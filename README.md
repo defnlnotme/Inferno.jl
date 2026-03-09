@@ -1,0 +1,1 @@
+We want to build an LLM inference engine/server in Julia. We target only intel hardware. Specifically gpus in the series battlemage (like B580). We want to support the GGUF model format. The engine/server must not be bloated, for now we only want to support the family of Qwen3.5 models. We should use OneApi.jl as a dependency for GPU acceleration.

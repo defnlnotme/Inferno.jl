@@ -1,0 +1,22 @@
+name = "Inferno"
+uuid = "4e1e2c4b-a6e7-48e4-a8cc-a3a3a2d64561"
+version = "0.1.0"
+authors = ["defnlnotme <a9pbg0vj6@mozmail.com>"]
+
+[deps]
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+StructTypes = "856f2bd8-1eba-4b0a-8007-ebc267875bd4"
+oneAPI = "8f75cd03-7ff8-4ecb-9b8f-daf728133b1b"
+
+[compat]
+HTTP = "1.10.19"
+JSON3 = "1.14.3"
+LinearAlgebra = "1.12.0"
+Mmap = "1.11.0"
+Sockets = "1.11.0"
+StructTypes = "1.11.0"
+oneAPI = "2.6.1"
