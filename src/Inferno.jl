@@ -63,6 +63,7 @@ function load_model(path::String; device::Union{Int, Nothing}=nothing)
         ssm_inner_size=Int(get(file.metadata, "$(arch).ssm.inner_size", 2048)),
         ssm_state_size=Int(get(file.metadata, "$(arch).ssm.state_size", 128)),
         ssm_group_count=Int(get(file.metadata, "$(arch).ssm.group_count", 16)),
+        ssm_time_step_rank=Int(get(file.metadata, "$(arch).ssm.time_step_rank", 16)),
     )
     println("  Config: hidden=$(config.hidden_size), layers=$(config.num_hidden_layers), heads=$(config.num_attention_heads)")
 

@@ -42,14 +42,12 @@ function ggml_dequantize(sym_name::Symbol, data::AbstractVector{UInt8}, num_elem
         return zeros(Float32, num_elements)
     end
     
-    print("  [Dequantizing via $(sym_name) ($num_elements elements)] ")
     out = Vector{Float32}(undef, num_elements)
     GC.@preserve data out begin
         ptr_in = pointer(data)
         ptr_out = pointer(out)
         ccall(sym, Cvoid, (Ptr{UInt8}, Ptr{Float32}, Int64), ptr_in, ptr_out, num_elements)
     end
-    println("Done!")
     return out
 end
 
@@ -144,9 +142,21 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
             ssm_norm_w     = vec(collect(Float32.(extract_tensor(file, "$(prefix).ssm_norm.weight"))))
             ssm_norm       = Model.RMSNorm(oneArray(Float16.(ssm_norm_w)), config.rms_norm_eps)
 
-            Model.MambaBlock(in_proj, gate_proj, ssm_out,
+            # conv_channels = d_inner + 2 * num_k_heads * head_k_dim
+            conv_kernel = 4  # ssm.conv_kernel
+            num_v_heads = config.ssm_time_step_rank  # 16
+            num_k_heads = config.ssm_group_count      # 16
+            head_k_dim  = config.ssm_state_size       # 128
+            head_v_dim  = config.ssm_inner_size ÷ num_v_heads  # 128
+            conv_channels = config.ssm_inner_size + 2 * num_k_heads * head_k_dim  # 6144
+
+            conv_state = zeros(Float32, conv_kernel, conv_channels)  # CPU ring buffer
+            ssm_state  = zeros(Float32, head_v_dim, head_k_dim, num_v_heads)  # CPU state matrix
+
+            Model.GatedDeltaNet(in_proj, gate_proj, ssm_out,
                 ssm_a_cpu, ssm_alpha, ssm_beta, ssm_conv1d_f32, ssm_dt_bias, ssm_norm,
-                config.ssm_group_count, config.ssm_state_size, config.ssm_inner_size)
+                conv_state, ssm_state,
+                num_v_heads, num_k_heads, head_k_dim, head_v_dim, config.ssm_inner_size)
         else
             qw = extract_tensor(file, "$(prefix).attn_q.weight")
             kw = extract_tensor(file, "$(prefix).attn_k.weight")
@@ -158,7 +168,8 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
             q_norm = Model.RMSNorm(oneArray(Float16.(q_norm_w)), config.rms_norm_eps)
             k_norm = Model.RMSNorm(oneArray(Float16.(k_norm_w)), config.rms_norm_eps)
 
-            n_heads = size(qw, 2) ÷ config.head_dim
+            # Q output has packed Q+gate: size = head_dim * 2 * n_heads
+            n_heads = size(qw, 2) ÷ (config.head_dim * 2)
             n_kv    = size(kw, 2) ÷ config.head_dim
 
             Model.FullAttention(qw, kw, vw, ow, q_norm, k_norm, n_heads, n_kv, config.head_dim)
