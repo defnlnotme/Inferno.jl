@@ -2,7 +2,7 @@
 
 julia_version = "1.12.2"
 manifest_format = "2.0"
-project_hash = "68f26ae3e3374654b5f78d7aacf1ddfc1cd8e671"
+project_hash = "a164dd8efc1cd7f8aed456bdf2c40bd65b1e2d3c"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -179,7 +179,7 @@ uuid = "e33a78d0-f292-5ffc-b300-72abe9b543c8"
 version = "2.13.0+0"
 
 [[deps.Inferno]]
-deps = ["HTTP", "JSON3", "Mmap", "StructTypes", "oneAPI"]
+deps = ["HTTP", "JSON3", "LinearAlgebra", "Mmap", "Random", "Sockets", "Statistics", "StructTypes", "oneAPI"]
 path = "."
 uuid = "4e1e2c4b-a6e7-48e4-a8cc-a3a3a2d64561"
 version = "0.1.0"

@@ -31,16 +31,17 @@ function load_model(path::String)
     arch = get(file.metadata, "general.architecture", "llm")
 
     config = Model.QwenConfig(
-        vocab_size         = Int(get(file.metadata, "$(arch).vocab_size",
-                                    length(get(file.metadata, "tokenizer.ggml.tokens", [])))),
-        hidden_size        = Int(get(file.metadata, "$(arch).embedding_length", 4096)),
-        intermediate_size  = Int(get(file.metadata, "$(arch).feed_forward_length", 11008)),
-        num_hidden_layers  = Int(get(file.metadata, "$(arch).block_count", 32)),
-        num_attention_heads = Int(get(file.metadata, "$(arch).attention.head_count", 32)),
-        num_key_value_heads = Int(get(file.metadata, "$(arch).attention.head_count_kv", 32)),
-        rms_norm_eps       = Float32(get(file.metadata, "$(arch).attention.layer_norm_rms_epsilon", 1.0e-6)),
-        rope_theta         = Float32(get(file.metadata, "$(arch).rope.freq_base", 1000000.0)),
-        max_position_embeddings = Int(get(file.metadata, "$(arch).context_length", 32768)),
+        vocab_size=Int(get(file.metadata, "$(arch).vocab_size",
+            length(get(file.metadata, "tokenizer.ggml.tokens", [])))),
+        hidden_size=Int(get(file.metadata, "$(arch).embedding_length", 4096)),
+        intermediate_size=Int(get(file.metadata, "$(arch).feed_forward_length", 11008)),
+        num_hidden_layers=Int(get(file.metadata, "$(arch).block_count", 32)),
+        num_attention_heads=Int(get(file.metadata, "$(arch).attention.head_count", 32)),
+        num_key_value_heads=Int(get(file.metadata, "$(arch).attention.head_count_kv", 1)),
+        head_dim=Int(get(file.metadata, "$(arch).attention.key_length", 128)),
+        rms_norm_eps=Float32(get(file.metadata, "$(arch).attention.layer_norm_rms_epsilon", 1.0e-6)),
+        rope_theta=Float32(get(file.metadata, "$(arch).rope.freq_base", 1000000.0)),
+        max_position_embeddings=min(4096, Int(get(file.metadata, "$(arch).context_length", 32768))),
     )
     println("  Config: hidden=$(config.hidden_size), layers=$(config.num_hidden_layers), heads=$(config.num_attention_heads)")
 
