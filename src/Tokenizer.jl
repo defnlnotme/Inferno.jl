@@ -1,5 +1,6 @@
 module Tokenizer
 
+import Base: show
 export BPETokenizer, encode, decode, load_tokenizer
 
 """
@@ -40,16 +41,38 @@ function load_tokenizer(metadata::Dict{String, Any})
     BPETokenizer(token_to_id, id_to_token, merges, bos_id, eos_id)
 end
 
+function get_byte_map()
+    bs = vcat(collect(UInt8('!'):UInt8('~')), collect(UInt8('¡'):UInt8('¬')), collect(UInt8('®'):UInt8('ÿ')))
+    cs = Int.(bs)
+    n = 0
+    for b in 0:255
+        if !(UInt8(b) in bs)
+            push!(bs, UInt8(b))
+            push!(cs, 256 + n)
+            n += 1
+        end
+    end
+    byte_to_char = Dict{UInt8, Char}()
+    for (b, c) in zip(bs, cs)
+        byte_to_char[UInt8(b)] = Char(c)
+    end
+    return byte_to_char
+end
+
+const BYTE_TO_CHAR = get_byte_map()
+const CHAR_TO_BYTE = Dict(v => k for (k, v) in BYTE_TO_CHAR)
+
 """
     encode(tok, text) -> Vector{Int}
 
-Byte-level BPE encoding. First splits text into UTF-8 bytes (as single-char strings),
-then iteratively applies the highest-priority merge.
+Byte-level BPE encoding.
 """
 function encode(tok::BPETokenizer, text::String)
-    # Start with individual UTF-8 bytes as tokens
-    symbols = [string(Char(b)) for b in Vector{UInt8}(text)]
-
+    # Map raw UTF-8 bytes to unicode characters using standard BPE mapping
+    symbols = String[]
+    for b in Vector{UInt8}(text)
+        push!(symbols, string(get(BYTE_TO_CHAR, b, Char(b))))
+    end
     # Build a priority lookup: merge pair -> priority (lower = higher priority)
     merge_priority = Dict{Tuple{String,String}, Int}()
     for (i, (a, b)) in enumerate(tok.merges)
@@ -105,20 +128,33 @@ end
 Decode token IDs back to a UTF-8 string.
 """
 function decode(tok::BPETokenizer, ids::Vector{Int})
-    parts = String[]
+    bytes_arr = UInt8[]
     for id in ids
         if 1 <= id <= length(tok.id_to_token)
             s = tok.id_to_token[id]
-            # Handle byte tokens like <0x41>
             m = match(r"^<0x([0-9A-Fa-f]{2})>$", s)
             if m !== nothing
-                push!(parts, string(Char(parse(UInt8, m.captures[1], base=16))))
+                push!(bytes_arr, parse(UInt8, m.captures[1], base=16))
             else
-                push!(parts, s)
+                for c in s
+                    b = get(CHAR_TO_BYTE, c, nothing)
+                    if b !== nothing
+                        push!(bytes_arr, b)
+                    else
+                        # Unmapped char (e.g. special unicode tokens) — encode as raw UTF-8
+                        for byte in Vector{UInt8}(string(c))
+                            push!(bytes_arr, byte)
+                        end
+                    end
+                end
             end
         end
     end
-    return join(parts)
+    return String(bytes_arr)
+end
+
+function show(io::IO, tok::BPETokenizer)
+    print(io, "[CPU] BPETokenizer (vocab=$(length(tok.id_to_token)))")
 end
 
 end # module

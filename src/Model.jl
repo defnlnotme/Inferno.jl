@@ -4,7 +4,7 @@ using oneAPI
 using LinearAlgebra
 using Statistics
 
-export QwenConfig, QwenModel, KVCache, forward!, RMSNorm, MLP, HybridBlock, Attention, DecoderLayer, init_kv_cache
+export QwenConfig, QwenModel, KVCache, forward!, RMSNorm, MLP, MambaBlock, FullAttention, DecoderLayer, init_kv_cache
 
 # --- Configuration ---
 Base.@kwdef struct QwenConfig
@@ -12,37 +12,42 @@ Base.@kwdef struct QwenConfig
     hidden_size::Int = 1024
     intermediate_size::Int = 3584
     num_hidden_layers::Int = 24
-    num_attention_heads::Int = 8
-    num_key_value_heads::Int = 2
-    head_dim::Int = 128
+    num_attention_heads::Int = 16   # q heads
+    num_key_value_heads::Int = 2    # kv heads
+    head_dim::Int = 256             # from attn_key_length
     rms_norm_eps::Float32 = 1e-6
     rope_theta::Float32 = 10000000.0
     max_position_embeddings::Int = 4096
+    full_attention_interval::Int = 4  # every 4th layer is full attention
+    ssm_inner_size::Int = 2048
+    ssm_state_size::Int = 128
+    ssm_group_count::Int = 16
 end
+
+const oneMatrix{T} = oneArray{T, 2}
+const oneVector{T} = oneArray{T, 1}
 
 # --- Normalization ---
 struct RMSNorm
-    weight::oneVector{Float16}
+    weight::oneArray{Float16}
     eps::Float32
 end
 
-function (norm::RMSNorm)(x::oneMatrix{Float16})
+function (norm::RMSNorm)(x::oneArray{Float16})
     x32 = Float32.(x)
-    # Correct RMS calculation: mean(x^2)
-    rms = sqrt.(vec(mean(x32 .^ 2, dims=1)) .+ norm.eps)
-    res32 = (x32 ./ rms') .* Float32.(norm.weight)
-    return Float16.(res32)
+    # RMS per column (hidden dim)
+    rms = reshape(sqrt.(vec(mean(x32 .^ 2, dims=1)) .+ norm.eps), 1, :)
+    normalized = x32 ./ rms
+    w = reshape(Float32.(norm.weight), :, 1)
+    return Float16.(normalized .* w)
 end
 
-# --- CHUNKED STABLE Mat-Mul ---
-# This version avoids large broadcasts by chunking the output dimension.
-# mat_mul_chunked computes weight' * x where weight: (K,N), x: (K,S) -> out: (N,S)
-function mat_mul_chunked(weight::AbstractMatrix{Float16}, x::AbstractMatrix{Float16})
-    # weight: (K, N), x: (K, S) -> out: (N, S)
+# --- Stable Mat-Mul (accumulate in Float32) ---
+# weight: (K, N), x: (K, S) -> (N, S)  (weight is stored transposed in GGUF)
+function mat_mul(weight::AbstractArray{Float16,2}, x::AbstractArray{Float16,2})
     K, N = size(weight)
     K_x, S = size(x)
 
-    # Handle padding/slicing for stability
     x_in = if K_x == K
         x
     elseif K_x < K
@@ -53,46 +58,35 @@ function mat_mul_chunked(weight::AbstractMatrix{Float16}, x::AbstractMatrix{Floa
         @view x[1:K, :]
     end
 
-    chunk_size = 1024 # Small chunks for stability
+    chunk = 512
     res = zeros(Float16, N, S) |> oneArray
-
-    # Process tokens one-by-one for decode stability
     for s in 1:S
         xv = @view x_in[:, s]
-        for c in 1:chunk_size:N
-            c_end = min(c + chunk_size - 1, N)
+        for c in 1:chunk:N
+            c_end = min(c + chunk - 1, N)
             w_c = @view weight[:, c:c_end]
-            # w_c: (K, chunk), xv: (K)
-            # sum(w_c .* xv, dims=1) -> (1, chunk)
-            res[c:c_end, s] = vec(sum(w_c .* xv, dims=1))
+            v32 = sum(Float32.(w_c) .* Float32.(xv), dims=1)
+            @views res[c:c_end, s] .= vec(Float16.(v32))
         end
     end
     return res
 end
 
-# mat_mul_chunked_AB computes A * B where A: (M, N), B: (N, S) -> out: (M, S)
-# This is a companion to mat_mul_chunked that avoids large BLAS calls by chunking
-# the output rows (M). Implemented similarly to mat_mul_chunked but for non-transposed.
-function mat_mul_chunked_AB(A::AbstractMatrix{Float16}, B::AbstractMatrix{Float16})
+# A: (M, N), B: (N, S) -> (M, S)
+function mat_mul_AB(A::AbstractArray{Float16,2}, B::AbstractArray{Float16,2})
     M, N = size(A)
     N_b, S = size(B)
-    @assert N == N_b "Inner dimensions must match for matmul"
-
-    chunk_size = 1024
+    chunk = 512
     res = zeros(Float16, M, S) |> oneArray
-
     for s in 1:S
-        bv = @view B[:, s]               # (N)
-        # Broadcast multiply over each output-row chunk
-        for r in 1:chunk_size:M
-            r_end = min(r + chunk_size - 1, M)
-            a_chunk = @view A[r:r_end, :]   # (chunk, N)
-            # We want each row dot bv: sum(a_chunk .* bv', dims=2)
-            # bv' is (1, N) and will broadcast across rows
-            @views res[r:r_end, s] .= vec(sum(a_chunk .* bv', dims=2))
+        bv = @view B[:, s]
+        for r in 1:chunk:M
+            r_end = min(r + chunk - 1, M)
+            a_c = @view A[r:r_end, :]
+            v32 = sum(Float32.(a_c) .* Float32.(bv)', dims=2)
+            @views res[r:r_end, s] .= vec(Float16.(v32))
         end
     end
-
     return res
 end
 
@@ -109,26 +103,18 @@ function RotaryEmbedding(dim::Int; base=10000000.0)
 end
 
 function (rope::RotaryEmbedding)(x::oneArray{Float16,3}, pos::Int)
-    # x: (dim, n_heads, seq)
     d, h, seq = size(x)
     d_rope = min(d, rope.dim)
-
-    # Pre-calculate positions
     positions = oneArray(Float32.(pos:(pos+seq-1)))
-    # freq: (dim/2, seq)
     freqs = rope.inv_freq[1:(d_rope÷2)] * positions'
-
     cos_t = reshape(Float16.(cos.(freqs)), d_rope ÷ 2, 1, seq)
     sin_t = reshape(Float16.(sin.(freqs)), d_rope ÷ 2, 1, seq)
-
     xr = reshape(@view(x[1:d_rope, :, :]), 2, d_rope ÷ 2, h, seq)
     x1 = @view xr[1, :, :, :]
     x2 = @view xr[2, :, :, :]
-
     res = similar(xr)
     res[1, :, :, :] = x1 .* cos_t .- x2 .* sin_t
     res[2, :, :, :] = x1 .* sin_t .+ x2 .* cos_t
-
     out = copy(x)
     out[1:d_rope, :, :] = reshape(res, d_rope, h, seq)
     return out
@@ -136,182 +122,197 @@ end
 
 # --- KV Cache ---
 mutable struct KVCache
-    k::oneArray{Float16,3}
+    k::oneArray{Float16,3}  # (head_dim, n_kv, max_seq)
     v::oneArray{Float16,3}
+    pos::Int
 end
 
 function init_kv_cache(head_dim, n_kv, max_seq)
     k = zeros(Float16, head_dim, n_kv, max_seq) |> oneArray
     v = zeros(Float16, head_dim, n_kv, max_seq) |> oneArray
-    return KVCache(k, v)
+    return KVCache(k, v, 0)
 end
 
-function update!(cache::KVCache, k::oneArray{Float16,3}, v::oneArray{Float16,3}, pos::Int)
+function update_kv!(cache::KVCache, k::oneArray{Float16,3}, v::oneArray{Float16,3})
     seq = size(k, 3)
-    d, n, _ = size(cache.k)
-    # Safe copy with slicing
-    dk = min(d, size(k, 1))
-    nk = min(n, size(k, 2))
-
+    pos = cache.pos
+    dk = min(size(cache.k, 1), size(k, 1))
+    nk = min(size(cache.k, 2), size(k, 2))
     @views cache.k[1:dk, 1:nk, pos+1:pos+seq] .= k[1:dk, 1:nk, :]
     @views cache.v[1:dk, 1:nk, pos+1:pos+seq] .= v[1:dk, 1:nk, :]
+    cache.pos += seq
 end
 
 # --- MLP ---
 struct MLP
-    gate::oneArray{Float16,2}
-    up::oneArray{Float16,2}
-    down::oneArray{Float16,2}
+    gate::oneMatrix{Float16}
+    up::oneMatrix{Float16}
+    down::oneMatrix{Float16}
 end
 
 function (mlp::MLP)(x::oneMatrix{Float16})
-    g = mat_mul_chunked(mlp.gate, x)
-    u = mat_mul_chunked(mlp.up, x)
-    # Silu/Swish: x * sigmoid(x)
+    g = mat_mul(mlp.gate, x)
+    u = mat_mul(mlp.up, x)
     g32 = Float32.(g)
-    g .= Float16.(g32 .* (1.0f0 ./ (1.0f0 .+ exp.(-g32))))
-    return mat_mul_chunked(mlp.down, g .* u)
+    g .= Float16.(g32 ./ (1.0f0 .+ exp.(-g32)))  # silu
+    return mat_mul(mlp.down, g .* u)
 end
 
-# --- Attention ---
-struct Attention
-    q_weight::oneArray{Float16,2}
-    k_weight::oneArray{Float16,2}
-    v_weight::oneArray{Float16,2}
-    o_weight::oneArray{Float16,2}
-    n_heads::Int
-    n_kv::Int
+# --- Full Attention Layer ---
+struct FullAttention
+    q_weight::oneMatrix{Float16}
+    k_weight::oneMatrix{Float16}
+    v_weight::oneMatrix{Float16}
+    o_weight::oneMatrix{Float16}
+    q_norm::RMSNorm
+    k_norm::RMSNorm
+    n_heads::Int    # query heads
+    n_kv::Int       # kv heads
+    head_dim::Int
 end
 
-function (attn::Attention)(x::oneMatrix{Float16}, pos::Int, rope::RotaryEmbedding, cache::KVCache)
+function (attn::FullAttention)(x::oneMatrix{Float16}, pos::Int, rope::RotaryEmbedding, cache::KVCache)
     h_dim, seq = size(x)
-    # q, k, v projections
-    q = mat_mul_chunked(attn.q_weight, x)   # q = q_weight' * x  -> (q_dim, seq)
-    k = mat_mul_chunked(attn.k_weight, x)   # k = k_weight' * x  -> (kv_dim, seq)
-    v = mat_mul_chunked(attn.v_weight, x)   # v = v_weight' * x  -> (kv_dim, seq)
+    # Project
+    q = mat_mul(attn.q_weight, x)   # (n_heads * head_dim, seq)
+    k = mat_mul(attn.k_weight, x)   # (n_kv * head_dim, seq)
+    v = mat_mul(attn.v_weight, x)   # (n_kv * head_dim, seq)
 
-    q_hd = size(q, 1) ÷ attn.n_heads
-    kv_hd = size(k, 1) ÷ attn.n_kv
+    q_hd = attn.head_dim
+    kv_hd = attn.head_dim
 
-    qr = rope(reshape(q, q_hd, attn.n_heads, seq), pos)
-    kr = rope(reshape(k, kv_hd, attn.n_kv, seq), pos)
-    vr = reshape(v, kv_hd, attn.n_kv, seq)
+    # RMSNorm on each head
+    qr3 = reshape(q, q_hd, attn.n_heads, seq)
+    kr3 = reshape(k, kv_hd, attn.n_kv, seq)
+    vr3 = reshape(v, kv_hd, attn.n_kv, seq)
 
-    update!(cache, kr, vr, pos)
+    # Per-head norm (reshape to (head_dim, n_heads*seq), norm, reshape back)
+    qn = reshape(attn.q_norm(reshape(qr3, q_hd, :)), q_hd, attn.n_heads, seq)
+    kn = reshape(attn.k_norm(reshape(kr3, kv_hd, :)), kv_hd, attn.n_kv, seq)
 
-    # Use full context for attention
-    total_len = pos + seq
+    # RoPE
+    qr = rope(qn, pos)
+    kr = rope(kn, pos)
+
+    update_kv!(cache, kr, vr3)
+
+    total_len = cache.pos
     k_full = @view cache.k[:, :, 1:total_len]
     v_full = @view cache.v[:, :, 1:total_len]
 
-    # attn_out: (head_dim, n_heads, seq)
     res_out = zeros(Float16, q_hd, attn.n_heads, seq) |> oneArray
+    kv_per_q = attn.n_heads ÷ attn.n_kv  # GQA groups
 
-    # Head-by-head loop for B580 stability (prevents large GPU-wide broadcasts)
     for h in 1:attn.n_heads
-        kv_h = ((h - 1) * attn.n_kv ÷ attn.n_heads) + 1
-        qh = @view qr[:, h, :]        # (q_hd, seq)
-        kh = @view k_full[:, kv_h, :] # (kv_hd, total_len)
-        vh = @view v_full[:, kv_h, :] # (kv_hd, total_len)
+        kv_h = (h - 1) ÷ kv_per_q + 1
+        qh = oneArray(collect(Float16, @view qr[:, h, :]))      # (head_dim, seq) on GPU
+        kh = oneArray(collect(Float16, @view k_full[:, kv_h, :]))  # (head_dim, total_len), on GPU
+        vh = oneArray(collect(Float16, @view v_full[:, kv_h, :]))  # (head_dim, total_len) on GPU
 
-        # Align query/key dims for MLA: use smallest common dimension so multiplication shapes match.
-        use_dim = min(size(qh, 1), size(kh, 1))
-        qh_r = @view qh[1:use_dim, :]  # (use_dim, seq)
-        kh_r = @view kh[1:use_dim, :]  # (use_dim, total_len)
-        vh_r = @view vh[1:use_dim, :]  # (use_dim, total_len)
+        # scores: (total_len, seq)  by treating kh as weight (K=head_dim) and qh as input
+        scale = Float16(1.0f0 / sqrt(Float32(q_hd)))
+        scores = mat_mul(kh, qh) .* scale
 
-        # scores: (total_len, seq)
-        # Replace direct BLAS GEMM with safe chunked transpose-matmul to avoid driver hangs.
-        # mat_mul_chunked computes weight' * x for weight:(K,N), x:(K,S) -> (N,S).
-        # Passing kh_r (K=use_dim, N=total_len) and qh_r (K=use_dim, S=seq) yields kh_r' * qh_r.
-        scores = mat_mul_chunked(kh_r, qh_r) ./ Float16(sqrt(use_dim))
-
-        # Causal masking for prefill
-        if seq > 1
-            for s in 1:seq
-                mask_end = pos + s
-                if mask_end < total_len
-                    @views scores[(mask_end+1):total_len, s] .= -65500.0f0
-                end
+        # Causal mask
+        for s in 1:seq
+            mask_start = pos + s
+            if mask_start < total_len
+                @views scores[mask_start+1:total_len, s] .= Float16(-65504)
             end
         end
 
-        # Softmax per column (token)
-        scores_32 = Float32.(scores)
-        mx = maximum(scores_32, dims=1)
-        ex = exp.(scores_32 .- mx)
+        s32 = Float32.(scores)
+        mx = maximum(s32, dims=1)
+        ex = exp.(s32 .- mx)
         pb = Float16.(ex ./ sum(ex, dims=1))   # (total_len, seq)
-
-        # heads_res: (use_dim, seq) computed safely without large GEMM
-        # vh_r: (use_dim, total_len), pb: (total_len, seq) -> result (use_dim, seq)
-        heads_res = mat_mul_chunked_AB(vh_r, pb)
-
-        # Write into res_out. If the query head-dim (q_hd) is larger than use_dim,
-        # leave the remaining slots zero (effectively zero-padding). This keeps the
-        # output tensor shape consistent while supporting MLA-style reduced KV dims.
-        @views res_out[1:use_dim, h, :] .= heads_res
+        res_out[:, h, :] = mat_mul_AB(vh, pb)  # (head_dim, seq)
     end
 
-    return mat_mul_chunked(attn.o_weight, reshape(res_out, :, seq))
+    return mat_mul(attn.o_weight, reshape(res_out, :, seq))
 end
 
-# --- Hybrid Block (SSM) ---
-struct HybridBlock
-    qkv_weight::oneArray{Float16,2}
-    gate_weight::oneArray{Float16,2}
-    out_weight::oneArray{Float16,2}
+# --- Mamba (SSM) Block ---
+# Qwen3.5 SSM hybrid: uses attn_qkv as in_proj, ssm_* params
+struct MambaBlock
+    in_proj::oneMatrix{Float16}   # (hidden, 6144): projects x -> [z(2048), x_expanded(2048), dt_base(ssm_groups)]
+    gate_proj::oneMatrix{Float16} # (hidden, 2048): gate
+    ssm_out::oneMatrix{Float16}   # (ssm_inner_size, hidden)
+    ssm_a::oneVector{Float32}     # (ssm_groups,) log-scale A param
+    ssm_alpha::oneMatrix{Float16} # (hidden, ssm_groups)
+    ssm_beta::oneMatrix{Float16}  # (hidden, ssm_groups)
+    ssm_conv1d::oneMatrix{Float32} # (conv_kernel, ssm_inner*2)  -- kept F32
+    ssm_dt_bias::oneVector{Float32} # (ssm_groups,)
+    ssm_norm::RMSNorm
+    ssm_groups::Int   # = group_count = 16
+    ssm_d::Int        # = state_size = 128
+    inner_size::Int   # = 2048
 end
 
-function (block::HybridBlock)(x::oneMatrix{Float16}, pos::Int, rope::RotaryEmbedding, cache::KVCache)
-    p = mat_mul_chunked(block.qkv_weight, x)
-    g = mat_mul_chunked(block.gate_weight, x)
+function silu32(x::AbstractArray{T}) where T
+    x32 = Float32.(x)
+    return T.(x32 ./ (1.0f0 .+ exp.(-x32)))
+end
 
-    # Functional approximation of gated SSM
-    g32 = 1.0f0 ./ (1.0f0 .+ exp.(-Float32.(g)))
-    # We slice qkv to match gate size if needed
-    p_use = size(p, 1) > size(g, 1) ? (@view p[1:size(g, 1), :]) : p
+function (m::MambaBlock)(x::oneMatrix{Float16}, pos::Int, rope::RotaryEmbedding, cache::KVCache)
+    hidden, seq = size(x)
 
-    res = Float16.(g32) .* p_use
-    return mat_mul_chunked(block.out_weight, res)
+    # in_proj: (hidden, 6144) -> proj: (6144, seq)
+    # Qwen3.5 split: 6144 = 2048(z_gate) + 2048(x_ssm) + 2048(dt_proj)
+    proj = mat_mul(m.in_proj, x)
+
+    inner = m.inner_size  # 2048
+
+    z_gate = @view proj[1:inner, :]          # (2048, seq) - z gate
+    x_ssm  = @view proj[inner+1:2*inner, :]  # (2048, seq) - SSM input
+
+    # Additional gate from gate_proj
+    gate_out = mat_mul(m.gate_proj, x)  # (2048, seq)
+    gate = silu32(gate_out)
+
+    # Gate the SSM input with SiLU-gated z
+    z_act = silu32(z_gate)  # SiLU(z)
+    gated_x = Float16.(Float32.(x_ssm) .* Float32.(z_act) .* Float32.(gate))
+
+    # Output projection: (hidden, seq) from gated inner representation
+    return mat_mul(m.ssm_out, gated_x)
 end
 
 # --- Decoder Layer ---
 struct DecoderLayer
     in_norm::RMSNorm
-    op::Union{HybridBlock,Attention}
+    op::Union{MambaBlock, FullAttention}
     post_norm::RMSNorm
     mlp::MLP
+    is_ssm::Bool
 end
 
 function (layer::DecoderLayer)(x::oneMatrix{Float16}, pos::Int, rope::RotaryEmbedding, cache::KVCache)
     h = layer.in_norm(x)
     h = layer.op(h, pos, rope, cache)
-    x = x .+= h
-
+    x = x .+ h
     h = layer.post_norm(x)
     h = layer.mlp(h)
-    x = x .+= h
+    x = x .+ h
     return x
 end
 
 # --- Model ---
 struct QwenModel
     config::QwenConfig
-    embed::oneArray{Float16,2}
+    embed::oneMatrix{Float16}
     layers::Vector{DecoderLayer}
     final_norm::RMSNorm
-    lm_head::oneArray{Float16,2}
+    lm_head::oneMatrix{Float16}
     rope::RotaryEmbedding
 end
 
 function forward!(model::QwenModel, tokens::Vector{Int}, pos::Int, caches::Vector{KVCache})
-    # tokens are 1-indexed token IDs
-    x = model.embed[:, tokens]
+    x = model.embed[:, tokens]              # (hidden, seq)
     for (i, layer) in enumerate(model.layers)
         x = layer(x, pos, model.rope, caches[i])
     end
     x = model.final_norm(x)
-    logits = mat_mul_chunked(model.lm_head, x)
+    logits = mat_mul(model.lm_head, x)     # (vocab, seq)
     return Float32.(logits) |> collect
 end
 

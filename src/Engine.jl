@@ -98,34 +98,34 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
 
     return Channel{String}(32) do chan
         try
-            # Initialize KV Caches
-            kv_caches = [Model.init_kv_cache(model.config.head_dim, model.config.num_key_value_heads, model.config.max_position_embeddings)
-                         for _ in 1:model.config.num_hidden_layers]
+            # Initialize KV Caches (pos tracked inside cache)
+            kv_caches = [Model.init_kv_cache(
+                model.config.head_dim,
+                model.config.num_key_value_heads,
+                model.config.max_position_embeddings)
+                for _ in 1:model.config.num_hidden_layers]
 
-            curr_pos = 0
+            # Prefill: pass pos=0, the KV caches will accumulate internally
+            logits = Model.forward!(model, tokens, 0, kv_caches)
+            last_token = mask_and_sample(
+                vec(logits[:, end]), tok, Float32(temperature), Float32(top_p))
 
-            # Prefill
-            logits = Model.forward!(model, tokens, curr_pos, kv_caches)
-            last_token = mask_and_sample(vec(logits[:, end]), tok, Float32(temperature), Float32(top_p))
-            curr_pos += length(tokens)
-
-            # Put first token (mask PAD tokens if they appear)
             token_str = Tokenizer.decode(tok, [last_token])
             put!(chan, token_str)
 
-            # Decode
+            # Decode: each step passes current cache.pos as the position
             for _ in 1:(max_tokens-1)
                 if last_token == (stop_token === nothing ? tok.eos_id : stop_token)
                     break
                 end
 
+                curr_pos = kv_caches[1].pos  # all caches share same length after prefill
                 logits = Model.forward!(model, [last_token], curr_pos, kv_caches)
-                last_token = mask_and_sample(vec(logits[:, 1]), tok, Float32(temperature), Float32(top_p))
+                last_token = mask_and_sample(
+                    vec(logits[:, 1]), tok, Float32(temperature), Float32(top_p))
 
                 token_str = Tokenizer.decode(tok, [last_token])
                 put!(chan, token_str)
-
-                curr_pos += 1
             end
         catch e
             @error "ERROR during generation stream" exception = (e, catch_backtrace())

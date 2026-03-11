@@ -6,6 +6,7 @@ authors = ["defnlnotme <a9pbg0vj6@mozmail.com>"]
 [deps]
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
@@ -17,6 +18,7 @@ oneAPI = "8f75cd03-7ff8-4ecb-9b8f-daf728133b1b"
 [compat]
 HTTP = "1.10.19"
 JSON3 = "1.14.3"
+Libdl = "1.11.0"
 LinearAlgebra = "1.12.0"
 Mmap = "1.11.0"
 Random = "1.11.0"
