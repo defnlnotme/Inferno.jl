@@ -1,5 +1,6 @@
 using Test
 using Inferno
+using Statistics
 
 const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
 
@@ -70,6 +71,64 @@ const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
         @test hidden_size == 1024
         @test num_heads == 8
         @test num_kv_heads == 2
+    end
+
+    @testset "Inference" begin
+        model, tok = Inferno.load_model(MODEL_PATH)
+
+        @test model.config.hidden_size == 1024
+        @test model.config.num_hidden_layers == 24
+        @test length(model.layers) == 24
+
+        prompt = "The capital of France is"
+        tokens = Inferno.Tokenizer.encode(tok, prompt)
+        @test length(tokens) > 0
+        println("  Prompt: \"$prompt\" -> $(length(tokens)) tokens")
+
+        # Init KV caches
+        caches = [Inferno.Model.init_kv_cache(
+            model.config.head_dim,
+            model.config.num_key_value_heads,
+            model.config.max_position_embeddings)
+            for _ in 1:model.config.num_hidden_layers]
+
+        # Prefill
+        logits = Inferno.Model.forward!(model, tokens, 0, caches)
+        last_logits = vec(logits[:, end])
+
+        # Logits should be finite real numbers
+        @test all(isfinite, last_logits)
+        @test maximum(last_logits) > -1000.0f0
+        @test minimum(last_logits) < 1000.0f0
+        println("  Logits: mean=$(round(mean(last_logits), digits=2)), max=$(round(maximum(last_logits), digits=2)), min=$(round(minimum(last_logits), digits=2))")
+
+        # Generate 3 greedy tokens
+        generated = Int[]
+        for i in 1:3
+            tok_id = argmax(last_logits)
+            push!(generated, tok_id)
+            # Decode should produce a non-empty string
+            tok_str = Inferno.Tokenizer.decode(tok, [tok_id])
+            @test length(tok_str) > 0
+            print("  Token $i: $tok_id -> \"$tok_str\"")
+
+            if tok_id == tok.eos_id
+                println(" [EOS]")
+                break
+            end
+            println()
+
+            # Next step
+            curr_pos = caches[1].pos
+            next_logits = Inferno.Model.forward!(model, [tok_id], curr_pos, caches)
+            last_logits = vec(next_logits[:, 1])
+            @test all(isfinite, last_logits)
+        end
+
+        @test length(generated) >= 1
+        full_decode = Inferno.Tokenizer.decode(tok, generated)
+        println("  Full generation: \"$full_decode\"")
+        @test length(full_decode) > 0
     end
 
 end
