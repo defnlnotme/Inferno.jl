@@ -88,7 +88,6 @@ end
 function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::String;
     max_tokens=64, temperature=0.7f0, top_p=0.9f0, stop_token=nothing)
 
-    println("Generating stream for prompt: $prompt")
     tokens = Tokenizer.encode(tok, prompt)
     if isempty(tokens)
         return Channel{String}(0) do chan
@@ -98,6 +97,7 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
 
     return Channel{String}(32) do chan
         try
+            Model.reset_states!(model)
             # Initialize KV Caches (pos tracked inside cache)
             kv_caches = [Model.init_kv_cache(
                 model.config.head_dim,
@@ -108,7 +108,7 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
             # Prefill: pass pos=0, the KV caches will accumulate internally
             logits = Model.forward!(model, tokens, 0, kv_caches)
             last_token = mask_and_sample(
-                vec(logits[:, end]), tok, Float32(temperature), Float32(top_p))
+                vec(logits[:, end]), [tok.eos_id], Float32(temperature), Float32(top_p))
 
             token_str = Tokenizer.decode(tok, [last_token])
             put!(chan, token_str)
@@ -122,7 +122,7 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
                 curr_pos = kv_caches[1].pos  # all caches share same length after prefill
                 logits = Model.forward!(model, [last_token], curr_pos, kv_caches)
                 last_token = mask_and_sample(
-                    vec(logits[:, 1]), tok, Float32(temperature), Float32(top_p))
+                    vec(logits[:, 1]), [tok.eos_id], Float32(temperature), Float32(top_p))
 
                 token_str = Tokenizer.decode(tok, [last_token])
                 put!(chan, token_str)

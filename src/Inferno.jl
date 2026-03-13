@@ -2,6 +2,8 @@ module Inferno
 
 using oneAPI
 
+include("QuantsData.jl")
+include("Dequant.jl")
 include("GGUF.jl")
 include("Model.jl")
 include("Tokenizer.jl")
@@ -9,6 +11,8 @@ include("Loader.jl")
 include("Engine.jl")
 include("Server.jl")
 
+using .QuantsData
+using .Dequant
 using .GGUF
 using .Model
 using .Tokenizer
@@ -26,6 +30,7 @@ Load a GGUF model file and return the constructed model + tokenizer.
 function load_model(path::String; device::Union{Int, Nothing}=nothing)
     devs = collect(oneAPI.devices())
     if !isempty(devs)
+        # Default to GPU 2 if available per user's rule, otherwise 1.
         target_dev = isnothing(device) ? (length(devs) >= 2 ? 2 : 1) : device
         if 1 <= target_dev <= length(devs)
             oneAPI.device!(devs[target_dev])

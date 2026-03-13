@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["defnlnotme <a9pbg0vj6@mozmail.com>"]
 
 [deps]
+ArgParse = "c7e460c6-2fb9-53a9-8c5b-16f535851c63"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
@@ -16,6 +17,7 @@ StructTypes = "856f2bd8-1eba-4b0a-8007-ebc267875bd4"
 oneAPI = "8f75cd03-7ff8-4ecb-9b8f-daf728133b1b"
 
 [compat]
+ArgParse = "1.2.0"
 HTTP = "1.10.19"
 JSON3 = "1.14.3"
 Libdl = "1.11.0"
