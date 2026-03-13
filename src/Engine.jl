@@ -3,6 +3,7 @@ module Engine
 using ..Model
 using ..Tokenizer
 using Random
+import oneAPI
 
 export generate, generate_stream, sample
 
@@ -20,7 +21,7 @@ end
 
 function sample(logits::Vector{Float32}, temperature::Float32, top_p::Float32)
     # Sanitize logits
-    logits[.!isfinite.(logits)] .= -1e9f0
+    logits[.!isfinite.(logits)] .= -Inf32
 
     if temperature == 0.0f0
         return argmax(logits)
@@ -64,7 +65,7 @@ function mask_and_sample(logits::Vector{Float32}, pad_ids::Vector{Int}, temperat
         for pid in pad_ids
             if 1 <= pid <= length(logits_copy)
                 pad_mask[pid] = true
-                logits_copy[pid] = -1e9f0
+                logits_copy[pid] = -Inf32
             end
         end
     end
@@ -95,8 +96,10 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
         end
     end
 
+    current_dev = oneAPI.device()
     return Channel{String}(32) do chan
         try
+            oneAPI.device!(current_dev)
             Model.reset_states!(model)
             # Initialize KV Caches (pos tracked inside cache)
             kv_caches = [Model.init_kv_cache(

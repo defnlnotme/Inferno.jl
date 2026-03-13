@@ -51,44 +51,77 @@ function (norm::RMSNorm)(x::AbstractArray{Float32, N}) where N
 end
 
 # --- Matrix Multiplication (Fallback using broadcast to bypass crashes) ---
+# Custom kernel for stable matrix-vector multiplication
+# Avoids oneMKL/GEMM driver issues
+function mat_mul_kernel!(res, weight, x, K, N)
+    n = get_global_id(1)
+    if n <= N
+        val = 0.0f0
+        for k in 1:K
+            @inbounds val += weight[n, k] * x[k, 1]
+        end
+        res[n] = val
+    end
+    return nothing
+end
+
 function mat_mul(weight::AbstractArray{Float32,2}, x::AbstractArray{Float32,2})
-    # weight: (K, N), x: (K, S) -> result: (N, S) (representing weight' * x)
+    # weight: (N, K), x: (K, S) -> result: (N, S)
+    return Float32.(collect(weight) * collect(x))
+end
+
+function mat_mul(weight::oneMatrix{Float32}, x::oneMatrix{Float32})
+    N, K = size(weight)
     S = size(x, 2)
-    N = size(weight, 2)
-    
+
     if S == 1
-        res = sum(weight .* x, dims=1)
+        res = oneArray{Float32}(undef, N)
+        gs = min(N, 256)
+        gr = cld(N, gs)
+        @oneapi items=gs groups=gr mat_mul_kernel!(res, weight, x, K, N)
         return reshape(res, N, 1)
     else
-        res_cols = []
+        res = oneArray(zeros(Float32, N, S))
+        gs = min(N, 256)
+        gr = cld(N, gs)
         for s in 1:S
-            col = sum(weight .* (@view x[:, s]), dims=1)
-            push!(res_cols, reshape(col, N, 1))
+            v = @view x[:, s]
+            r = @view res[:, s]
+            @oneapi items=gs groups=gr mat_mul_kernel!(r, weight, v, K, N)
         end
-        return hcat(res_cols...)
+        return res
     end
+end
+
+function mat_mul_AB_kernel!(res, A, B, N, M, S_dim)
+    m = get_global_id(1)
+    s = get_global_id(2)
+    if m <= M && s <= S_dim
+        val = 0.0f0
+        for n in 1:N
+            @inbounds val += A[m, n] * B[n, s]
+        end
+        res[m, s] = val
+    end
+    return nothing
 end
 
 function mat_mul_AB(A::AbstractArray{Float32,2}, B::AbstractArray{Float32,2})
-    # A * B
     # A: (M, N), B: (N, S) -> result: (M, S)
-    M = size(A, 1)
-    S = size(B, 2)
-    
-    if S == 1
-        res = sum(A .* B', dims=2)
-        return res
-    else
-        res_cols = []
-        for s in 1:S
-            col = sum(A .* (@view B[:, s])', dims=2)
-            push!(res_cols, col)
-        end
-        return hcat(res_cols...)
-    end
+    return Float32.(collect(A) * collect(B))
 end
 
-# --- SiLU ---
+function mat_mul_AB(A::oneMatrix{Float32}, B::oneMatrix{Float32})
+    M, N = size(A)
+    S = size(B, 2)
+    res = oneArray{Float32}(undef, M, S)
+    gs_x = min(M, 16)
+    gs_y = min(S, 16)
+    gr_x = cld(M, gs_x)
+    gr_y = cld(S, gs_y)
+    @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) mat_mul_AB_kernel!(res, A, B, N, M, S)
+    return res
+end# --- SiLU ---
 function silu(x::AbstractArray{Float32})
     return x .* (1.0f0 ./ (1.0f0 .+ exp.(-x)))
 end
@@ -158,10 +191,10 @@ function (m::MLP)(x::oneMatrix{Float32})
     # silu(gate) * up
     g = mat_mul(m.gate_weight, x)
     u = mat_mul(m.up_weight, x)
-    
+
     # SiLU: x * sigmoid(x)
     @. g = g * (1.0f0 / (1.0f0 + exp(-g)))
-    
+
     res = g .* u
     return mat_mul(m.down_weight, res)
 end
@@ -189,8 +222,8 @@ function (m::FullAttention)(x::oneArray{Float32,2}, pos::Int, rope::RotaryEmbedd
 
     # Split into Q and gate
     q_3d = reshape(q_full, hd * 2, m.n_heads, seq)
-    q_only = q_3d[1:hd, :, :]       
-    gate_raw = q_3d[hd+1:2*hd, :, :] 
+    q_only = q_3d[1:hd, :, :]
+    gate_raw = q_3d[hd+1:2*hd, :, :]
 
     # 2. K, V projections
     k = mat_mul(m.wk, x)  # (hd*n_kv, seq)
@@ -199,7 +232,7 @@ function (m::FullAttention)(x::oneArray{Float32,2}, pos::Int, rope::RotaryEmbedd
     # 3. Apply Q, K normalization
     q_normed = m.q_norm(reshape(q_only, hd, :))
     k_normed = m.k_norm(reshape(k, hd, :))
-    
+
     q_2d = reshape(q_normed, hd, m.n_heads, seq)
     k_2d = reshape(k_normed, hd, m.n_kv, seq)
     v_2d = reshape(v, hd, m.n_kv, seq)
@@ -218,7 +251,7 @@ function (m::FullAttention)(x::oneArray{Float32,2}, pos::Int, rope::RotaryEmbedd
     # 7. Attention
     total_len = cache.pos
     scale = 1.0f0 / sqrt(Float32(hd))
-    
+
     # Combined output buffer
     if seq == 1
         q_final = reshape(q_gated, hd, m.n_heads, 1) # (hd, n_heads, 1)
@@ -228,12 +261,12 @@ function (m::FullAttention)(x::oneArray{Float32,2}, pos::Int, rope::RotaryEmbedd
             kh = (h - 1) ÷ kv_per_q + 1
             # scores: (total_len, 1)
             scores = mat_mul(K[:, kh, 1:total_len], q_final[:, h, :]) .* scale
-            
+
             s32 = collect(scores)
             mx = maximum(s32)
             ex = exp.(s32 .- mx)
             pb = oneArray(reshape(ex ./ sum(ex), :, 1)) # (total_len, 1)
-            
+
             # out_h: (hd, 1)
             out_h = mat_mul_AB(V[:, kh, 1:total_len], pb)
             push!(outputs, out_h)
@@ -310,11 +343,11 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
     # Move raw projections to CPU to avoid unstable GPU broadcast kernels
     beta_cpu_raw = collect(beta_raw)
     alpha_cpu_raw = collect(alpha_raw)
-    
+
     # Compute Beta and Alpha on CPU
     beta = 1.0f0 ./ (1.0f0 .+ exp.(-Float32.(beta_cpu_raw))) # sigmoid
     alpha_sp = log.(1.0f0 .+ exp.(Float32.(alpha_cpu_raw) .+ collect(m.ssm_dt_bias))) # softplus
-    
+
     # Decay gate = alpha_softplus * ssm_a
     # ssm_a is on GPU, let's bring it once
     ssm_a_cpu = collect(m.ssm_a)
@@ -324,17 +357,17 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
     # Move mixed to CPU
     qkv_cpu_h16 = collect(qkv_mixed)
     qkv_cpu = Float32.(qkv_cpu_h16)
-    
+
     conv_channels = size(m.conv_state, 2)
     conv_k = size(m.ssm_conv1d, 1)  # kernel size = 4
     conv_w = m.ssm_conv1d_cpu
- 
+
     conv_out_cpu = zeros(Float32, conv_channels, seq)
- 
+
     for t in 1:seq
         m.conv_state[1:end-1, :] .= @view m.conv_state[2:end, :]
         m.conv_state[end, :] .= @view qkv_cpu[:, t]
- 
+
         for c in 1:conv_channels
             s = 0.0f0
             for k in 1:conv_k
@@ -343,7 +376,7 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
             conv_out_cpu[c, t] = s
         end
     end
- 
+
     # SiLU on CPU
     conv_silu = conv_out_cpu ./ (1.0f0 .+ exp.(-conv_out_cpu))
 
@@ -491,14 +524,14 @@ function forward!(model::QwenModel, tokens::Vector{Int}, pos::Int, caches::Vecto
         # 3. Final Norm and Logits
         x_cpu_out = collect(x)
         x_cpu_norm = model.final_norm(x_cpu_out) # Now on CPU
-        
+
         # model.lm_head: (hidden, vocab)
         # x_cpu_norm: (hidden, seq) — but it was returned as oneArray by RMSNorm
         x_final = collect(x_cpu_norm)
-        
+
         # We want (vocab, seq) = (vocab, hidden) * (hidden, seq)
         logits = (model.lm_head') * x_final # (vocab, seq)
-        
+
         return Float32.(logits)
     catch e
         println("ERROR in forward!: ", e)

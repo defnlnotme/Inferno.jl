@@ -51,7 +51,7 @@ function extract_tensor(file::GGUF.GGUFFile, name::String)
     dims = Tuple(Int.(info.dimensions))
     inner = dims[1]
     outer = length(dims) > 1 ? dims[2] : 1
-    
+
     # Return as CPU Float16 matrix for stability during loading
     return reshape(Float16.(data32), inner, outer)
 end
@@ -74,13 +74,13 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
         post_norm = Model.RMSNorm(oneArray(post_norm_w), config.rms_norm_eps)
 
         op = if is_ssm
-            in_proj   = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_qkv.weight")))
-            gate_proj = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_gate.weight")))
-            ssm_out   = oneArray(Float32.(extract_tensor(file, "$(prefix).ssm_out.weight")))
+            in_proj   = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_qkv.weight")'))
+            gate_proj = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_gate.weight")'))
+            ssm_out   = oneArray(Float32.(extract_tensor(file, "$(prefix).ssm_out.weight")'))
 
             ssm_a      = oneArray(vec(collect(Float32.(extract_tensor(file, "$(prefix).ssm_a")))))
-            ssm_alpha  = oneArray(Float32.(extract_tensor(file, "$(prefix).ssm_alpha.weight")))
-            ssm_beta   = oneArray(Float32.(extract_tensor(file, "$(prefix).ssm_beta.weight")))
+            ssm_alpha  = oneArray(Float32.(extract_tensor(file, "$(prefix).ssm_alpha.weight")'))
+            ssm_beta   = oneArray(Float32.(extract_tensor(file, "$(prefix).ssm_beta.weight")'))
             ssm_conv1d_raw = extract_tensor(file, "$(prefix).ssm_conv1d.weight")
             ssm_conv1d_f32 = oneArray(collect(Float32.(ssm_conv1d_raw)))
             ssm_dt_bias    = oneArray(vec(collect(Float32.(extract_tensor(file, "$(prefix).ssm_dt.bias")))))
@@ -106,26 +106,26 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
                 num_v_heads, num_k_heads, head_k_dim, head_v_dim, config.ssm_inner_size,
                 ssm_conv1d_cpu)
         else
-            qw = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_q.weight")))
-            kw = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_k.weight")))
-            vw = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_v.weight")))
-            ow = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_output.weight")))
-            
+            qw = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_q.weight")'))
+            kw = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_k.weight")'))
+            vw = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_v.weight")'))
+            ow = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_output.weight")'))
+
             q_norm_w = vec(collect(Float32.(extract_tensor(file, "$(prefix).attn_q_norm.weight"))))
             k_norm_w = vec(collect(Float32.(extract_tensor(file, "$(prefix).attn_k_norm.weight"))))
             q_norm = Model.RMSNorm(oneArray(q_norm_w), config.rms_norm_eps)
             k_norm = Model.RMSNorm(oneArray(k_norm_w), config.rms_norm_eps)
 
             # Q output has packed Q+gate: size = head_dim * 2 * n_heads
-            n_heads = size(qw, 2) ÷ (config.head_dim * 2)
-            n_kv    = size(kw, 2) ÷ config.head_dim
+            n_heads = size(qw, 1) ÷ (config.head_dim * 2)
+            n_kv    = size(kw, 1) ÷ config.head_dim
 
             Model.FullAttention(qw, kw, vw, ow, q_norm, k_norm, n_heads, n_kv, config.head_dim)
         end
 
-        gate_w = oneArray(Float32.(extract_tensor(file, "$(prefix).ffn_gate.weight")))
-        up_w   = oneArray(Float32.(extract_tensor(file, "$(prefix).ffn_up.weight")))
-        down_w = oneArray(Float32.(extract_tensor(file, "$(prefix).ffn_down.weight")))
+        gate_w = oneArray(Float32.(extract_tensor(file, "$(prefix).ffn_gate.weight")'))
+        up_w   = oneArray(Float32.(extract_tensor(file, "$(prefix).ffn_up.weight")'))
+        down_w = oneArray(Float32.(extract_tensor(file, "$(prefix).ffn_down.weight")'))
         mlp    = Model.MLP(gate_w, up_w, down_w)
 
         push!(layers, Model.DecoderLayer(in_norm, op, post_norm, mlp, is_ssm))
