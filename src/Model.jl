@@ -878,7 +878,11 @@ struct FullAttention
     prefill_pb::oneMatrix{Float32}
 end
 
-function FullAttention(wq, wk, wv, wo, q_norm, k_norm, n_heads, n_kv, hd)
+function FullAttention(wq, wk, wv, wo, q_norm, k_norm, config::QwenConfig)
+    hd = config.head_dim
+    n_heads = size(wq, 1) ÷ (hd * 2)
+    n_kv = size(wk, 1) ÷ hd
+
     decode_q_full = oneArray(zeros(Float32, hd * 2 * n_heads, 1))
     decode_k = oneArray(zeros(Float32, hd * n_kv, 1))
     decode_v = oneArray(zeros(Float32, hd * n_kv, 1))
