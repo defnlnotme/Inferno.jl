@@ -610,28 +610,6 @@ function softplus_kernel!(out, x, bias, N)
     return nothing
 end
 
-# GPU 1D convolution kernel for SSM (simplified for compatibility)
-function conv1d_kernel!(out, input, weight, conv_state, kernel_size, channels, seq)
-    c = get_global_id(1)
-    if c <= channels
-        for t in 1:seq
-            # Update conv state ring buffer
-            for k in 1:(kernel_size-1)
-                conv_state[k, c] = conv_state[k+1, c]
-            end
-            conv_state[kernel_size, c] = input[c, t]
-            
-            # Compute convolution
-            s = 0.0f0
-            for k in 1:kernel_size
-                s += weight[k, c] * conv_state[k, c]
-            end
-            out[c, t] = s
-        end
-    end
-    return nothing
-end
-
 # GPU SiLU kernel
 function silu_kernel!(out, x, N)
     i = get_global_id(1)
