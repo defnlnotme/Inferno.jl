@@ -122,10 +122,10 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
             ssm_conv1d_cpu = collect(Float32.(ssm_conv1d_raw))
 
             Model.GatedDeltaNet(in_proj, gate_proj, ssm_out,
-                ssm_a, ssm_alpha, ssm_beta, ssm_conv1d_f32, ssm_dt_bias, ssm_norm,
+                ssm_a, ssm_alpha, ssm_beta, ssm_conv1d_f32, ssm_conv1d_cpu, ssm_dt_bias, ssm_norm,
                 conv_state, ssm_state,
-                num_v_heads, num_k_heads, head_k_dim, head_v_dim, config.ssm_inner_size,
-                ssm_conv1d_cpu)
+                num_v_heads, num_k_heads, head_k_dim, head_v_dim, config.ssm_inner_size)
+
         else
             qw = get_weight(file, "$(prefix).attn_q.weight")
             kw = get_weight(file, "$(prefix).attn_k.weight")

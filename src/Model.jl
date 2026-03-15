@@ -1024,6 +1024,7 @@ struct GatedDeltaNet
     ssm_alpha::Union{oneMatrix{Float32}, QuantMatrix}   # (hidden, num_v_heads=16) — dt projection
     ssm_beta::Union{oneMatrix{Float32}, QuantMatrix}    # (hidden, num_v_heads=16) — beta projection
     ssm_conv1d::oneArray{Float32,2} # (conv_kernel=4, conv_channels=6144) — F32
+    ssm_conv1d_cpu::Matrix{Float32} # CPU copy of conv1d weights
     ssm_dt_bias::oneVector{Float32} # GPU dt bias
     ssm_norm::RMSNorm               # (head_v_dim=128,) for output norm
     # CPU state buffers (kept on CPU for efficiency)
@@ -1048,8 +1049,8 @@ struct GatedDeltaNet
     prefill_alpha::oneMatrix{Float32}
 end
 
-function GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, ssm_conv1d, ssm_dt_bias, ssm_norm,
-                       conv_state, ssm_state, num_v_heads, num_k_heads, head_k_dim, head_v_dim, d_inner, ssm_conv1d_cpu)
+function GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, ssm_conv1d, ssm_conv1d_cpu, ssm_dt_bias, ssm_norm,
+                       conv_state, ssm_state, num_v_heads, num_k_heads, head_k_dim, head_v_dim, d_inner)
     conv_channels = size(ssm_conv1d, 2)
     
     # Keep essential GPU buffers only
@@ -1070,7 +1071,7 @@ function GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, 
     # Convert conv1d to GPU if needed
     ssm_conv1d_gpu = ssm_conv1d isa oneArray ? ssm_conv1d : oneArray(Float32.(ssm_conv1d))
     
-    return GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, ssm_conv1d_gpu, ssm_dt_bias, ssm_norm,
+    return GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, ssm_conv1d_gpu, ssm_conv1d_cpu, ssm_dt_bias, ssm_norm,
                          conv_state, ssm_state, num_v_heads, num_k_heads, head_k_dim, head_v_dim, d_inner,
                          decode_beta, decode_alpha, decode_decay_gate, decode_conv_out,
                          decode_z, decode_output_normed, decode_gated,
@@ -1123,7 +1124,7 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
         
         # Compute convolution
         conv_out_cpu = zeros(Float32, conv_channels, 1)
-        conv_w_cpu = collect(m.ssm_conv1d)
+        conv_w_cpu = m.ssm_conv1d_cpu
         for c in 1:conv_channels
             s = 0.0f0
             for k in 1:conv_kernel
@@ -1235,7 +1236,7 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
         # Process on CPU for prefill
         conv_out_cpu = zeros(Float32, conv_channels, seq)
         conv_state_cpu = zeros(Float32, conv_kernel, conv_channels)
-        conv_w_cpu = collect(m.ssm_conv1d)
+        conv_w_cpu = m.ssm_conv1d_cpu
         
         for t in 1:seq
             # Update conv state
