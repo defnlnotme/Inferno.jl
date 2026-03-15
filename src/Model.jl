@@ -655,16 +655,25 @@ mutable struct KVCache
 end
 
 function init_kv_cache(head_dim, n_kv, max_seq)
-    try
-        # Use reasonable fixed size - 4096 is enough for most use cases
-        # Lazy allocation was causing memory issues
-        actual_seq = min(max_seq, 4096)
-        k = zeros(Float32, head_dim, n_kv, actual_seq) |> oneArray
-        v = zeros(Float32, head_dim, n_kv, actual_seq) |> oneArray
-        return KVCache(k, v, 0)
-    catch e
-        @error "Failed to initialize KV cache on GPU: $e"
-        rethrow(e)
+    # Use smaller default to avoid driver issues on Intel Arc
+    # See: https://github.com/JuliaGPU/oneAPI.jl/issues/458
+    actual_seq = min(max_seq, 512)  # Start with 512 instead of 4096
+    
+    # Try smaller allocation first, then progressively increase if needed
+    for try_seq in [128, 256, 512]
+        try
+            seq = min(try_seq, max_seq)
+            k = oneArray(zeros(Float32, head_dim, n_kv, seq))
+            v = oneArray(zeros(Float32, head_dim, n_kv, seq))
+            return KVCache(k, v, 0)
+        catch e
+            if try_seq == 512  # Last attempt
+                @error "Failed to initialize KV cache on GPU: $e"
+                rethrow(e)
+            end
+            # Try smaller size
+            continue
+        end
     end
 end
 
