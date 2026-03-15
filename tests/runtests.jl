@@ -7,6 +7,13 @@ const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
 
 @testset "Inferno Tests" begin
 
+    @testset "Security: Unbounded string allocation" begin
+        io = IOBuffer()
+        write(io, UInt64(typemax(UInt64))) # Arbitrarily large length
+        seekstart(io)
+        @test_throws ErrorException Inferno.GGUF.read_string(io)
+    end
+
     @testset "GGUF Parsing" begin
         file = Inferno.GGUF.read_gguf(MODEL_PATH)
 
