@@ -880,16 +880,16 @@ struct GatedDeltaNet
     ssm_conv1d::oneArray{Float32,2} # (conv_kernel=4, conv_channels=6144) — F32
     ssm_dt_bias::oneVector{Float32} # GPU dt bias
     ssm_norm::RMSNorm               # (head_v_dim=128,) for output norm
-    # GPU state buffers (minimal)
-    conv_state::oneArray{Float32,2} # GPU buffer: (conv_kernel, conv_channels) — ring buffer  
-    ssm_state::oneArray{Float32,3}  # GPU: (head_v_dim, head_k_dim, num_v_heads) state matrix
+    # CPU state buffers (kept on CPU for efficiency)
+    conv_state::Matrix{Float32} # CPU: (conv_kernel, conv_channels) — ring buffer  
+    ssm_state::Array{Float32}    # CPU: (head_v_dim, head_k_dim, num_v_heads) state matrix
     # Dimensions
     num_v_heads::Int    # = 16 (ssm_time_step_rank)
     num_k_heads::Int    # = 16 (ssm_group_count)
     head_k_dim::Int     # = 128 (ssm_state_size)
     head_v_dim::Int     # = 128 (d_inner / num_v_heads)
     d_inner::Int        # = 2048
-    # Essential GPU buffers for operations
+    # Essential GPU buffers for operations (decode path)
     decode_beta::oneMatrix{Float32}
     decode_alpha::oneMatrix{Float32}
     decode_decay_gate::oneMatrix{Float32}
@@ -897,6 +897,9 @@ struct GatedDeltaNet
     decode_z::oneMatrix{Float32}
     decode_output_normed::oneMatrix{Float32}
     decode_gated::oneMatrix{Float32}
+    # Prefill buffers
+    prefill_beta::oneMatrix{Float32}
+    prefill_alpha::oneMatrix{Float32}
 end
 
 function GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, ssm_conv1d, ssm_dt_bias, ssm_norm,
@@ -912,30 +915,25 @@ function GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, 
     decode_output_normed = oneArray(zeros(Float32, head_v_dim * num_v_heads, 1))
     decode_gated = oneArray(zeros(Float32, d_inner, 1))
     
+    # Prefill buffers - sized for max context
+    max_seq = 4096
+    prefill_beta = oneArray(zeros(Float32, num_v_heads, max_seq))
+    prefill_alpha = oneArray(zeros(Float32, num_v_heads, max_seq))
+    
     # Convert conv1d to GPU if needed
     ssm_conv1d_gpu = ssm_conv1d isa oneArray ? ssm_conv1d : oneArray(Float32.(ssm_conv1d))
     
     return GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, ssm_conv1d_gpu, ssm_dt_bias, ssm_norm,
                          conv_state, ssm_state, num_v_heads, num_k_heads, head_k_dim, head_v_dim, d_inner,
                          decode_beta, decode_alpha, decode_decay_gate, decode_conv_out,
-                         decode_z, decode_output_normed, decode_gated)
+                         decode_z, decode_output_normed, decode_gated,
+                         prefill_beta, prefill_alpha)
 end
 
 function reset_states!(m::GatedDeltaNet)
-    try
-        # Try to reset GPU arrays in-place
-        fill!(m.conv_state, 0.0f0)
-        fill!(m.ssm_state, 0.0f0)
-    catch e
-        @warn "GPU reset failed, using CPU fallback: $e"
-        # CPU fallback - create new arrays if GPU operations fail
-        try
-            m.conv_state .= oneArray(zeros(Float32, size(m.conv_state)))
-            m.ssm_state .= oneArray(zeros(Float32, size(m.ssm_state)))
-        catch e2
-            @warn "CPU fallback also failed, skipping reset: $e2"
-        end
-    end
+    # Reset CPU state buffers
+    fill!(m.conv_state, 0.0f0)
+    fill!(m.ssm_state, 0.0f0)
 end
 
 function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbedding, cache::KVCache)
@@ -944,6 +942,7 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
     conv_kernel = 4
     
     if seq == 1
+        # Decode path - optimized for minimal memory usage
         # 1. Input projections
         qkv_mixed = mat_mul(m.in_proj, x)    # (6144, 1)
         z         = mat_mul(m.gate_proj, x)  # (2048, 1)
@@ -958,40 +957,38 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
         @oneapi items=gs groups=gr sigmoid_kernel!(m.decode_beta, beta_raw, m.num_v_heads)
         @oneapi items=gs groups=gr softplus_kernel!(m.decode_alpha, alpha_raw, m.ssm_dt_bias, m.num_v_heads)
         
-        # 4. Compute decay gate on GPU
+        # 4. Compute decay gate on GPU and collect to CPU
         m.decode_decay_gate .= m.decode_alpha .* m.ssm_a
+        decay_gate_cpu = collect(m.decode_decay_gate)
+        beta_cpu = collect(m.decode_beta)
+        z_cpu = collect(z)
         
-        # 5. 1D convolution (CPU fallback for stability)
+        # 5. 1D convolution on CPU
         qkv_cpu = collect(qkv_mixed)
-        conv_out_cpu = zeros(Float32, conv_channels, 1)
-        conv_state_cpu = collect(m.conv_state)
-        conv_w_cpu = collect(m.ssm_conv1d)
         
-        # Update conv state ring buffer
-        for k in 1:(conv_kernel-1)
-            conv_state_cpu[k, :] .= conv_state_cpu[k+1, :]
+        # Shift conv state ring buffer - copy from next position
+        for c in 1:conv_channels
+            for k in 1:(conv_kernel-1)
+                m.conv_state[k, c] = m.conv_state[k+1, c]
+            end
+            m.conv_state[conv_kernel, c] = qkv_cpu[c, 1]
         end
-        conv_state_cpu[conv_kernel, :] .= qkv_cpu[:, 1]
         
         # Compute convolution
+        conv_out_cpu = zeros(Float32, conv_channels, 1)
+        conv_w_cpu = collect(m.ssm_conv1d)
         for c in 1:conv_channels
             s = 0.0f0
             for k in 1:conv_kernel
-                s += conv_w_cpu[k, c] * conv_state_cpu[k, c]
+                s += conv_w_cpu[k, c] * m.conv_state[k, c]
             end
             conv_out_cpu[c, 1] = s
         end
         
-        m.decode_conv_out .= oneArray(conv_out_cpu)
-        m.conv_state .= oneArray(conv_state_cpu)
+        # 6. SiLU on CPU
+        conv_out_cpu .*= (1.0f0 ./ (1.0f0 .+ exp.(-conv_out_cpu)))
         
-        # 6. SiLU (GPU)
-        gs = min(conv_channels, 256)
-        gr = cld(conv_channels, gs)
-        @oneapi items=gs groups=gr silu_kernel!(m.decode_conv_out, m.decode_conv_out, conv_channels)
-        
-        # 7. Split into Q, K, V and process (CPU for now)
-        conv_out_cpu = collect(m.decode_conv_out)
+        # 7. Split into Q, K, V
         qkv_size = m.head_k_dim * m.num_k_heads  # 2048
         v_size = m.head_v_dim * m.num_v_heads     # 2048
         
@@ -999,100 +996,94 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
         k_flat = @view conv_out_cpu[qkv_size+1:2*qkv_size, :]              # (2048, 1)
         v_flat = @view conv_out_cpu[2*qkv_size+1:2*qkv_size+v_size, :]     # (2048, 1)
         
-        # 8. L2-normalize Q and K (CPU)
+        # 8. L2-normalize Q and K on CPU
         q_4d = reshape(q_flat, m.head_k_dim, m.num_k_heads, seq)
         k_4d = reshape(k_flat, m.head_k_dim, m.num_k_heads, seq)
         v_4d = reshape(v_flat, m.head_v_dim, m.num_v_heads, seq)
         
-        for t in 1:seq
-            for h in 1:m.num_k_heads
-                q_vec = @view q_4d[:, h, t]
-                k_vec = @view k_4d[:, h, t]
-                q_norm_val = sqrt(sum(abs2, q_vec) + m.ssm_norm.eps)
-                k_norm_val = sqrt(sum(abs2, k_vec) + m.ssm_norm.eps)
-                q_4d[:, h, t] ./= q_norm_val
-                k_4d[:, h, t] ./= k_norm_val
-            end
+        for h in 1:m.num_k_heads
+            q_vec = @view q_4d[:, h, 1]
+            k_vec = @view k_4d[:, h, 1]
+            q_norm_val = sqrt(sum(abs2, q_vec) + m.ssm_norm.eps)
+            k_norm_val = sqrt(sum(abs2, k_vec) + m.ssm_norm.eps)
+            q_4d[:, h, 1] ./= q_norm_val
+            k_4d[:, h, 1] ./= k_norm_val
         end
         
-        # 9. SSM recurrence (CPU for now)
-        output_cpu = zeros(Float32, m.head_v_dim, m.num_v_heads, seq)
-        beta_cpu = collect(m.decode_beta)
-        decay_gate_cpu = collect(m.decode_decay_gate)
-        
-        for t in 1:seq
-            for vh in 1:m.num_v_heads
-                g = exp(decay_gate_cpu[vh, t])
-                b = beta_cpu[vh, t]
-                
-                kh = vh
-                k_vec = @view k_4d[:, kh, t]
-                v_vec = @view v_4d[:, vh, t]
-                q_vec = @view q_4d[:, kh, t]
-                
-                state = @view m.ssm_state[:, :, vh]
-                
-                # Update state (using allowscalar for GPU compatibility)
-                oneAPI.@allowscalar begin
-                    for i in 1:m.head_v_dim
-                        vi_b = v_vec[i] * b
-                        for j in 1:m.head_k_dim
-                            state[i, j] = g * state[i, j] + vi_b * k_vec[j]
-                        end
-                    end
-                end
-                
-                # Compute output (using allowscalar for GPU compatibility)
-                oneAPI.@allowscalar begin
-                    for i in 1:m.head_v_dim
-                        s = 0.0f0
-                        for j in 1:m.head_k_dim
-                            s += state[i, j] * q_vec[j]
-                        end
-                        output_cpu[i, vh, t] = s
-                    end
+        # 9. SSM recurrence on CPU - use in-place update of m.ssm_state
+        for vh in 1:m.num_v_heads
+            g = exp(decay_gate_cpu[vh, 1])
+            b = beta_cpu[vh, 1]
+            
+            kh = vh
+            k_vec = @view k_4d[:, kh, 1]
+            v_vec = @view v_4d[:, vh, 1]
+            q_vec = @view q_4d[:, kh, 1]
+            
+            # Update state in-place
+            state = @view m.ssm_state[:, :, vh]
+            for i in 1:m.head_v_dim
+                vi_b = v_vec[i] * b
+                for j in 1:m.head_k_dim
+                    state[i, j] = g * state[i, j] + vi_b * k_vec[j]
                 end
             end
         end
         
-        # 10. Final processing
-        output_flat = reshape(output_cpu, m.head_v_dim * m.num_v_heads, seq)
-        output_gpu = oneArray(output_flat)
+        # 10. Compute output on CPU
+        output_cpu = zeros(Float32, m.head_v_dim * m.num_v_heads, seq)
+        for vh in 1:m.num_v_heads
+            kh = vh
+            q_vec = @view q_4d[:, kh, 1]
+            for i in 1:m.head_v_dim
+                s = 0.0f0
+                for j in 1:m.head_k_dim
+                    s += m.ssm_state[i, j, vh] * q_vec[j]
+                end
+                output_cpu[(vh-1)*m.head_v_dim + i, 1] = s
+            end
+        end
+        
+        # 11. Final processing on GPU
+        output_gpu = oneArray(output_cpu)
         rmsnorm!(m.decode_output_normed, output_gpu, m.ssm_norm)
         
         # GPU SiLU on z and gating
-        gs = min(m.d_inner, 256)
-        gr = cld(m.d_inner, gs)
-        @oneapi items=gs groups=gr silu_kernel!(m.decode_gated, m.decode_z, m.d_inner)
+        z_silu = z_cpu .* (1.0f0 ./ (1.0f0 .+ exp.(-z_cpu)))
+        z_silu_gpu = oneArray(z_silu)
+        m.decode_gated .= z_silu_gpu
         m.decode_gated .*= m.decode_output_normed
         
         return mat_mul(m.ssm_out, m.decode_gated)
         
     else
-        # Prefill path - simplified implementation
+        # Prefill path - simplified: compute on CPU to avoid complexity
         qkv_mixed = mat_mul(m.in_proj, x)
         z = mat_mul(m.gate_proj, x)
         
-        beta_raw = mat_mul(m.ssm_beta, x)
-        alpha_raw = mat_mul(m.ssm_alpha, x)
+        # Compute beta and alpha on CPU
+        beta_raw = collect(mat_mul(m.ssm_beta, x))
+        alpha_raw = collect(mat_mul(m.ssm_alpha, x))
         
-        # GPU sigmoid and softplus
-        beta = oneArray(zeros(Float32, size(beta_raw)))
-        alpha = oneArray(zeros(Float32, size(alpha_raw)))
+        seq = size(beta_raw, 2)
         
-        N = length(beta_raw)
-        gs = min(N, 256)
-        gr = cld(N, gs)
-        @oneapi items=gs groups=gr sigmoid_kernel!(beta, beta_raw, N)
-        @oneapi items=gs groups=gr softplus_kernel!(alpha, alpha_raw, m.ssm_dt_bias, N)
+        # CPU sigmoid
+        beta = 1.0f0 ./ (1.0f0 .+ exp.(-beta_raw))
         
-        decay_gate = alpha .* m.ssm_a
+        # CPU softplus: softplus(x) = log(1 + exp(x))
+        ssm_dt_bias_cpu = collect(m.ssm_dt_bias)
+        alpha_raw_cpu = alpha_raw .+ reshape(ssm_dt_bias_cpu, :, 1)
+        alpha = log.(1.0f0 .+ exp.(alpha_raw_cpu))
         
-        # CPU fallback for prefill
+        # Compute decay gate: alpha * ssm_a
+        ssm_a_cpu = collect(m.ssm_a)
+        decay_gate = alpha .* ssm_a_cpu
+        
+        # CPU computation for prefill
         qkv_cpu = collect(qkv_mixed)
         z_cpu = collect(z)
-        beta_cpu = collect(beta)
-        decay_gate_cpu = collect(decay_gate)
+        beta_cpu = beta
+        decay_gate_cpu = decay_gate
         
         # Process on CPU for prefill
         conv_out_cpu = zeros(Float32, conv_channels, seq)
@@ -1178,19 +1169,18 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
             end
         end
         
-        # Final processing
+        # Final processing - reuse decode buffers
         output_flat = reshape(output_cpu, m.head_v_dim * m.num_v_heads, seq)
         output_gpu = oneArray(output_flat)
-        output_normed = oneArray(zeros(Float32, size(output_flat)))
-        rmsnorm!(output_normed, output_gpu, m.ssm_norm)
+        rmsnorm!(m.decode_output_normed, output_gpu, m.ssm_norm)
         
         z_silu = z_cpu .* (1.0f0 ./ (1.0f0 .+ exp.(-z_cpu)))
         # Ensure z_silu has same dimensions as output_normed
-        if size(z_silu, 2) != size(output_normed, 2)
-            z_silu = z_silu[:, 1:size(output_normed, 2)]
+        if size(z_silu, 2) != size(m.decode_output_normed, 2)
+            z_silu = z_silu[:, 1:size(m.decode_output_normed, 2)]
         end
         z_silu_gpu = oneArray(z_silu)
-        gated = output_normed .* z_silu_gpu
+        gated = m.decode_output_normed .* z_silu_gpu
         
         return mat_mul(m.ssm_out, gated)
     end

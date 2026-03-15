@@ -114,6 +114,7 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
             head_v_dim  = config.ssm_inner_size ÷ num_v_heads  # 128
             conv_channels = config.ssm_inner_size + 2 * num_k_heads * head_k_dim  # 6144
 
+            # Keep SSM state on CPU for efficiency - avoid GPU-CPU transfers
             conv_state = zeros(Float32, conv_kernel, conv_channels)  # CPU ring buffer
             ssm_state  = zeros(Float32, head_v_dim, head_k_dim, num_v_heads)  # CPU state matrix
 

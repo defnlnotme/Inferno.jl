@@ -242,7 +242,7 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
             put!(chan, token_str)
 
             # Decode: each step passes current cache.pos as the position
-            for _ in 1:(max_tokens-1)
+            for step in 1:(max_tokens-1)
                 if last_token == (stop_token === nothing ? tok.eos_id : stop_token)
                     break
                 end
@@ -256,6 +256,11 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
 
                 token_str = Tokenizer.decode(tok, [last_token])
                 put!(chan, token_str)
+                
+                # Force GC every few tokens to prevent memory buildup
+                if step % 4 == 0
+                    GC.gc(false)
+                end
             end
         catch e
             if e isa InterruptException
