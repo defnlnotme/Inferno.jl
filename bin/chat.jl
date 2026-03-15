@@ -55,13 +55,33 @@ function format_messages(system_prompt::String, messages::Vector{Pair{String, St
     return join(parts, "\n")
 end
 
+function handle_command(input::String, messages::Vector{Pair{String, String}})
+    cmd = strip(lowercase(input))
+    if cmd == "/exit" || cmd == "/quit"
+        println("Goodbye!")
+        return :exit
+    elseif cmd == "/clear"
+        empty!(messages)
+        println("🔥 Conversation history cleared.")
+        return :continue
+    elseif cmd == "/help"
+        println("\e[1mAvailable commands:\e[0m")
+        println("  \e[33m/exit\e[0m, \e[33m/quit\e[0m - Exit the chat")
+        println("  \e[33m/clear\e[0m       - Clear conversation history")
+        println("  \e[33m/help\e[0m        - Show this help message")
+        return :continue
+    end
+    return :none
+end
+
 function main()
     args = parse_commandline()
     
     device_arg = args["device"] == -1 ? nothing : args["device"]
-    println("🔥 Inferno Chat Interface 🔥")
+    println("\e[1;35m🔥 Inferno Chat Interface 🔥\e[0m")
     println("Loading model from: $(args["model"])")
     
+    Base.exit_on_sigint(false)
     model, tok = Inferno.load_model(args["model"]; device=device_arg)
     
     messages = Pair{String, String}[]
@@ -71,53 +91,112 @@ function main()
         push!(messages, "user" => args["prompt"])
         prompt_text = format_messages(args["system-prompt"], messages)
         
-        print("\n\e[32mAssistant:\e[0m ")
+        print("\n\e[1;32mAssistant:\e[0m ")
+        flush(stdout)
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
                                               max_tokens=args["max-tokens"], 
                                               temperature=Float32(args["temperature"]), 
                                               top_p=Float32(args["top-p"]))
         
         full_response = ""
-        for token_text in stream
-            print(token_text)
-            full_response *= token_text
-            flush(stdout)
+        try
+            for token_text in stream
+                print(token_text)
+                full_response *= token_text
+                flush(stdout)
+            end
+            println()
+        catch e
+            if e isa InterruptException
+                close(stream)
+                println("\n\e[31m[Interrupted]\e[0m")
+                full_response *= " [Interrupted]"
+            else
+                rethrow(e)
+            end
         end
-        println()
         push!(messages, "assistant" => full_response)
     end
     
-    println("\nType 'exit', 'quit', or '\\q' to stop.")
+    println("\nType \e[33m/help\e[0m for commands, or just chat away!")
+    
+    is_tty = isa(stdin, Base.TTY)
     
     # Interactive loop
     while true
-        print("\n\e[36mUser:\e[0m ")
-        user_input = readline()
+        print("\e[1;36mUser:\e[0m ")
+        flush(stdout)
         
-        if isempty(strip(user_input))
+        user_input = try
+            readline()
+        catch e
+            if e isa InterruptException
+                println("^C")
+                continue
+            else
+                rethrow(e)
+            end
+        end
+        
+        if user_input === nothing || isempty(strip(user_input))
+            # readline returns nothing on EOF
+            if user_input === nothing
+                println("Goodbye!")
+                break
+            end
             continue
         end
+
+        if !is_tty
+            println(user_input)
+        end
+
+        # Handle slash commands
+        if startswith(strip(user_input), "/")
+            cmd_res = handle_command(user_input, messages)
+            if cmd_res == :exit
+                break
+            elseif cmd_res == :continue
+                continue
+            end
+            # else: might be an unknown command or just a message starting with /
+        end
+
+        # Handle legacy exit commands (optional but good for transition)
         if lowercase(strip(user_input)) in ["exit", "quit", "\\q"]
-            println("Goodbye!")
+            println("Use \e[33m/exit\e[0m to quit. Goodbye!")
             break
         end
         
         push!(messages, "user" => user_input)
         prompt_text = format_messages(args["system-prompt"], messages)
         
-        print("\e[32mAssistant:\e[0m ")
+        print("\e[1;32mAssistant:\e[0m ")
+        flush(stdout)
+        
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
                                               max_tokens=args["max-tokens"], 
                                               temperature=Float32(args["temperature"]), 
                                               top_p=Float32(args["top-p"]))
                                               
         full_response = ""
-        for token_text in stream
-            print(token_text)
-            full_response *= token_text
-            flush(stdout)
+        try
+            for token_text in stream
+                print(token_text)
+                full_response *= token_text
+                flush(stdout)
+            end
+            println()
+        catch e
+            if e isa InterruptException
+                close(stream)
+                println("\n\e[31m[Interrupted]\e[0m")
+                full_response *= " [Interrupted]"
+            else
+                rethrow(e)
+            end
         end
-        println()
+        
         push!(messages, "assistant" => full_response)
     end
 end

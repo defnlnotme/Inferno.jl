@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "8419b85e5a1a2d7df358d011a4acc0633e4d9e02"
+project_hash = "32a120a6e72baad30fa9a19d6217d55592301a74"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -185,7 +185,7 @@ uuid = "e33a78d0-f292-5ffc-b300-72abe9b543c8"
 version = "2.13.0+0"
 
 [[deps.Inferno]]
-deps = ["HTTP", "JSON3", "Libdl", "LinearAlgebra", "Mmap", "Random", "Sockets", "Statistics", "StructTypes", "oneAPI"]
+deps = ["ArgParse", "HTTP", "JSON3", "Libdl", "LinearAlgebra", "Mmap", "Random", "Sockets", "Statistics", "StructTypes"]
 path = "."
 uuid = "4e1e2c4b-a6e7-48e4-a8cc-a3a3a2d64561"
 version = "0.1.0"
@@ -678,7 +678,7 @@ version = "1.64.0+1"
 
 [[deps.oneAPI]]
 deps = ["AbstractFFTs", "AcceleratedKernels", "Adapt", "CEnum", "ExprTools", "GPUArrays", "GPUCompiler", "GPUToolbox", "KernelAbstractions", "LLVM", "Libdl", "LinearAlgebra", "NEO_jll", "Preferences", "Printf", "Random", "SPIRVIntrinsics", "SPIRV_LLVM_Translator_jll", "SPIRV_Tools_jll", "SparseArrays", "SpecialFunctions", "StaticArrays", "oneAPI_Level_Zero_Headers_jll", "oneAPI_Level_Zero_Loader_jll", "oneAPI_Support_jll"]
-git-tree-sha1 = "dd8abcb84c4cdc3344f3d6209e21ef971535491e"
+path = "vendor/oneAPI"
 uuid = "8f75cd03-7ff8-4ecb-9b8f-daf728133b1b"
 version = "2.6.1"
 

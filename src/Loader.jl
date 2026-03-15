@@ -28,7 +28,11 @@ function extract_tensor(file::GGUF.GGUFFile, name::String)
     elseif info.type == GGUF.GGML_TYPE_Q8_0
         dequantize_q8_0(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_IQ2_XXS
-        dequantize_iq2_xxs(@view(file.tensor_data[start:end]), num_elements)
+        dims = Tuple(Int.(info.dimensions))
+        inner = dims[1]
+        outer = length(dims) > 1 ? dims[2] : 1
+        raw_data = @view file.tensor_data[start:start + num_elements * 66 ÷ 256 - 1]
+        return Model.IQ2XXSMatrix(collect(raw_data), inner, outer)
     elseif info.type == GGUF.GGML_TYPE_IQ2_XS
         dequantize_iq2_xs(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_IQ2_S
@@ -56,35 +60,50 @@ function extract_tensor(file::GGUF.GGUFFile, name::String)
     return reshape(Float16.(data32), inner, outer)
 end
 
+function get_weight(file::GGUF.GGUFFile, name::String)
+    tensor = extract_tensor(file, name)
+    if tensor isa Model.IQ2XXSMatrix
+        return tensor
+    else
+        return oneArray(Float32.(tensor'))
+    end
+end
+
+function get_bias_or_norm(file::GGUF.GGUFFile, name::String)
+    tensor = extract_tensor(file, name)
+    return vec(collect(Float32.(tensor)))
+end
+
 function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
 
     embed = extract_tensor(file, "token_embd.weight")
+
 
     layers = Model.DecoderLayer[]
     for i in 0:(config.num_hidden_layers-1)
         prefix = "blk.$(i)"
         is_ssm = haskey(file.tensors, "$(prefix).ssm_a")
 
-        in_norm_w = vec(collect(Float32.(extract_tensor(file, "$(prefix).attn_norm.weight"))))
+        in_norm_w = get_bias_or_norm(file, "$(prefix).attn_norm.weight")
         in_norm = Model.RMSNorm(oneArray(in_norm_w), config.rms_norm_eps)
 
         post_norm_key = haskey(file.tensors, "$(prefix).post_attention_norm.weight") ?
                         "$(prefix).post_attention_norm.weight" : "$(prefix).attn_norm.weight"
-        post_norm_w = vec(collect(Float32.(extract_tensor(file, post_norm_key))))
+        post_norm_w = get_bias_or_norm(file, post_norm_key)
         post_norm = Model.RMSNorm(oneArray(post_norm_w), config.rms_norm_eps)
 
         op = if is_ssm
-            in_proj   = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_qkv.weight")'))
-            gate_proj = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_gate.weight")'))
-            ssm_out   = oneArray(Float32.(extract_tensor(file, "$(prefix).ssm_out.weight")'))
+            in_proj   = get_weight(file, "$(prefix).attn_qkv.weight")
+            gate_proj = get_weight(file, "$(prefix).attn_gate.weight")
+            ssm_out   = get_weight(file, "$(prefix).ssm_out.weight")
 
-            ssm_a      = oneArray(vec(collect(Float32.(extract_tensor(file, "$(prefix).ssm_a")))))
-            ssm_alpha  = oneArray(Float32.(extract_tensor(file, "$(prefix).ssm_alpha.weight")'))
-            ssm_beta   = oneArray(Float32.(extract_tensor(file, "$(prefix).ssm_beta.weight")'))
+            ssm_a      = oneArray(get_bias_or_norm(file, "$(prefix).ssm_a"))
+            ssm_alpha  = get_weight(file, "$(prefix).ssm_alpha.weight")
+            ssm_beta   = get_weight(file, "$(prefix).ssm_beta.weight")
             ssm_conv1d_raw = extract_tensor(file, "$(prefix).ssm_conv1d.weight")
             ssm_conv1d_f32 = oneArray(collect(Float32.(ssm_conv1d_raw)))
-            ssm_dt_bias    = oneArray(vec(collect(Float32.(extract_tensor(file, "$(prefix).ssm_dt.bias")))))
-            ssm_norm_w     = vec(collect(Float32.(extract_tensor(file, "$(prefix).ssm_norm.weight"))))
+            ssm_dt_bias    = oneArray(get_bias_or_norm(file, "$(prefix).ssm_dt.bias"))
+            ssm_norm_w     = get_bias_or_norm(file, "$(prefix).ssm_norm.weight")
             ssm_norm       = Model.RMSNorm(oneArray(ssm_norm_w), config.rms_norm_eps)
 
             # conv_channels = d_inner + 2 * num_k_heads * head_k_dim
@@ -106,45 +125,40 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
                 num_v_heads, num_k_heads, head_k_dim, head_v_dim, config.ssm_inner_size,
                 ssm_conv1d_cpu)
         else
-            qw = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_q.weight")'))
-            kw = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_k.weight")'))
-            vw = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_v.weight")'))
-            ow = oneArray(Float32.(extract_tensor(file, "$(prefix).attn_output.weight")'))
+            qw = get_weight(file, "$(prefix).attn_q.weight")
+            kw = get_weight(file, "$(prefix).attn_k.weight")
+            vw = get_weight(file, "$(prefix).attn_v.weight")
+            ow = get_weight(file, "$(prefix).attn_output.weight")
 
-            q_norm_w = vec(collect(Float32.(extract_tensor(file, "$(prefix).attn_q_norm.weight"))))
-            k_norm_w = vec(collect(Float32.(extract_tensor(file, "$(prefix).attn_k_norm.weight"))))
+            q_norm_w = get_bias_or_norm(file, "$(prefix).attn_q_norm.weight")
+            k_norm_w = get_bias_or_norm(file, "$(prefix).attn_k_norm.weight")
             q_norm = Model.RMSNorm(oneArray(q_norm_w), config.rms_norm_eps)
             k_norm = Model.RMSNorm(oneArray(k_norm_w), config.rms_norm_eps)
 
             # Q output has packed Q+gate: size = head_dim * 2 * n_heads
+            # Use size because get_weight returns IQ2XXSMatrix or Float32 matrix
             n_heads = size(qw, 1) ÷ (config.head_dim * 2)
             n_kv    = size(kw, 1) ÷ config.head_dim
 
             Model.FullAttention(qw, kw, vw, ow, q_norm, k_norm, n_heads, n_kv, config.head_dim)
         end
 
-        gate_w = oneArray(Float32.(extract_tensor(file, "$(prefix).ffn_gate.weight")'))
-        up_w   = oneArray(Float32.(extract_tensor(file, "$(prefix).ffn_up.weight")'))
-        down_w = oneArray(Float32.(extract_tensor(file, "$(prefix).ffn_down.weight")'))
+        gate_w = get_weight(file, "$(prefix).ffn_gate.weight")
+        up_w   = get_weight(file, "$(prefix).ffn_up.weight")
+        down_w = get_weight(file, "$(prefix).ffn_down.weight")
         mlp    = Model.MLP(gate_w, up_w, down_w)
 
         push!(layers, Model.DecoderLayer(in_norm, op, post_norm, mlp, is_ssm))
-
-        oneAPI.synchronize()
-        GC.gc()
     end
 
-    final_norm_w = vec(collect(Float32.(extract_tensor(file, "output_norm.weight"))))
+    final_norm_w = get_bias_or_norm(file, "output_norm.weight")
     final_norm = Model.RMSNorm(oneArray(final_norm_w), config.rms_norm_eps)
 
     lm_head_raw = haskey(file.tensors, "output.weight") ?
                   extract_tensor(file, "output.weight") : embed
-    lm_head = Float32.(lm_head_raw)
+    lm_head = Float32.(lm_head_raw)  # Keep on CPU for now
 
     rope = Model.RotaryEmbedding(config.head_dim; base=config.rope_theta)
-
-    oneAPI.synchronize()
-    GC.gc()
 
     return Model.QwenModel(config, Float32.(embed), layers, final_norm, lm_head, rope)
 end

@@ -22,6 +22,59 @@ using .Server
 
 export load_model, start_server
 
+# Probe a device for the ZE_RESULT_ERROR_UNKNOWN driver corruption bug.
+# Per JuliaGPU/oneAPI.jl#458: Intel Arc driver permanently corrupts the L0 command
+# queue across process boundaries after mixed HostBuffer/DeviceBuffer kernel ops.
+# A small probe (4 bytes) passes even on corrupted devices; medium probes (256KB) detect
+# devices that fail quickly. Large uploads (>1MB) may hang indefinitely on some states.
+# Returns :ok, :fast_fail, or :unknown
+function probe_device(dev)::Symbol
+    try
+        oneAPI.device!(dev)
+        # Small probe to detect immediate failures
+        arr = oneArray(Int32[1])
+        oneAPI.unsafe_free!(arr)
+        # Medium probe to detect partial failures (256KB)
+        arr2 = oneArray(zeros(Float32, 64 * 1024))
+        oneAPI.unsafe_free!(arr2)
+        return :ok
+    catch
+        return :fast_fail
+    end
+end
+
+function select_device!(devs, requested_device)
+    if !isnothing(requested_device)
+        # Use specific requested device
+        target_idx = clamp(requested_device, 1, length(devs))
+        oneAPI.device!(devs[target_idx])
+        println("Using requested GPU $target_idx: $(oneAPI.device())")
+        return target_idx
+    end
+    
+    # Auto-select: start from second GPU, probe devices to find working one
+    # Default to GPU 2 (index 2) if available, else try others
+    start_idx = min(2, length(devs))
+    for offset in 0:(length(devs)-1)
+        i = mod1(start_idx + offset, length(devs))
+        dev = devs[i]
+        status = probe_device(dev)
+        if status == :ok
+            oneAPI.device!(dev)
+            println("Using GPU $i (probed OK): $(oneAPI.device())")
+            return i
+        else
+            println("Skipping GPU $i (probe failed: $status)")
+        end
+    end
+    
+    # Fallback to first device if all fail
+    target_idx = 1
+    oneAPI.device!(devs[target_idx])
+    println("All devices failed probe, falling back to GPU $target_idx: $(oneAPI.device())")
+    return target_idx
+end
+
 """
     load_model(path; device=nothing) -> (QwenModel, BPETokenizer)
 
@@ -29,19 +82,10 @@ Load a GGUF model file and return the constructed model + tokenizer.
 """
 function load_model(path::String; device::Union{Int, Nothing}=nothing)
     devs = collect(oneAPI.devices())
-    if !isempty(devs)
-        # Default to GPU 2 if available per user's rule, otherwise 1.
-        target_dev = isnothing(device) ? (length(devs) >= 2 ? 2 : 1) : device
-        if 1 <= target_dev <= length(devs)
-            oneAPI.device!(devs[target_dev])
-            println("Using GPU $target_dev: $(oneAPI.device())")
-        else
-            @warn "Requested device index $target_dev out of bounds. Using GPU 1."
-            oneAPI.device!(devs[1])
-            println("Using GPU 1: $(oneAPI.device())")
-        end
-    else
+    if isempty(devs)
         @warn "No oneAPI devices found."
+    else
+        select_device!(devs, device)
     end
 
     println("Loading GGUF file: $path")
@@ -49,7 +93,6 @@ function load_model(path::String; device::Union{Int, Nothing}=nothing)
     println("  Metadata keys: $(length(file.metadata))")
     println("  Tensors: $(length(file.tensors))")
 
-    # GGUF uses the architecture name as prefix for model-specific keys
     arch = get(file.metadata, "general.architecture", "llm")
 
     config = Model.QwenConfig(
@@ -73,6 +116,7 @@ function load_model(path::String; device::Union{Int, Nothing}=nothing)
     println("  Config: hidden=$(config.hidden_size), layers=$(config.num_hidden_layers), heads=$(config.num_attention_heads)")
 
     println("Loading weights...")
+    Model.init_gpu_tables(QuantsData.IQ2XXS_GRID, QuantsData.KSIGNS_IQ2XS, QuantsData.KMASK_IQ2XS)
     model = Loader.load_weights(file, config)
     println("Model loaded successfully.")
 
