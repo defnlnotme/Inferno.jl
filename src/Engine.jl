@@ -23,24 +23,6 @@ function gpu_argmax(logits::oneVector{Float32})
     return argmax(logits_cpu)
 end
 
-# GPU softmax with temperature scaling
-function gpu_softmax(logits::oneVector{Float32}, temperature::Float32)
-    if temperature == 0.0f0
-        return gpu_argmax(logits)
-    end
-    
-    # Scale on GPU
-    scaled_logits = gpu_temperature_scale(logits, temperature)
-    
-    # Compute softmax on CPU for now (can be optimized later)
-    mx = maximum(scaled_logits)
-    exp_vals = exp.(scaled_logits .- mx)
-    sum_exp = sum(exp_vals)
-    probs = exp_vals ./ sum_exp
-    
-    return simple_sample(probs)
-end
-
 module Engine
 
 using ..Model
