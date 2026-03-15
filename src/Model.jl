@@ -45,6 +45,7 @@ const KSIGNS_IQ2XS_GPU = Ref{oneVector{UInt8}}()
 const KMASK_IQ2XS_GPU = Ref{oneVector{UInt8}}()
 
 function init_gpu_tables(grid, signs_table, kmask)
+    # Use DeviceBuffer but ensured by our fixed copyto! (GPU-driven)
     IQ2XXS_GRID_GPU[] = oneArray(grid)
     KSIGNS_IQ2XS_GPU[] = oneArray(signs_table)
     KMASK_IQ2XS_GPU[] = oneArray(kmask)
@@ -77,11 +78,38 @@ function rms_norm_kernel!(out, x, weight, eps, N)
     return nothing
 end
 
+# Helper to allocate on SharedBuffer (RAM accessible to GPU) to avoid 458 bug and save VRAM
+function oneSharedArray(T::Type, dims...)
+    return oneArray{T, length(dims), oneAPI.oneL0.SharedBuffer}(undef, dims...)
+end
+
+
+
+# Corrected RMSNorm kernel to normalize over the first dimension (hidden size)
+function rms_norm_kernel!(out, x, weight, eps, rows, cols)
+    j = get_global_id(1)
+    if j <= cols
+        acc = 0.0f0
+        @inbounds for i in 1:rows
+            v = x[i, j]
+            acc += v * v
+        end
+        inv_rms = 1.0f0 / sqrt(acc / Float32(rows) + eps)
+        @inbounds for i in 1:rows
+            out[i, j] = x[i, j] * inv_rms * weight[i]
+        end
+    end
+    return nothing
+end
+
 function (norm::RMSNorm)(x::oneAPI.oneArray{Float32, N}) where N
-    # GPU-native RMSNorm using broadcast - no temporaries allocated beyond the output
-    m = sum(x .* x, dims=1) .* (1.0f0 / Float32(size(x, 1)))
-    inv_rms = 1.0f0 ./ sqrt.(m .+ norm.eps)
-    return x .* inv_rms .* norm.weight
+    rows = size(x, 1)
+    cols = length(x) ÷ rows
+    out = similar(x)
+    gs = min(cols, 256)
+    gr = cld(cols, gs)
+    @oneapi items=gs groups=gr rms_norm_kernel!(out, x, norm.weight, norm.eps, rows, cols)
+    return out
 end
 
 function is_gpu(x)
@@ -96,11 +124,9 @@ function is_gpu(x)
 end
 
 function (norm::RMSNorm)(x::AbstractArray{Float32, N}) where N
-    # Handle SubArray/ReshapedArray on GPU without collection
     if is_gpu(x)
-        m = sum(x .* x, dims=1) .* (1.0f0 / Float32(size(x, 1)))
-        inv_rms = 1.0f0 ./ sqrt.(m .+ norm.eps)
-        return x .* inv_rms .* norm.weight
+        inner = oneArray(x)
+        return norm(inner)
     else
         # Real CPU fallback
         w_cpu = collect(norm.weight)
@@ -110,32 +136,18 @@ function (norm::RMSNorm)(x::AbstractArray{Float32, N}) where N
     end
 end
 
-# In-place RMSNorm that writes into a pre-allocated buffer (no allocation)
+# In-place RMSNorm that writes into a pre-allocated buffer
 function rmsnorm!(out::oneMatrix{Float32}, x::oneMatrix{Float32}, norm::RMSNorm)
-    # CPU fallback for rmsnorm to avoid GPU scalar indexing issues
-    x_cpu = collect(x)
-    weight_cpu = collect(norm.weight)  # Ensure weight is on CPU
-    m = sum(x_cpu .* x_cpu, dims=1) .* (1.0f0 / Float32(size(x_cpu, 1)))
-    inv_rms = 1.0f0 ./ sqrt.(m .+ norm.eps)
-    
-    # Handle dimension mismatch by using element-wise multiplication
-    weight_size = length(weight_cpu)
-    if weight_size == size(x_cpu, 1)
-        # Normal case - weight matches first dimension
-        out_cpu = x_cpu .* inv_rms .* reshape(weight_cpu, :, 1)
-    else
-        # Mismatch case - use element-wise with proper indexing
-        out_cpu = similar(x_cpu)
-        for i in 1:size(x_cpu, 1)
-            w_idx = mod1(i, weight_size)
-            for j in 1:size(x_cpu, 2)
-                out_cpu[i, j] = x_cpu[i, j] * inv_rms[j] * weight_cpu[w_idx]
-            end
-        end
-    end
-    
-    out .= oneArray(out_cpu)
+    rows, cols = size(x)
+    gs = min(cols, 256)
+    gr = cld(cols, gs)
+    @oneapi items=gs groups=gr rms_norm_kernel!(out, x, norm.weight, norm.eps, rows, cols)
     return out
+end
+
+function rmsnorm(x::oneMatrix{Float32}, norm::RMSNorm)
+    out = similar(x)
+    return rmsnorm!(out, x, norm)
 end
 
 # --- GPU Sampling Kernels ---
@@ -327,7 +339,7 @@ function mat_mul_iq2_xxs_kernel!(res, data, x, K, N, grid, signs_table, kmask)
                     signs = signs_table[signs_idx]
                     
                     for j in 0:7
-                        byte_val = UInt8((grid_val >> (8 * j)) & 255)
+                        byte_val = Int8((grid_val >> (8 * j)) & 255) - 8
                         is_neg = (signs & kmask[j+1]) != 0
                         f_w = db * Float32(byte_val) * (is_neg ? -1.0f0 : 1.0f0)
                         
@@ -604,10 +616,11 @@ function silu(x::AbstractArray{Float32})
 end
 
 # --- Rotary Embedding (RoPE) ---
+# --- Rotary Embedding (RoPE) ---
 struct RotaryEmbedding
     dim::Int
     base::Float32
-    inv_freq::Vector{Float32}  # Keep on CPU for now
+    inv_freq::Vector{Float32}
 end
 
 function RotaryEmbedding(dim::Int; base=10000000.0)
@@ -615,36 +628,45 @@ function RotaryEmbedding(dim::Int; base=10000000.0)
     return RotaryEmbedding(dim, Float32(base), inv_freq)
 end
 
+function rope_kernel!(x, inv_freq, pos, d, h, seq, d_rope)
+    idx = get_global_id(1)
+    if idx <= (d_rope ÷ 2) * h * seq
+        half_d = d_rope ÷ 2
+        i = (idx - 1) % half_d + 1
+        rem = (idx - 1) ÷ half_d
+        head = rem % h + 1
+        t = rem ÷ h + 1
+        
+        idx1 = 2*i - 1
+        idx2 = 2*i
+        
+        p = Float32(pos + t - 1)
+        freq = inv_freq[i] * p
+        cos_val = cos(freq)
+        sin_val = sin(freq)
+        
+        x1 = x[idx1, head, t]
+        x2 = x[idx2, head, t]
+        
+        x[idx1, head, t] = x1 * cos_val - x2 * sin_val
+        x[idx2, head, t] = x1 * sin_val + x2 * cos_val
+    end
+    return nothing
+end
+
 function (rope::RotaryEmbedding)(x::oneArray{Float32,3}, pos::Int)
     d, h, seq = size(x)
     d_rope = min(d, rope.dim)
-    # CPU fallback for rope to avoid GPU kernel issues
-    x_cpu = collect(x)
-    positions = Float32.(pos:(pos+seq-1))
-    freqs = rope.inv_freq[1:(d_rope÷2)] * positions'
-    cos_t = reshape(cos.(freqs), d_rope ÷ 2, 1, seq)
-    sin_t = reshape(sin.(freqs), d_rope ÷ 2, 1, seq)
     
-    # Element-wise rope transformation to avoid GPU issues
-    for t in 1:seq
-        for head in 1:h
-            for i in 1:(d_rope÷2)
-                idx1 = 2*i - 1
-                idx2 = 2*i
-                if idx1 <= d && idx2 <= d
-                    cos_val = cos_t[i, 1, t]
-                    sin_val = sin_t[i, 1, t]
-                    x1 = x_cpu[idx1, head, t]
-                    x2 = x_cpu[idx2, head, t]
-                    x_cpu[idx1, head, t] = x1 * cos_val - x2 * sin_val
-                    x_cpu[idx2, head, t] = x1 * sin_val + x2 * cos_val
-                end
-            end
-        end
-    end
+    inv_freq_gpu = oneArray(rope.inv_freq)
     
-    x_gpu = oneArray(x_cpu)
-    return x_gpu
+    n_elements = (d_rope ÷ 2) * h * seq
+    gs = min(n_elements, 256)
+    gr = cld(n_elements, gs)
+    
+    @oneapi items=gs groups=gr rope_kernel!(x, inv_freq_gpu, pos, d, h, seq, d_rope)
+    
+    return x
 end
 
 # --- KV Cache ---
@@ -655,25 +677,18 @@ mutable struct KVCache
 end
 
 function init_kv_cache(head_dim, n_kv, max_seq)
-    # Use smaller default to avoid driver issues on Intel Arc
-    # See: https://github.com/JuliaGPU/oneAPI.jl/issues/458
-    actual_seq = min(max_seq, 512)  # Start with 512 instead of 4096
-    
-    # Try smaller allocation first, then progressively increase if needed
-    for try_seq in [128, 256, 512]
-        try
-            seq = min(try_seq, max_seq)
-            k = oneArray(zeros(Float32, head_dim, n_kv, seq))
-            v = oneArray(zeros(Float32, head_dim, n_kv, seq))
-            return KVCache(k, v, 0)
-        catch e
-            if try_seq == 512  # Last attempt
-                @error "Failed to initialize KV cache on GPU: $e"
-                rethrow(e)
-            end
-            # Try smaller size
-            continue
-        end
+    # Correct memory-efficient initialization using DeviceBuffer
+    # Avoids CPU zeros() blowup and uses explicit fill! which is 458-safe.
+    seq = min(max_seq, 512)
+    try
+        k = oneArray{Float32}(undef, head_dim, n_kv, seq)
+        v = oneArray{Float32}(undef, head_dim, n_kv, seq)
+        fill!(k, 0.0f0)
+        fill!(v, 0.0f0)
+        return KVCache(k, v, 0)
+    catch e
+        @error "Failed to initialize KV cache: $e"
+        rethrow(e)
     end
 end
 
@@ -1178,18 +1193,21 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
             end
         end
         
-        # Final processing - reuse decode buffers
+        # Final processing
         output_flat = reshape(output_cpu, m.head_v_dim * m.num_v_heads, seq)
         output_gpu = oneArray(output_flat)
-        rmsnorm!(m.decode_output_normed, output_gpu, m.ssm_norm)
+        
+        # Only use pre-allocated buffers if seq == 1 (decoding)
+        output_normed = if seq == 1
+            rmsnorm!(m.decode_output_normed, output_gpu, m.ssm_norm)
+        else
+            rmsnorm(output_gpu, m.ssm_norm)
+        end
         
         z_silu = z_cpu .* (1.0f0 ./ (1.0f0 .+ exp.(-z_cpu)))
-        # Ensure z_silu has same dimensions as output_normed
-        if size(z_silu, 2) != size(m.decode_output_normed, 2)
-            z_silu = z_silu[:, 1:size(m.decode_output_normed, 2)]
-        end
         z_silu_gpu = oneArray(z_silu)
-        gated = m.decode_output_normed .* z_silu_gpu
+        
+        gated = output_normed .* z_silu_gpu
         
         return mat_mul(m.ssm_out, gated)
     end

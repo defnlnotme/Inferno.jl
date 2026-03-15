@@ -43,7 +43,7 @@ function dequantize_iq2_xxs(data::AbstractVector{UInt8}, num_elements::Int)
                 signs = KSIGNS_IQ2XS[signs_idx]
                 
                 for j in 0:7
-                    byte_val = UInt8((grid_val >> (8 * j)) & 0xFF)
+                    byte_val = Int8((grid_val >> (8 * j)) & 0xFF) - 8
                     is_neg = (signs & KMASK_IQ2XS[j+1]) != 0
                     y[(i-1)*256 + ib32*32 + l*8 + j + 1] = db * Float32(byte_val) * (is_neg ? -1.0f0 : 1.0f0)
                 end
@@ -85,7 +85,7 @@ function dequantize_iq2_xs(data::AbstractVector{UInt8}, num_elements::Int)
                 db = (l < 2) ? db0 : db1
                 
                 for j in 0:7
-                    byte_val = UInt8((grid_val >> (8 * j)) & 0xFF)
+                    byte_val = Int8((grid_val >> (8 * j)) & 0xFF) - 8
                     is_neg = (signs & KMASK_IQ2XS[j+1]) != 0
                     y[(i-1)*256 + ib32*32 + l*8 + j + 1] = db * Float32(byte_val) * (is_neg ? -1.0f0 : 1.0f0)
                 end
@@ -147,7 +147,7 @@ function dequantize_iq2_s(data::AbstractVector{UInt8}, num_elements::Int)
                 db = (l < 2) ? db0 : db1
                 
                 for j in 0:7
-                    byte_val = UInt8((grid_val >> (8 * j)) & 0xFF)
+                    byte_val = Int8((grid_val >> (8 * j)) & 0xFF) - 8
                     is_neg = (sign_val & KMASK_IQ2XS[j+1]) != 0
                     y[(i-1)*256 + ib32*32 + l*8 + j + 1] = db * Float32(byte_val) * (is_neg ? -1.0f0 : 1.0f0)
                 end
@@ -200,11 +200,11 @@ function dequantize_iq3_xxs(data::AbstractVector{UInt8}, num_elements::Int)
                 
                 for j in 0:3
                     y_idx = (i-1)*256 + ib32*32 + l*8 + j + 1
-                    byte_val1 = UInt8((grid1 >> (8 * j)) & 0xFF)
+                    byte_val1 = Int8((grid1 >> (8 * j)) & 0xFF) - 4
                     is_neg1 = (signs & KMASK_IQ2XS[j+1]) != 0
                     y[y_idx] = db * Float32(byte_val1) * (is_neg1 ? -1.0f0 : 1.0f0)
                     
-                    byte_val2 = UInt8((grid2 >> (8 * j)) & 0xFF)
+                    byte_val2 = Int8((grid2 >> (8 * j)) & 0xFF) - 4
                     is_neg2 = (signs & KMASK_IQ2XS[j+5]) != 0
                     y[y_idx + 4] = db * Float32(byte_val2) * (is_neg2 ? -1.0f0 : 1.0f0)
                 end
@@ -259,11 +259,11 @@ function dequantize_iq3_s(data::AbstractVector{UInt8}, num_elements::Int)
                 
                 for j in 0:3
                     y_idx = (i-1)*256 + ib32*32 + l*8 + j + 1
-                    byte_val1 = UInt8((grid1 >> (8 * j)) & 0xFF)
+                    byte_val1 = Int8((grid1 >> (8 * j)) & 0xFF) - 1
                     is_neg1 = (signs & KMASK_IQ2XS[j+1]) != 0
                     y[y_idx] = db1 * Float32(byte_val1) * (is_neg1 ? -1.0f0 : 1.0f0)
                     
-                    byte_val2 = UInt8((grid2 >> (8 * j)) & 0xFF)
+                    byte_val2 = Int8((grid2 >> (8 * j)) & 0xFF) - 1
                     is_neg2 = (signs & KMASK_IQ2XS[j+5]) != 0
                     y[y_idx + 4] = db1 * Float32(byte_val2) * (is_neg2 ? -1.0f0 : 1.0f0)
                 end
@@ -287,11 +287,11 @@ function dequantize_iq3_s(data::AbstractVector{UInt8}, num_elements::Int)
                 
                 for j in 0:3
                     y_idx = (i-1)*256 + (ib32+1)*32 + l*8 + j + 1
-                    byte_val1 = UInt8((grid1 >> (8 * j)) & 0xFF)
+                    byte_val1 = Int8((grid1 >> (8 * j)) & 0xFF) - 1
                     is_neg1 = (signs & KMASK_IQ2XS[j+1]) != 0
                     y[y_idx] = db2 * Float32(byte_val1) * (is_neg1 ? -1.0f0 : 1.0f0)
                     
-                    byte_val2 = UInt8((grid2 >> (8 * j)) & 0xFF)
+                    byte_val2 = Int8((grid2 >> (8 * j)) & 0xFF) - 1
                     is_neg2 = (signs & KMASK_IQ2XS[j+5]) != 0
                     y[y_idx + 4] = db2 * Float32(byte_val2) * (is_neg2 ? -1.0f0 : 1.0f0)
                 end

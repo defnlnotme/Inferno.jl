@@ -1,6 +1,7 @@
 using Test
 using Inferno
 using Statistics
+using oneAPI
 
 const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
 
@@ -71,6 +72,60 @@ const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
         @test hidden_size == 1024
         @test num_heads == 8
         @test num_kv_heads == 2
+    end
+
+    @testset "Dequantization Kernels (CPU)" begin
+        using Inferno.Dequant
+        using Inferno.QuantsData
+
+        @testset "IQ2_XXS" begin
+            data = zeros(UInt8, 66); data[1] = 0x00; data[2] = 0x3c # d = 1.0
+            y = dequantize_iq2_xxs(data, 256)
+            @test all(y .== 0.0f0)
+            data[3] = 0x01 # grid[2] = 0x08...082b
+            y = dequantize_iq2_xxs(data, 256)
+            @test y[1] == 4.375f0 # (43-8) * 0.125
+            @test all(y[2:8] .== 0.0f0)
+        end
+
+        @testset "IQ2_XS" begin
+            data = zeros(UInt8, 74); data[1] = 0x00; data[2] = 0x3c
+            y = dequantize_iq2_xs(data, 256)
+            @test all(y .== 0.0f0)
+        end
+
+        @testset "IQ3_XXS" begin
+            data = zeros(UInt8, 98); data[1] = 0x00; data[2] = 0x3c
+            y = dequantize_iq3_xxs(data, 256)
+            @test all(y .== 0.0f0)
+        end
+    end
+
+    @testset "CPU vs GPU Consistency" begin
+        using Inferno.Model
+        using Inferno.Dequant
+        using Inferno.QuantsData
+        
+        N, K = 1, 1024
+        data = rand(UInt8, 66 * 4)
+        for i in 1:4
+            base = (i-1)*66
+            data[base+1] = 0x00; data[base+2] = 0x3c
+        end
+        
+        weight_cpu = dequantize_iq2_xxs(data, K)
+        Model.init_gpu_tables(QuantsData.IQ2XXS_GRID, QuantsData.KSIGNS_IQ2XS, QuantsData.KMASK_IQ2XS)
+        
+        weight_gpu = Model.IQ2XXSMatrix(oneArray(data), K, N)
+        x_cpu = rand(Float32, K)
+        x_gpu = oneArray(x_cpu)
+        
+        y_cpu = sum(weight_cpu .* x_cpu)
+        res_gpu = Model.mat_mul(weight_gpu, reshape(x_gpu, K, 1))
+        y_gpu = collect(res_gpu)[1]
+        
+        println("  Consistency diff: $(abs(y_cpu - y_gpu))")
+        @test y_cpu ≈ y_gpu atol=1e-3
     end
 
     @testset "Inference" begin
