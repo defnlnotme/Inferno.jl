@@ -3,7 +3,7 @@
 # GPU temperature scaling
 function gpu_temperature_scale(logits::oneVector{Float32}, temperature::Float32)
     if temperature == 0.0f0
-        return collect(logits)  # Return to CPU for argmax
+        return logits  # Return GPU array without CPU transition
     end
     
     inv_temp = 1.0f0 / temperature
@@ -14,7 +14,7 @@ function gpu_temperature_scale(logits::oneVector{Float32}, temperature::Float32)
     gr = cld(N, gs)
     @oneapi items=gs groups=gr temperature_scale_kernel!(scaled_logits, logits, inv_temp, N)
     
-    return collect(scaled_logits)
+    return scaled_logits
 end
 
 # GPU argmax (fallback to CPU for simplicity)
@@ -30,9 +30,10 @@ function gpu_softmax(logits::oneVector{Float32}, temperature::Float32)
     end
     
     # Scale on GPU
-    scaled_logits = gpu_temperature_scale(logits, temperature)
+    scaled_logits_gpu = gpu_temperature_scale(logits, temperature)
     
     # Compute softmax on CPU for now (can be optimized later)
+    scaled_logits = collect(scaled_logits_gpu)
     mx = maximum(scaled_logits)
     exp_vals = exp.(scaled_logits .- mx)
     sum_exp = sum(exp_vals)
@@ -74,10 +75,11 @@ function sample(logits::Vector{Float32}, temperature::Float32, top_p::Float32)
         end
         
         # Temperature scaling on GPU
-        scaled_logits = gpu_temperature_scale(logits_gpu, temperature)
+        scaled_logits_gpu = gpu_temperature_scale(logits_gpu, temperature)
         
         # Continue with CPU processing for top-p and sampling
         # (can be GPU-accelerated in future optimizations)
+        scaled_logits = collect(scaled_logits_gpu)
         return cpu_sample_from_scaled(scaled_logits, temperature, top_p)
         
     catch e
