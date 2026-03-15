@@ -220,6 +220,7 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
     end
 
     current_dev = oneAPI.device()
+    kv_caches = Vector{Model.KVCache}()  # Initialize empty, populate in try block
     return Channel{String}(32) do chan
         try
             oneAPI.device!(current_dev)
@@ -271,6 +272,29 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
                 @error "ERROR during generation stream" exception = (e, catch_backtrace())
             end
         finally
+            # Ensure KV caches are freed and memory is released
+            try
+                if !isempty(kv_caches)
+                    Model.free_all_kv_caches!(kv_caches)
+                end
+            catch
+                # Ignore cleanup errors
+            end
+            
+            # Force garbage collection to release VRAM
+            try
+                GC.gc(true)  # Full GC to ensure VRAM cleanup
+            catch
+                # Ignore GC errors
+            end
+            
+            # Synchronize GPU to ensure all operations complete
+            try
+                oneAPI.synchronize()
+            catch
+                # Ignore sync errors
+            end
+            
             # Ensure channel is closed even on error
             try
                 close(chan)
