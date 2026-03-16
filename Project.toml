@@ -1,7 +1,7 @@
 name = "Inferno"
 uuid = "4e1e2c4b-a6e7-48e4-a8cc-a3a3a2d64561"
-authors = ["defnlnotme <a9pbg0vj6@mozmail.com>"]
 version = "0.1.0"
+authors = ["defnlnotme <a9pbg0vj6@mozmail.com>"]
 
 [deps]
 ArgParse = "c7e460c6-2fb9-53a9-8c5b-16f535851c63"
@@ -20,10 +20,10 @@ oneAPI = "8f75cd03-7ff8-4ecb-9b8f-daf728133b1b"
 ArgParse = "1.2.0"
 HTTP = "1.10.19"
 JSON3 = "1.14.3"
-Libdl = "1.10.0"
-LinearAlgebra = "1.10.0"
-Mmap = "1.10.0"
-Random = "1.10.0"
-Sockets = "1.10.0"
-Statistics = "1.10.0"
+Libdl = "1.11.0"
+LinearAlgebra = "1.12.0"
+Mmap = "1.11.0"
+Random = "1.11.0"
+Sockets = "1.11.0"
+Statistics = "1.11.0"
 StructTypes = "1.11.0"
