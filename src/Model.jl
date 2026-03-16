@@ -658,37 +658,6 @@ function l2_norm_ssm_kernel!(q, k, head_dim, num_heads, seq, eps)
     return nothing
 end
 
-# --- SSM Delta Net recurrence on GPU ---
-function ssm_recurrence_kernel!(output, state, q, k, v, decay_gate, beta, 
-                               head_v_dim, head_k_dim, num_v_heads, seq)
-    vh = get_global_id(1)
-    t = get_global_id(2)
-    if vh <= num_v_heads && t <= seq
-        g = exp(decay_gate[vh, t])
-        b = beta[vh, t]
-        
-        kh = vh  # 1:1 mapping for simplicity
-        
-        # Update state: state = g * state + b * v * k'
-        for i in 1:head_v_dim
-            vi_b = v[i, vh, t] * b
-            for j in 1:head_k_dim
-                state[i, j, vh] = g * state[i, j, vh] + vi_b * k[j, kh, t]
-            end
-        end
-        
-        # Compute output: output = state @ q
-        for i in 1:head_v_dim
-            s = 0.0f0
-            for j in 1:head_k_dim
-                s += state[i, j, vh] * q[j, kh, t]
-            end
-            output[i, vh, t] = s
-        end
-    end
-    return nothing
-end
-
 # --- SiLU ---
 function silu(x::AbstractArray{Float32})
     return x .* (1.0f0 ./ (1.0f0 .+ exp.(-x)))
