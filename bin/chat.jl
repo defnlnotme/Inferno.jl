@@ -57,18 +57,18 @@ end
 
 function handle_command(input::String, messages::Vector{Pair{String, String}})
     cmd = strip(lowercase(input))
-    if cmd == "/exit" || cmd == "/quit"
+    if cmd == "/exit" || cmd == "/quit" || cmd == "/q"
         println("Goodbye!")
         return :exit
-    elseif cmd == "/clear"
+    elseif cmd == "/clear" || cmd == "/c"
         empty!(messages)
         println("🔥 Conversation history cleared.")
         return :continue
-    elseif cmd == "/help"
+    elseif cmd == "/help" || cmd == "/h"
         println("\e[1mAvailable commands:\e[0m")
-        println("  \e[33m/exit\e[0m, \e[33m/quit\e[0m - Exit the chat")
-        println("  \e[33m/clear\e[0m       - Clear conversation history")
-        println("  \e[33m/help\e[0m        - Show this help message")
+        println("  \e[33m/exit\e[0m, \e[33m/quit\e[0m, \e[33m/q\e[0m - Exit the chat")
+        println("  \e[33m/clear\e[0m, \e[33m/c\e[0m      - Clear conversation history")
+        println("  \e[33m/help\e[0m, \e[33m/h\e[0m       - Show this help message")
         return :continue
     end
     return :none
@@ -79,10 +79,25 @@ function main()
     
     device_arg = args["device"] == -1 ? nothing : args["device"]
     println("\e[1;35m🔥 Inferno Chat Interface 🔥\e[0m")
+
+    if !ispath(args["model"])
+        println("\e[31mError: Model file not found at $(args["model"])\e[0m")
+        exit(1)
+    end
+
     println("Loading model from: $(args["model"])")
     
     Base.exit_on_sigint(false)
-    model, tok = Inferno.load_model(args["model"]; device=device_arg)
+    model, tok = try
+        Inferno.load_model(args["model"]; device=device_arg)
+    catch e
+        if e isa InterruptException
+            println("\n\e[31m[Loading Interrupted]\e[0m")
+            exit(0)
+        else
+            rethrow(e)
+        end
+    end
     
     messages = Pair{String, String}[]
     
@@ -133,17 +148,19 @@ function main()
             if e isa InterruptException
                 println("^C")
                 continue
+            elseif e isa EOFError
+                # Handled below by checking for nothing, but catch here for completeness
+                break
             else
                 rethrow(e)
             end
         end
         
-        if user_input === nothing || isempty(strip(user_input))
-            # readline returns nothing on EOF
-            if user_input === nothing
-                println("Goodbye!")
-                break
-            end
+        if user_input === nothing || (isempty(strip(user_input)) && eof(stdin))
+            # Handle EOF (Ctrl+D) gracefully
+            println("Goodbye!")
+            break
+        elseif isempty(strip(user_input))
             continue
         end
 
