@@ -31,7 +31,7 @@ const oneVector{T} = oneArray{T, 1}
 abstract type QuantMatrix end
 
 struct IQ2XXSMatrix <: QuantMatrix
-    data::Union{oneVector{UInt8}, Vector{UInt8}}
+    data::oneVector{UInt8} # Optimized: Enforce GPU storage to avoid hot-path copies
     K::Int
     N::Int
 end
@@ -447,8 +447,9 @@ function mat_mul!(res::oneMatrix{Float32}, weight::IQ2XXSMatrix, x::oneMatrix{Fl
     N, K = weight.N, weight.K
     S = size(x, 2)
     
-    # Convert CPU data to GPU if needed
-    weight_data_gpu = weight.data isa Vector{UInt8} ? oneArray(weight.data) : weight.data
+    # Optimization: weight.data is already on GPU (enforced by struct)
+    # This eliminates redundant host-to-device transfers during inference
+    weight_data_gpu = weight.data
     
     tables = IQ2LookupTables(IQ2XXS_GRID_GPU[], KSIGNS_IQ2XS_GPU[], KMASK_IQ2XS_GPU[])
 
