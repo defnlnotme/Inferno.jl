@@ -15,6 +15,11 @@ const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
     end
 
     @testset "GGUF Parsing" begin
+        # Test unknown GGUF type
+        io = IOBuffer()
+        invalid_type = reinterpret(Inferno.GGUF.GGUFValueType, 999%UInt32)
+        @test_throws ErrorException("Unknown GGUF type: $(invalid_type)") Inferno.GGUF.read_value(io, invalid_type)
+
         file = Inferno.GGUF.read_gguf(MODEL_PATH)
 
         @test length(file.metadata) > 0
