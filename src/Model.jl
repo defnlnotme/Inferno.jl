@@ -325,7 +325,8 @@ function mat_mul(weight::oneMatrix{Float32}, x::oneMatrix{Float32})
         res = oneArray{Float32}(undef, N, 1)
         return mat_mul!(res, weight, x)
     else
-        res = oneArray(zeros(Float32, N, S))
+        res = oneArray{Float32}(undef, N, S)
+        fill!(res, 0.0f0)
         return mat_mul!(res, weight, x)
     end
 end
