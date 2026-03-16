@@ -98,27 +98,39 @@ function load_model(path::String; device::Union{Int, Nothing}=nothing)
         println("  Metadata keys: $(length(file.metadata))")
         println("  Tensors: $(length(file.tensors))")
 
-        arch = get(file.metadata, "general.architecture", "llm")
+    arch_str = get(file.metadata, "general.architecture", "qwen2")
+    arch = Symbol(arch_str)
 
-        config = Model.QwenConfig(
-            vocab_size=Int(get(file.metadata, "$(arch).vocab_size",
-                length(get(file.metadata, "tokenizer.ggml.tokens", [])))),
-            hidden_size=Int(get(file.metadata, "$(arch).embedding_length", 1024)),
-            intermediate_size=Int(get(file.metadata, "$(arch).feed_forward_length", 3584)),
-            num_hidden_layers=Int(get(file.metadata, "$(arch).block_count", 24)),
-            num_attention_heads=Int(get(file.metadata, "$(arch).attention.head_count", 8)),
-            num_key_value_heads=Int(get(file.metadata, "$(arch).attention.head_count_kv", 2)),
-            head_dim=Int(get(file.metadata, "$(arch).attention.key_length", 256)),
-            rms_norm_eps=Float32(get(file.metadata, "$(arch).attention.layer_norm_rms_epsilon", 1.0e-6)),
-            rope_theta=Float32(get(file.metadata, "$(arch).rope.freq_base", 10000000.0)),
-            max_position_embeddings=min(4096, Int(get(file.metadata, "$(arch).context_length", 32768))),
-            full_attention_interval=Int(get(file.metadata, "$(arch).full_attention_interval", 4)),
-            ssm_inner_size=Int(get(file.metadata, "$(arch).ssm.inner_size", 2048)),
-            ssm_state_size=Int(get(file.metadata, "$(arch).ssm.state_size", 128)),
-            ssm_group_count=Int(get(file.metadata, "$(arch).ssm.group_count", 16)),
-            ssm_time_step_rank=Int(get(file.metadata, "$(arch).ssm.time_step_rank", 16)),
-        )
-        println("  Config: hidden=$(config.hidden_size), layers=$(config.num_hidden_layers), heads=$(config.num_attention_heads)")
+    config = Model.QwenConfig(
+        architecture=arch,
+        vocab_size=Int(get(file.metadata, "$(arch_str).vocab_size",
+            length(get(file.metadata, "tokenizer.ggml.tokens", [])))),
+        hidden_size=Int(get(file.metadata, "$(arch_str).embedding_length", 1024)),
+        intermediate_size=Int(get(file.metadata, "$(arch_str).feed_forward_length", 3584)),
+        num_hidden_layers=Int(get(file.metadata, "$(arch_str).block_count", 24)),
+        num_attention_heads=Int(get(file.metadata, "$(arch_str).attention.head_count", 8)),
+        num_key_value_heads=Int(get(file.metadata, "$(arch_str).attention.head_count_kv", 2)),
+        head_dim=Int(get(file.metadata, "$(arch_str).attention.key_length", 256)),
+        rms_norm_eps=Float32(get(file.metadata, "$(arch_str).attention.layer_norm_rms_epsilon", 1.0e-6)),
+        rope_theta=Float32(get(file.metadata, "$(arch_str).rope.freq_base", 10000000.0)),
+        max_position_embeddings=min(4096, Int(get(file.metadata, "$(arch_str).context_length", 32768))),
+        full_attention_interval=Int(get(file.metadata, "$(arch_str).full_attention_interval", 4)),
+        ssm_inner_size=Int(get(file.metadata, "$(arch_str).ssm.inner_size", 2048)),
+        ssm_state_size=Int(get(file.metadata, "$(arch_str).ssm.state_size", 128)),
+        ssm_group_count=Int(get(file.metadata, "$(arch_str).ssm.group_count", 16)),
+        ssm_time_step_rank=Int(get(file.metadata, "$(arch_str).ssm.time_step_rank", 16)),
+
+        # MoE
+        num_experts=Int(get(file.metadata, "$(arch_str).expert_count", 0)),
+        num_experts_per_tok=Int(get(file.metadata, "$(arch_str).expert_used_count", 0)),
+
+        # MLA
+        q_lora_rank=Int(get(file.metadata, "$(arch_str).attention.q_lora_rank", 0)),
+        kv_lora_rank=Int(get(file.metadata, "$(arch_str).attention.kv_lora_rank", 0)),
+        qk_rope_head_dim=Int(get(file.metadata, "$(arch_str).attention.qk_rope_head_dim", 0)),
+        v_head_dim=Int(get(file.metadata, "$(arch_str).attention.v_head_dim", 0)),
+    )
+    println("  Config: hidden=$(config.hidden_size), layers=$(config.num_hidden_layers), heads=$(config.num_attention_heads)")
 
         println("Loading weights...")
         Model.init_gpu_tables(QuantsData.IQ2XXS_GRID, QuantsData.KSIGNS_IQ2XS, QuantsData.KMASK_IQ2XS)
