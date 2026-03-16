@@ -8,7 +8,7 @@ function parse_commandline()
         "--model", "-m"
             help = "Path to GGUF model file"
             arg_type = String
-            default = joinpath(@__DIR__, "..", "tests", "models", "Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
+            default = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "..", "tests", "models", "Qwen3.5-0.8B-UD-Q4_K_XL.gguf"))
         "--device", "-d"
             help = "GPU device index to use (1-based, e.g., 2 for second GPU)"
             arg_type = Int

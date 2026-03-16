@@ -900,7 +900,7 @@ struct FullAttention
 end
 
 function FullAttention(arch, wq, wk, wv, wqkv, wo, q_norm, k_norm, n_heads, n_kv, hd)
-    q_size = arch == :qwen ? hd * 2 * n_heads : hd * n_heads
+    q_size = (arch == :qwen || arch == :qwen2 || arch == :qwen2_5) ? hd * 2 * n_heads : hd * n_heads
     decode_q_full = oneArray(zeros(Float32, q_size, 1))
     decode_k = oneArray(zeros(Float32, hd * n_kv, 1))
     decode_v = oneArray(zeros(Float32, hd * n_kv, 1))
@@ -927,7 +927,7 @@ end
 function (m::FullAttention)(x::oneArray{Float32,2}, pos::Int, rope::RotaryEmbedding, cache::KVCache)
     hd, seq = m.head_dim, size(x, 2)
 
-    if m.architecture == :qwen
+    if m.architecture == :qwen || m.architecture == :qwen2 || m.architecture == :qwen2_5
         # 1. Packed Q+gate projection
         if seq == 1
             q_full = mat_mul!(m.decode_q_full, m.wq, x)
