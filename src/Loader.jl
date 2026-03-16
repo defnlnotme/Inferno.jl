@@ -21,6 +21,10 @@ function extract_tensor(file::GGUF.GGUFFile, name::String)
         reinterpret(Float32, @view file.tensor_data[start:start+num_elements*4-1]) |> collect
     elseif info.type == GGUF.GGML_TYPE_F16
         Float32.(reinterpret(Float16, @view file.tensor_data[start:start+num_elements*2-1]) |> collect)
+    elseif info.type == GGUF.GGML_TYPE_BF16
+        # BF16 to Float32 conversion
+        raw = reinterpret(UInt16, @view file.tensor_data[start:start+num_elements*2-1]) |> collect
+        Float32.(reinterpret(Float32, [UInt32(r) << 16 for r in raw]))
     elseif info.type == GGUF.GGML_TYPE_Q5_K
         dequantize_q5_k(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_Q4_K
@@ -78,9 +82,8 @@ function get_bias_or_norm(file::GGUF.GGUFFile, name::String)
 end
 
 function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
-
+    arch = config.architecture
     embed = extract_tensor(file, "token_embd.weight")
-
 
     layers = Model.DecoderLayer[]
     for i in 0:(config.num_hidden_layers-1)
@@ -89,11 +92,18 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
         prefix = "blk.$(i)"
         is_ssm = haskey(file.tensors, "$(prefix).ssm_a")
 
-        in_norm_w = get_bias_or_norm(file, "$(prefix).attn_norm.weight")
+        # Standardize normalization key search
+        in_norm_key = haskey(file.tensors, "$(prefix).attn_norm.weight") ? "$(prefix).attn_norm.weight" :
+                      haskey(file.tensors, "$(prefix).input_layernorm.weight") ? "$(prefix).input_layernorm.weight" :
+                      "$(prefix).attn_norm.weight"
+
+        in_norm_w = get_bias_or_norm(file, in_norm_key)
         in_norm = Model.RMSNorm(oneArray(in_norm_w), config.rms_norm_eps)
 
-        post_norm_key = haskey(file.tensors, "$(prefix).post_attention_norm.weight") ?
-                        "$(prefix).post_attention_norm.weight" : "$(prefix).attn_norm.weight"
+        post_norm_key = haskey(file.tensors, "$(prefix).post_attention_norm.weight") ? "$(prefix).post_attention_norm.weight" :
+                        haskey(file.tensors, "$(prefix).ffn_norm.weight") ? "$(prefix).ffn_norm.weight" :
+                        haskey(file.tensors, "$(prefix).post_attention_layernorm.weight") ? "$(prefix).post_attention_layernorm.weight" :
+                        "$(prefix).attn_norm.weight"
         post_norm_w = get_bias_or_norm(file, post_norm_key)
         post_norm = Model.RMSNorm(oneArray(post_norm_w), config.rms_norm_eps)
 
@@ -130,27 +140,52 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
                 ssm_a, ssm_alpha, ssm_beta, ssm_conv1d_f32, ssm_conv1d_cpu, ssm_dt_bias, ssm_norm,
                 conv_state, ssm_state,
                 num_v_heads, num_k_heads, head_k_dim, head_v_dim, config.ssm_inner_size)
+        elseif arch == :deepseek2
+            # Simplified MLA loading
+            q_a_proj = get_weight(file, "$(prefix).attn_q_a.weight")
+            q_a_norm = Model.RMSNorm(oneArray(get_bias_or_norm(file, "$(prefix).attn_q_a_norm.weight")), config.rms_norm_eps)
+            q_b_proj = get_weight(file, "$(prefix).attn_q_b.weight")
+            kv_a_proj_with_mqa = get_weight(file, "$(prefix).attn_kv_a_mqa.weight")
+            kv_a_norm = Model.RMSNorm(oneArray(get_bias_or_norm(file, "$(prefix).attn_kv_a_norm.weight")), config.rms_norm_eps)
+            kv_b_proj = get_weight(file, "$(prefix).attn_kv_b.weight")
+            wo = get_weight(file, "$(prefix).attn_output.weight")
 
+            Model.MLAttention(q_a_proj, q_a_norm, q_b_proj, kv_a_proj_with_mqa, kv_a_norm, kv_b_proj, wo,
+                config.num_attention_heads, config.head_dim, config.q_lora_rank, config.kv_lora_rank,
+                config.qk_rope_head_dim, config.v_head_dim, 1.0f0/sqrt(Float32(config.head_dim)))
         else
-            qw = get_weight(file, "$(prefix).attn_q.weight")
-            kw = get_weight(file, "$(prefix).attn_k.weight")
-            vw = get_weight(file, "$(prefix).attn_v.weight")
+            wqkv = arch == :phi3 ? get_weight(file, "$(prefix).attn_qkv.weight") : nothing
+            qw = arch != :phi3 ? get_weight(file, "$(prefix).attn_q.weight") : nothing
+            kw = arch != :phi3 ? get_weight(file, "$(prefix).attn_k.weight") : nothing
+            vw = arch != :phi3 ? get_weight(file, "$(prefix).attn_v.weight") : nothing
             ow = get_weight(file, "$(prefix).attn_output.weight")
 
-            q_norm_w = get_bias_or_norm(file, "$(prefix).attn_q_norm.weight")
-            k_norm_w = get_bias_or_norm(file, "$(prefix).attn_k_norm.weight")
-            q_norm = Model.RMSNorm(oneArray(q_norm_w), config.rms_norm_eps)
-            k_norm = Model.RMSNorm(oneArray(k_norm_w), config.rms_norm_eps)
+            q_norm_w = haskey(file.tensors, "$(prefix).attn_q_norm.weight") ? get_bias_or_norm(file, "$(prefix).attn_q_norm.weight") : nothing
+            k_norm_w = haskey(file.tensors, "$(prefix).attn_k_norm.weight") ? get_bias_or_norm(file, "$(prefix).attn_k_norm.weight") : nothing
+            q_norm = isnothing(q_norm_w) ? nothing : Model.RMSNorm(oneArray(q_norm_w), config.rms_norm_eps)
+            k_norm = isnothing(k_norm_w) ? nothing : Model.RMSNorm(oneArray(k_norm_w), config.rms_norm_eps)
 
-            # Q output has packed Q+gate: size = head_dim * 2 * n_heads
-            # Use size because get_weight returns IQ2XXSMatrix or Float32 matrix
-            Model.FullAttention(qw, kw, vw, ow, q_norm, k_norm, config)
+            n_heads = config.num_attention_heads
+            n_kv    = config.num_key_value_heads
+
+            Model.FullAttention(arch, qw, kw, vw, wqkv, ow, q_norm, k_norm, n_heads, n_kv, config.head_dim)
         end
 
-        gate_w = get_weight(file, "$(prefix).ffn_gate.weight")
-        up_w   = get_weight(file, "$(prefix).ffn_up.weight")
-        down_w = get_weight(file, "$(prefix).ffn_down.weight")
-        mlp    = Model.MLP(gate_w, up_w, down_w)
+        # MLP or MoE
+        mlp = if haskey(file.tensors, "$(prefix).ffn_gate_exps.0.weight") || haskey(file.tensors, "$(prefix).ffn_gate_exps.weight")
+            # MoE
+            gate = get_weight(file, "$(prefix).ffn_gate.weight")
+            n_exp = config.num_experts
+            experts_gate = [get_weight(file, "$(prefix).ffn_gate_exps.$(j-1).weight") for j in 1:n_exp]
+            experts_up = [get_weight(file, "$(prefix).ffn_up_exps.$(j-1).weight") for j in 1:n_exp]
+            experts_down = [get_weight(file, "$(prefix).ffn_down_exps.$(j-1).weight") for j in 1:n_exp]
+            Model.MoE(gate, experts_gate, experts_up, experts_down, n_exp, config.num_experts_per_tok)
+        else
+            gate_w = get_weight(file, "$(prefix).ffn_gate.weight")
+            up_w   = get_weight(file, "$(prefix).ffn_up.weight")
+            down_w = get_weight(file, "$(prefix).ffn_down.weight")
+            Model.MLP(gate_w, up_w, down_w)
+        end
 
         push!(layers, Model.DecoderLayer(in_norm, op, post_norm, mlp, is_ssm))
     end
