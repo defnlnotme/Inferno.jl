@@ -295,6 +295,22 @@ const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
         @test length(full_decode) > 0
     end
 
+    @testset "Engine.sample" begin
+        # Test sample with temperature 0.0 (argmax)
+        logits1 = Float32[1.0, 5.0, 2.0, 4.0]
+        result1 = Inferno.Engine.sample(logits1, 0.0f0, 1.0f0)
+        @test result1 == 2
+
+        logits2 = Float32[-10.0, -5.0, -1.0]
+        result2 = Inferno.Engine.sample(logits2, 0.0f0, 1.0f0)
+        @test result2 == 3
+
+        # Test with duplicate max (argmax should return first index)
+        logits3 = Float32[1.0, 5.0, 2.0, 5.0]
+        result3 = Inferno.Engine.sample(logits3, 0.0f0, 1.0f0)
+        @test result3 == 2
+    end
+
 end
 
 @testset "Server Endpoints Tests" begin
