@@ -3,7 +3,7 @@ using Inferno
 using Statistics
 using oneAPI
 
-const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
+const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
 
 @testset "Inferno Tests" begin
 

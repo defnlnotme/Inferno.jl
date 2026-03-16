@@ -2,7 +2,7 @@ push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
 using Inferno
 using oneAPI
 
-model_path = "/home/fra/dev/inferno/tests/models/Qwen3.5-0.8B-UD-IQ2_XXS.gguf"
+model_path = "/home/fra/dev/inferno/tests/models/Qwen3.5-0.8B-UD-Q4_K_XL.gguf"
 
 println("Starting verification of pure Julia loading...")
 

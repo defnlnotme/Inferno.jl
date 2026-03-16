@@ -323,11 +323,8 @@ end
 
 # Optimized tiled IQ2XXS matrix multiplication kernel
 # Optimized for 2-bit quantization with proper tiling and memory coalescing
-function tiled_mat_mul_iq2_xxs_kernel!(res, data, x, K, N, tables)
+function tiled_mat_mul_iq2_xxs_kernel!(res, data, x, K, N, grid, signs_table, kmask)
     # Use 2D work groups for better parallelism
-    grid = tables.grid
-    signs_table = tables.signs_table
-    kmask = tables.kmask
 
     work_item_x = Int(get_global_id(1))  # Output row
     work_item_y = Int(get_global_id(2))  # Tile column
@@ -396,11 +393,8 @@ function tiled_mat_mul_iq2_xxs_kernel!(res, data, x, K, N, tables)
 end
 
 # Original kernel for backward compatibility
-function mat_mul_iq2_xxs_kernel!(res, data, x, K, N, tables)
+function mat_mul_iq2_xxs_kernel!(res, data, x, K, N, grid, signs_table, kmask)
     n = Int(get_global_id(1))
-    grid = tables.grid
-    signs_table = tables.signs_table
-    kmask = tables.kmask
     if n <= N
         val = 0.0f0
         nb = K ÷ 256
@@ -451,8 +445,11 @@ function mat_mul!(res::oneMatrix{Float32}, weight::IQ2XXSMatrix, x::oneMatrix{Fl
     # This eliminates redundant host-to-device transfers during inference
     weight_data_gpu = weight.data
     
-    tables = IQ2LookupTables(IQ2XXS_GRID_GPU[], KSIGNS_IQ2XS_GPU[], KMASK_IQ2XS_GPU[])
-
+    # Access GPU tables directly
+    grid = IQ2XXS_GRID_GPU[]
+    signs_table = KSIGNS_IQ2XS_GPU[]
+    kmask = KMASK_IQ2XS_GPU[]
+    
     # Use tiled kernel for better performance with 2-bit quantization
     if S == 1
         # Use optimized tiled kernel for single sequence
@@ -461,7 +458,7 @@ function mat_mul!(res::oneMatrix{Float32}, weight::IQ2XXSMatrix, x::oneMatrix{Fl
         gr_x = cld(N, gs_x)
         gr_y = 1
         
-        @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_iq2_xxs_kernel!(res, weight_data_gpu, x, K, N, tables)
+        @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_iq2_xxs_kernel!(res, weight_data_gpu, x, K, N, grid, signs_table, kmask)
     else
         # For batch processing, use tiled kernel per sequence
         for s in 1:S
@@ -473,7 +470,7 @@ function mat_mul!(res::oneMatrix{Float32}, weight::IQ2XXSMatrix, x::oneMatrix{Fl
             gr_x = cld(N, gs_x)
             gr_y = 1
             
-            @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_iq2_xxs_kernel!(r, weight_data_gpu, v, K, N, tables)
+            @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_iq2_xxs_kernel!(r, weight_data_gpu, v, K, N, grid, signs_table, kmask)
         end
     end
     return res
