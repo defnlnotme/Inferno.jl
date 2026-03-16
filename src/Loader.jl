@@ -31,8 +31,11 @@ function extract_tensor(file::GGUF.GGUFFile, name::String)
         dims = Tuple(Int.(info.dimensions))
         inner = dims[1]
         outer = length(dims) > 1 ? dims[2] : 1
+        # Optimization: Upload IQ2_XXS weights to GPU once during loading
+        # to avoid massive memory churn during inference hot-path.
         raw_data = @view file.tensor_data[start:start + num_elements * 66 ÷ 256 - 1]
-        return Model.IQ2XXSMatrix(collect(raw_data), inner, outer)
+        gpu_data = oneArray(collect(raw_data))
+        return Model.IQ2XXSMatrix(gpu_data, inner, outer)
     elseif info.type == GGUF.GGML_TYPE_IQ2_XS
         dequantize_iq2_xs(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_IQ2_S
