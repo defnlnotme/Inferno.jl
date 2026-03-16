@@ -139,10 +139,7 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
 
             # Q output has packed Q+gate: size = head_dim * 2 * n_heads
             # Use size because get_weight returns IQ2XXSMatrix or Float32 matrix
-            n_heads = size(qw, 1) ÷ (config.head_dim * 2)
-            n_kv    = size(kw, 1) ÷ config.head_dim
-
-            Model.FullAttention(qw, kw, vw, ow, q_norm, k_norm, n_heads, n_kv, config.head_dim)
+            Model.FullAttention(qw, kw, vw, ow, q_norm, k_norm, config)
         end
 
         gate_w = get_weight(file, "$(prefix).ffn_gate.weight")
