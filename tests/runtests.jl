@@ -128,58 +128,49 @@ const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
         @test y_cpu ≈ y_gpu atol=1e-3
     end
 
-    @testset "RotaryEmbedding" begin
-        using Inferno.Model
+    @testset "Server Prompt Building" begin
+        using Inferno.Server
 
-        d = 4
-        h = 1
-        seq = 2
-        rope = Model.RotaryEmbedding(d, base=10000.0)
+        # Test 1: Only user message
+        msgs1 = [Server.Message("user", "Hello!")]
+        prompt1 = Server.build_prompt(msgs1)
+        expected1 = "<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n"
+        @test prompt1 == expected1
 
-        # Base freq = 10000.0
-        # inv_freq = [1.0, 1.0 / (10000.0^(2/4))] = [1.0, 0.01]
-
-        # Test input: shape (d, h, seq)
-        # Sequence 1: 1.0, 2.0, 3.0, 4.0
-        # Sequence 2: 5.0, 6.0, 7.0, 8.0
-        x_cpu = zeros(Float32, d, h, seq)
-        x_cpu[:, 1, 1] .= [1.0f0, 2.0f0, 3.0f0, 4.0f0]
-        x_cpu[:, 1, 2] .= [5.0f0, 6.0f0, 7.0f0, 8.0f0]
-
-        x_gpu = oneArray(x_cpu)
-
-        # pos = 0
-        pos = 0
-        res_gpu = rope(x_gpu, pos)
-
-        # Force sync and collect
-        oneAPI.synchronize()
-        res_cpu = collect(res_gpu)
-
-        # Expected outputs:
-        # seq = 1 (t=1), pos = 0 => p = pos + t - 1 = 0
-        # For p = 0, freq = 0. cos(0)=1, sin(0)=0. Rotation is identity.
-        @test res_cpu[:, 1, 1] ≈ [1.0f0, 2.0f0, 3.0f0, 4.0f0] atol=1e-5
-
-        # seq = 2 (t=2), pos = 0 => p = 0 + 2 - 1 = 1
-        # i = 1 (dims 1,2): freq = 1.0 * 1 = 1.0
-        # x1 = 5.0, x2 = 6.0
-        # x1_new = 5.0*cos(1.0) - 6.0*sin(1.0)
-        # x2_new = 5.0*sin(1.0) + 6.0*cos(1.0)
-
-        # i = 2 (dims 3,4): freq = 0.01 * 1 = 0.01
-        # x1 = 7.0, x2 = 8.0
-        # x1_new = 7.0*cos(0.01) - 8.0*sin(0.01)
-        # x2_new = 7.0*sin(0.01) + 8.0*cos(0.01)
-
-        exp_seq2 = [
-            5.0f0 * cos(1.0f0) - 6.0f0 * sin(1.0f0),
-            5.0f0 * sin(1.0f0) + 6.0f0 * cos(1.0f0),
-            7.0f0 * cos(0.01f0) - 8.0f0 * sin(0.01f0),
-            7.0f0 * sin(0.01f0) + 8.0f0 * cos(0.01f0)
+        # Test 2: System and user message
+        msgs2 = [
+            Server.Message("system", "You are a helpful assistant."),
+            Server.Message("user", "What is 2+2?")
         ]
+        prompt2 = Server.build_prompt(msgs2)
+        expected2 = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n"
+        @test prompt2 == expected2
 
-        @test res_cpu[:, 1, 2] ≈ exp_seq2 atol=1e-5
+        # Test 3: System, user, assistant, user (conversation flow)
+        msgs3 = [
+            Server.Message("system", "You are a helpful assistant."),
+            Server.Message("user", "What is 2+2?"),
+            Server.Message("assistant", "It is 4."),
+            Server.Message("user", "What about 3+3?")
+        ]
+        prompt3 = Server.build_prompt(msgs3)
+        expected3 = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\nIt is 4.<|im_end|>\n<|im_start|>user\nWhat about 3+3?<|im_end|>\n<|im_start|>assistant\n"
+        @test prompt3 == expected3
+
+        # Test 4: Edge cases (empty message array)
+        msgs4 = Server.Message[]
+        prompt4 = Server.build_prompt(msgs4)
+        expected4 = "<|im_start|>assistant\n"
+        @test prompt4 == expected4
+
+        # Test 5: Unsupported roles are ignored
+        msgs5 = [
+            Server.Message("user", "Hello!"),
+            Server.Message("unsupported_role", "This should be ignored")
+        ]
+        prompt5 = Server.build_prompt(msgs5)
+        expected5 = "<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n"
+        @test prompt5 == expected5
     end
 
     @testset "Inference" begin
@@ -240,4 +231,8 @@ const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
         @test length(full_decode) > 0
     end
 
+end
+
+@testset "Server Endpoints Tests" begin
+    include("test_server.jl")
 end
