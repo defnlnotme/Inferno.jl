@@ -139,9 +139,26 @@ function handle_chat(stream::HTTP.Stream)
 
         if do_stream
             handle_stream(stream, model, tok, prompt, max_tokens, temperature, top_p, body.model)
-            return
+        else
+            handle_completion(stream, model, tok, prompt, max_tokens, temperature, top_p, body.model)
         end
+    catch e
+        @error "Error in handle_chat" exception = (e, catch_backtrace())
+        try
+            if !HTTP.iswritable(stream)
+                HTTP.setstatus(stream, 500)
+                HTTP.setheader(stream, "Content-Type" => "application/json")
+            end
+            write(stream, JSON3.write(Dict("error" => string(e))))
+        catch
+            # Stream might be closed
+        end
+    end
+end
 
+function handle_completion(stream::HTTP.Stream, model, tok, prompt,
+    max_tokens, temperature, top_p, model_name)
+    try
         prompt_ids = Tokenizer.encode(tok, prompt)
         response_text = Engine.generate(model, tok, prompt;
             max_tokens, temperature, top_p)
@@ -151,7 +168,7 @@ function handle_chat(stream::HTTP.Stream)
             "chatcmpl-" * string(rand(UInt32), base=16),
             "chat.completion",
             round(Int, time()),
-            body.model,
+            model_name,
             [Choice(0, Message("assistant", response_text), "stop")],
             Usage(length(prompt_ids), length(completion_ids),
                 length(prompt_ids) + length(completion_ids))
@@ -161,7 +178,7 @@ function handle_chat(stream::HTTP.Stream)
         HTTP.setheader(stream, "Content-Type" => "application/json")
         write(stream, JSON3.write(resp))
     catch e
-        @error "Error in handle_chat" exception = (e, catch_backtrace())
+        @error "Error in handle_completion" exception = (e, catch_backtrace())
         try
             if !HTTP.iswritable(stream)
                 HTTP.setstatus(stream, 500)
