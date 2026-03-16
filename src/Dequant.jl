@@ -43,7 +43,7 @@ function dequantize_iq2_xxs(data::AbstractVector{UInt8}, num_elements::Int)
                 signs = KSIGNS_IQ2XS[signs_idx]
                 
                 for j in 0:7
-                    byte_val = Int8((grid_val >> (8 * j)) & 0xFF) - 8
+                    byte_val = ((grid_val >> (8 * j)) & 0xFF) % Int8 - 8
                     is_neg = (signs & KMASK_IQ2XS[j+1]) != 0
                     y[(i-1)*256 + ib32*32 + l*8 + j + 1] = db * Float32(byte_val) * (is_neg ? -1.0f0 : 1.0f0)
                 end
@@ -85,7 +85,7 @@ function dequantize_iq2_xs(data::AbstractVector{UInt8}, num_elements::Int)
                 db = (l < 2) ? db0 : db1
                 
                 for j in 0:7
-                    byte_val = Int8((grid_val >> (8 * j)) & 0xFF) - 8
+                    byte_val = ((grid_val >> (8 * j)) & 0xFF) % Int8 - 8
                     is_neg = (signs & KMASK_IQ2XS[j+1]) != 0
                     y[(i-1)*256 + ib32*32 + l*8 + j + 1] = db * Float32(byte_val) * (is_neg ? -1.0f0 : 1.0f0)
                 end
@@ -147,7 +147,7 @@ function dequantize_iq2_s(data::AbstractVector{UInt8}, num_elements::Int)
                 db = (l < 2) ? db0 : db1
                 
                 for j in 0:7
-                    byte_val = Int8((grid_val >> (8 * j)) & 0xFF) - 8
+                    byte_val = ((grid_val >> (8 * j)) & 0xFF) % Int8 - 8
                     is_neg = (sign_val & KMASK_IQ2XS[j+1]) != 0
                     y[(i-1)*256 + ib32*32 + l*8 + j + 1] = db * Float32(byte_val) * (is_neg ? -1.0f0 : 1.0f0)
                 end
@@ -200,11 +200,11 @@ function dequantize_iq3_xxs(data::AbstractVector{UInt8}, num_elements::Int)
                 
                 for j in 0:3
                     y_idx = (i-1)*256 + ib32*32 + l*8 + j + 1
-                    byte_val1 = Int8((grid1 >> (8 * j)) & 0xFF) - 4
+                    byte_val1 = ((grid1 >> (8 * j)) & 0xFF) % Int8 - 4
                     is_neg1 = (signs & KMASK_IQ2XS[j+1]) != 0
                     y[y_idx] = db * Float32(byte_val1) * (is_neg1 ? -1.0f0 : 1.0f0)
                     
-                    byte_val2 = Int8((grid2 >> (8 * j)) & 0xFF) - 4
+                    byte_val2 = ((grid2 >> (8 * j)) & 0xFF) % Int8 - 4
                     is_neg2 = (signs & KMASK_IQ2XS[j+5]) != 0
                     y[y_idx + 4] = db * Float32(byte_val2) * (is_neg2 ? -1.0f0 : 1.0f0)
                 end
@@ -259,11 +259,11 @@ function dequantize_iq3_s(data::AbstractVector{UInt8}, num_elements::Int)
                 
                 for j in 0:3
                     y_idx = (i-1)*256 + ib32*32 + l*8 + j + 1
-                    byte_val1 = Int8((grid1 >> (8 * j)) & 0xFF) - 1
+                    byte_val1 = ((grid1 >> (8 * j)) & 0xFF) % Int8 - 1
                     is_neg1 = (signs & KMASK_IQ2XS[j+1]) != 0
                     y[y_idx] = db1 * Float32(byte_val1) * (is_neg1 ? -1.0f0 : 1.0f0)
                     
-                    byte_val2 = Int8((grid2 >> (8 * j)) & 0xFF) - 1
+                    byte_val2 = ((grid2 >> (8 * j)) & 0xFF) % Int8 - 1
                     is_neg2 = (signs & KMASK_IQ2XS[j+5]) != 0
                     y[y_idx + 4] = db1 * Float32(byte_val2) * (is_neg2 ? -1.0f0 : 1.0f0)
                 end
@@ -287,11 +287,11 @@ function dequantize_iq3_s(data::AbstractVector{UInt8}, num_elements::Int)
                 
                 for j in 0:3
                     y_idx = (i-1)*256 + (ib32+1)*32 + l*8 + j + 1
-                    byte_val1 = Int8((grid1 >> (8 * j)) & 0xFF) - 1
+                    byte_val1 = ((grid1 >> (8 * j)) & 0xFF) % Int8 - 1
                     is_neg1 = (signs & KMASK_IQ2XS[j+1]) != 0
                     y[y_idx] = db2 * Float32(byte_val1) * (is_neg1 ? -1.0f0 : 1.0f0)
                     
-                    byte_val2 = Int8((grid2 >> (8 * j)) & 0xFF) - 1
+                    byte_val2 = ((grid2 >> (8 * j)) & 0xFF) % Int8 - 1
                     is_neg2 = (signs & KMASK_IQ2XS[j+5]) != 0
                     y[y_idx + 4] = db2 * Float32(byte_val2) * (is_neg2 ? -1.0f0 : 1.0f0)
                 end
@@ -521,10 +521,10 @@ function dequantize_q3_k(data::AbstractVector{UInt8}, num_elements::Int)
         
         repacked_scales = Vector{Int8}(undef, 16)
         for k_sc in 0:3
-            repacked_scales[k_sc*4 + 1] = Int8(s0 >> (8*k_sc) & 0xFF)
-            repacked_scales[k_sc*4 + 2] = Int8(s1 >> (8*k_sc) & 0xFF)
-            repacked_scales[k_sc*4 + 3] = Int8(s2 >> (8*k_sc) & 0xFF)
-            repacked_scales[k_sc*4 + 4] = Int8(s3 >> (8*k_sc) & 0xFF)
+            repacked_scales[k_sc*4 + 1] = (s0 >> (8*k_sc) & 0xFF) % Int8
+            repacked_scales[k_sc*4 + 2] = (s1 >> (8*k_sc) & 0xFF) % Int8
+            repacked_scales[k_sc*4 + 3] = (s2 >> (8*k_sc) & 0xFF) % Int8
+            repacked_scales[k_sc*4 + 4] = (s3 >> (8*k_sc) & 0xFF) % Int8
         end
         
         is_idx = 1
@@ -582,15 +582,15 @@ function dequantize_q6_k(data::AbstractVector{UInt8}, num_elements::Int)
         for n in 0:128:255
             for l in 0:31
                 is = l ÷ 16
-                q1 = Int8((ql[ql_off + l + 1] & 0x0F) | ((qh[qh_off + l + 1] & 3) << 4)) - 32
-                q2 = Int8((ql[ql_off + l + 33] & 0x0F) | (((qh[qh_off + l + 1] >> 2) & 3) << 4)) - 32
-                q3 = Int8((ql[ql_off + l + 1] >> 4) | (((qh[qh_off + l + 1] >> 4) & 3) << 4)) - 32
-                q4 = Int8((ql[ql_off + l + 33] >> 4) | (((qh[qh_off + l + 1] >> 6) & 3) << 4)) - 32
+                q1 = ((ql[ql_off + l + 1] & 0x0F) | ((qh[qh_off + l + 1] & 3) << 4)) % Int8 - 32
+                q2 = ((ql[ql_off + l + 33] & 0x0F) | (((qh[qh_off + l + 1] >> 2) & 3) << 4)) % Int8 - 32
+                q3 = ((ql[ql_off + l + 1] >> 4) | (((qh[qh_off + l + 1] >> 4) & 3) << 4)) % Int8 - 32
+                q4 = ((ql[ql_off + l + 33] >> 4) | (((qh[qh_off + l + 1] >> 6) & 3) << 4)) % Int8 - 32
                 
-                y[y_off + n + l + 1] = d * Float32(Int8(scales[sc_off + is + 1])) * Float32(q1)
-                y[y_off + n + l + 33] = d * Float32(Int8(scales[sc_off + is + 3])) * Float32(q2)
-                y[y_off + n + l + 65] = d * Float32(Int8(scales[sc_off + is + 5])) * Float32(q3)
-                y[y_off + n + l + 97] = d * Float32(Int8(scales[sc_off + is + 7])) * Float32(q4)
+                y[y_off + n + l + 1] = d * Float32(scales[sc_off + is + 1] % Int8) * Float32(q1)
+                y[y_off + n + l + 33] = d * Float32(scales[sc_off + is + 3] % Int8) * Float32(q2)
+                y[y_off + n + l + 65] = d * Float32(scales[sc_off + is + 5] % Int8) * Float32(q3)
+                y[y_off + n + l + 97] = d * Float32(scales[sc_off + is + 7] % Int8) * Float32(q4)
             end
             ql_off += 64
             qh_off += 32

@@ -8,7 +8,7 @@ function parse_commandline()
         "--model", "-m"
             help = "Path to GGUF model file"
             arg_type = String
-            default = joinpath(@__DIR__, "..", "tests", "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
+            default = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "..", "tests", "models", "Qwen3.5-0.8B-UD-Q4_K_XL.gguf"))
         "--device", "-d"
             help = "GPU device index to use (1-based, e.g., 2 for second GPU)"
             arg_type = Int
@@ -30,8 +30,22 @@ function main()
     # 2. Define your prompt
     println("-"^40)
     print("Enter prompt: ")
-    prompt = readline()
+    prompt = try
+        readline()
+    catch e
+        if e isa EOFError
+            println("\nGoodbye!")
+            exit(0)
+        else
+            rethrow(e)
+        end
+    end
+
     if isempty(prompt)
+        if eof(stdin)
+            println("\nGoodbye!")
+            exit(0)
+        end
         prompt = "The capital of France is"
     end
 
