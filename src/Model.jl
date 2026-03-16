@@ -641,34 +641,6 @@ function silu_kernel!(out, x, N)
     return nothing
 end
 
-# GPU L2 normalization kernel for SSM
-function l2_norm_ssm_kernel!(q, k, head_dim, num_heads, seq, eps)
-    t = get_global_id(1)
-    h = get_global_id(2)
-    if t <= seq && h <= num_heads
-        # Compute L2 norm for Q
-        q_norm = 0.0f0
-        for d in 1:head_dim
-            q_norm += q[d, h, t] * q[d, h, t]
-        end
-        q_norm = sqrt(q_norm + eps)
-        
-        # Compute L2 norm for K
-        k_norm = 0.0f0
-        for d in 1:head_dim
-            k_norm += k[d, h, t] * k[d, h, t]
-        end
-        k_norm = sqrt(k_norm + eps)
-        
-        # Normalize in-place
-        for d in 1:head_dim
-            q[d, h, t] /= q_norm
-            k[d, h, t] /= k_norm
-        end
-    end
-    return nothing
-end
-
 # --- SSM Delta Net recurrence on GPU ---
 function ssm_recurrence_kernel!(output, state, q, k, v, decay_gate, beta, 
                                head_v_dim, head_k_dim, num_v_heads, seq)
