@@ -81,6 +81,9 @@ end
 Load a GGUF model file and return the constructed model + tokenizer.
 """
 function load_model(path::String; device::Union{Int, Nothing}=nothing)
+    model = nothing
+    tok = nothing
+    
     devs = collect(oneAPI.devices())
     if isempty(devs)
         @warn "No oneAPI devices found."
@@ -89,9 +92,11 @@ function load_model(path::String; device::Union{Int, Nothing}=nothing)
     end
 
     println("Loading GGUF file: $path")
-    file = GGUF.read_gguf(path)
-    println("  Metadata keys: $(length(file.metadata))")
-    println("  Tensors: $(length(file.tensors))")
+    file = nothing
+    try
+        file = GGUF.read_gguf(path)
+        println("  Metadata keys: $(length(file.metadata))")
+        println("  Tensors: $(length(file.tensors))")
 
     arch_str = get(file.metadata, "general.architecture", "qwen2")
     arch = Symbol(arch_str)
@@ -127,26 +132,45 @@ function load_model(path::String; device::Union{Int, Nothing}=nothing)
     )
     println("  Config: hidden=$(config.hidden_size), layers=$(config.num_hidden_layers), heads=$(config.num_attention_heads)")
 
-    println("Loading weights...")
-    Model.init_gpu_tables(QuantsData.IQ2XXS_GRID, QuantsData.KSIGNS_IQ2XS, QuantsData.KMASK_IQ2XS)
-    model = Loader.load_weights(file, config)
-    println("Model loaded successfully.")
+        println("Loading weights...")
+        Model.init_gpu_tables(QuantsData.IQ2XXS_GRID, QuantsData.KSIGNS_IQ2XS, QuantsData.KMASK_IQ2XS)
+        model = Loader.load_weights(file, config)
+        println("Model loaded successfully.")
 
-    println("Loading tokenizer...")
-    tok = Tokenizer.load_tokenizer(file.metadata)
-    println("  Vocab size: $(length(tok.id_to_token)), BOS=$(tok.bos_id), EOS=$(tok.eos_id)")
+        println("Loading tokenizer...")
+        tok = Tokenizer.load_tokenizer(file.metadata)
+        println("  Vocab size: $(length(tok.id_to_token)), BOS=$(tok.bos_id), EOS=$(tok.eos_id)")
 
-    return model, tok
+        return model, tok
+    catch e
+        @error "ERROR loading model: $e" exception=(e, catch_backtrace())
+        # Cleanup on error
+        try
+            if model !== nothing
+                Model.free_model_gpu!(model)
+            end
+        catch
+        end
+        try
+            GC.gc(true)
+        catch
+        end
+        try
+            oneAPI.synchronize()
+        catch
+        end
+        rethrow(e)
+    end
 end
 
 """
-    main(model_path; port=8080, device=nothing)
+    main(model_path; port=8080, device=nothing, auth_token=nothing)
 
 Load model and start the HTTP server.
 """
-function main(model_path::String; port::Int=8080, device::Union{Int, Nothing}=nothing)
+function main(model_path::String; port::Int=8080, device::Union{Int, Nothing}=nothing, auth_token::Union{String, Nothing}=nothing)
     model, tok = load_model(model_path; device=device)
-    Server.start_server(port; model=model, tokenizer=tok)
+    Server.start_server(port; model=model, tokenizer=tok, auth_token=auth_token)
 end
 
 end # module

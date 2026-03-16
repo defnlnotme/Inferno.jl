@@ -4,7 +4,7 @@ using oneAPI
 using LinearAlgebra
 using Statistics
 
-export QwenConfig, QwenModel, KVCache, forward!, RMSNorm, MLP, MoE, GatedDeltaNet, FullAttention, MLAttention, DecoderLayer, init_kv_cache
+export QwenConfig, QwenModel, KVCache, forward!, RMSNorm, MLP, MoE, GatedDeltaNet, FullAttention, MLAttention, DecoderLayer, init_kv_cache, free_kv_cache!, free_all_kv_caches!, free_model_gpu!
 
 # --- Configuration ---
 Base.@kwdef struct QwenConfig
@@ -45,6 +45,12 @@ struct IQ2XXSMatrix <: QuantMatrix
     N::Int
 end
 
+struct IQ2LookupTables{G, S, M}
+    grid::G
+    signs_table::S
+    kmask::M
+end
+
 # Base.size for compatibility if needed
 Base.size(m::IQ2XXSMatrix) = (m.N, m.K)
 Base.size(m::IQ2XXSMatrix, d::Int) = d == 1 ? m.N : (d == 2 ? m.K : 1)
@@ -54,6 +60,7 @@ const KSIGNS_IQ2XS_GPU = Ref{oneVector{UInt8}}()
 const KMASK_IQ2XS_GPU = Ref{oneVector{UInt8}}()
 
 function init_gpu_tables(grid, signs_table, kmask)
+    # Use DeviceBuffer but ensured by our fixed copyto! (GPU-driven)
     IQ2XXS_GRID_GPU[] = oneArray(grid)
     KSIGNS_IQ2XS_GPU[] = oneArray(signs_table)
     KMASK_IQ2XS_GPU[] = oneArray(kmask)
@@ -86,11 +93,38 @@ function rms_norm_kernel!(out, x, weight, eps, N)
     return nothing
 end
 
+# Helper to allocate on SharedBuffer (RAM accessible to GPU) to avoid 458 bug and save VRAM
+function oneSharedArray(T::Type, dims...)
+    return oneArray{T, length(dims), oneAPI.oneL0.SharedBuffer}(undef, dims...)
+end
+
+
+
+# Corrected RMSNorm kernel to normalize over the first dimension (hidden size)
+function rms_norm_kernel!(out, x, weight, eps, rows, cols)
+    j = get_global_id(1)
+    if j <= cols
+        acc = 0.0f0
+        @inbounds for i in 1:rows
+            v = x[i, j]
+            acc += v * v
+        end
+        inv_rms = 1.0f0 / sqrt(acc / Float32(rows) + eps)
+        @inbounds for i in 1:rows
+            out[i, j] = x[i, j] * inv_rms * weight[i]
+        end
+    end
+    return nothing
+end
+
 function (norm::RMSNorm)(x::oneAPI.oneArray{Float32, N}) where N
-    # GPU-native RMSNorm using broadcast - no temporaries allocated beyond the output
-    m = sum(x .* x, dims=1) .* (1.0f0 / Float32(size(x, 1)))
-    inv_rms = 1.0f0 ./ sqrt.(m .+ norm.eps)
-    return x .* inv_rms .* norm.weight
+    rows = size(x, 1)
+    cols = length(x) ÷ rows
+    out = similar(x)
+    gs = min(cols, 256)
+    gr = cld(cols, gs)
+    @oneapi items=gs groups=gr rms_norm_kernel!(out, x, norm.weight, norm.eps, rows, cols)
+    return out
 end
 
 function is_gpu(x)
@@ -105,11 +139,9 @@ function is_gpu(x)
 end
 
 function (norm::RMSNorm)(x::AbstractArray{Float32, N}) where N
-    # Handle SubArray/ReshapedArray on GPU without collection
     if is_gpu(x)
-        m = sum(x .* x, dims=1) .* (1.0f0 / Float32(size(x, 1)))
-        inv_rms = 1.0f0 ./ sqrt.(m .+ norm.eps)
-        return x .* inv_rms .* norm.weight
+        inner = oneArray(x)
+        return norm(inner)
     else
         # Real CPU fallback
         w_cpu = collect(norm.weight)
@@ -119,32 +151,18 @@ function (norm::RMSNorm)(x::AbstractArray{Float32, N}) where N
     end
 end
 
-# In-place RMSNorm that writes into a pre-allocated buffer (no allocation)
+# In-place RMSNorm that writes into a pre-allocated buffer
 function rmsnorm!(out::oneMatrix{Float32}, x::oneMatrix{Float32}, norm::RMSNorm)
-    # CPU fallback for rmsnorm to avoid GPU scalar indexing issues
-    x_cpu = collect(x)
-    weight_cpu = collect(norm.weight)  # Ensure weight is on CPU
-    m = sum(x_cpu .* x_cpu, dims=1) .* (1.0f0 / Float32(size(x_cpu, 1)))
-    inv_rms = 1.0f0 ./ sqrt.(m .+ norm.eps)
-    
-    # Handle dimension mismatch by using element-wise multiplication
-    weight_size = length(weight_cpu)
-    if weight_size == size(x_cpu, 1)
-        # Normal case - weight matches first dimension
-        out_cpu = x_cpu .* inv_rms .* reshape(weight_cpu, :, 1)
-    else
-        # Mismatch case - use element-wise with proper indexing
-        out_cpu = similar(x_cpu)
-        for i in 1:size(x_cpu, 1)
-            w_idx = mod1(i, weight_size)
-            for j in 1:size(x_cpu, 2)
-                out_cpu[i, j] = x_cpu[i, j] * inv_rms[j] * weight_cpu[w_idx]
-            end
-        end
-    end
-    
-    out .= oneArray(out_cpu)
+    rows, cols = size(x)
+    gs = min(cols, 256)
+    gr = cld(cols, gs)
+    @oneapi items=gs groups=gr rms_norm_kernel!(out, x, norm.weight, norm.eps, rows, cols)
     return out
+end
+
+function rmsnorm(x::oneMatrix{Float32}, norm::RMSNorm)
+    out = similar(x)
+    return rmsnorm!(out, x, norm)
 end
 
 # --- GPU Sampling Kernels ---
@@ -158,33 +176,34 @@ function temperature_scale_kernel!(scaled_logits, logits, inv_temp, N)
     return
 end
 
-# Argmax kernel
-function argmax_kernel!(result, logits, N)
-    i = get_global_id(1)
-    if i <= N
-        # Use atomic operations for reduction
-        # For simplicity, we'll collect to CPU for argmax
-        result[i] = i
-    end
-    return
-end
-
 # --- Optimized Matrix Multiplication with Tiling ---
 
+# Performance constants for 2-bit quantization
+const IQ2_TILE_SIZE = 16  # Optimal for 2-bit data (16x16 tiles)
+const IQ2_VEC_TILE = 32   # Vector operations tile size
+const CACHE_LINE_SIZE = 64 # Cache line alignment
+
+struct MatMulConfig
+    N::Int
+    M::Int
+    K::Int
+    tile_size::Int
+end
+
 # Optimized tiled matrix multiplication kernel (without shared memory for oneAPI compatibility)
-function tiled_mat_mul_kernel!(res, A, B, N, M, K, tile_size)
+function tiled_mat_mul_kernel!(res, A, B, config::MatMulConfig)
     # Each work item computes one element of the output
     i = get_global_id(1)
     j = get_global_id(2)
     
-    if i <= N && j <= M
+    if i <= config.N && j <= config.M
         val = 0.0f0
         
         # Process in tiles for better cache utilization
-        num_tiles = cld(K, tile_size)
+        num_tiles = cld(config.K, config.tile_size)
         for t in 1:num_tiles
-            tile_start = (t-1) * tile_size
-            tile_end = min(tile_start + tile_size, K)
+            tile_start = (t-1) * config.tile_size
+            tile_end = min(tile_start + config.tile_size, config.K)
             
             # Unrolled loop for better performance
             k = tile_start
@@ -252,15 +271,18 @@ function mat_mul(weight::AbstractArray{Float32,2}, x::AbstractArray{Float32,2})
         # Use optimized tiled kernel for matrix-matrix multiplication
         if S > 1
             M = S  # B is K x S, so M = S
-            tile_size = 16  # Optimal tile size for most GPUs
+            # Use smaller tiles for better cache utilization with dense operations
+            tile_size = min(16, max(8, cld(N, 256)))  # Adaptive tile size
             gs_x = tile_size
             gs_y = tile_size
             gr_x = cld(N, tile_size)
             gr_y = cld(M, tile_size)
-            @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_kernel!(res, weight, x, N, M, K, tile_size)
+            config = MatMulConfig(N, M, K, tile_size)
+            @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_kernel!(res, weight, x, config)
         else
             # Use optimized vector kernel for matrix-vector multiplication
-            tile_size = 64  # Larger tile for vector operations
+            # Larger tile for vector operations to maximize throughput
+            tile_size = min(IQ2_VEC_TILE, max(32, cld(N, 8)))  # Adaptive vector tile
             gs = min(N, 256)
             gr = cld(N, gs)
             @oneapi items=gs groups=gr tiled_mat_vec_kernel!(res, weight, x, K, N, tile_size)
@@ -276,17 +298,18 @@ function mat_mul!(res::oneMatrix{Float32}, weight::oneMatrix{Float32}, x::oneMat
     N, K = size(weight)
     S = size(x, 2)
     
-    # Use optimized tiled kernels
+    # Use optimized tiled kernels with adaptive sizing
     if S > 1
         M = S
-        tile_size = 16
+        tile_size = min(16, max(8, cld(N, 256)))  # Adaptive tile size
         gs_x = tile_size
         gs_y = tile_size
         gr_x = cld(N, tile_size)
         gr_y = cld(M, tile_size)
-        @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_kernel!(res, weight, x, N, M, K, tile_size)
+        config = MatMulConfig(N, M, K, tile_size)
+        @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_kernel!(res, weight, x, config)
     else
-        tile_size = 64
+        tile_size = min(IQ2_VEC_TILE, max(32, cld(N, 8)))  # Adaptive vector tile
         gs = min(N, 256)
         gr = cld(N, gs)
         @oneapi items=gs groups=gr tiled_mat_vec_kernel!(res, weight, x, K, N, tile_size)
@@ -307,8 +330,86 @@ function mat_mul(weight::oneMatrix{Float32}, x::oneMatrix{Float32})
     end
 end
 
-function mat_mul_iq2_xxs_kernel!(res, data, x, K, N, grid, signs_table, kmask)
+# Optimized tiled IQ2XXS matrix multiplication kernel
+# Optimized for 2-bit quantization with proper tiling and memory coalescing
+function tiled_mat_mul_iq2_xxs_kernel!(res, data, x, K, N, tables)
+    # Use 2D work groups for better parallelism
+    grid = tables.grid
+    signs_table = tables.signs_table
+    kmask = tables.kmask
+
+    work_item_x = Int(get_global_id(1))  # Output row
+    work_item_y = Int(get_global_id(2))  # Tile column
+    
+    # Tile dimensions optimized for 2-bit data
+    tile_rows = IQ2_TILE_SIZE
+    tile_cols = IQ2_TILE_SIZE
+    
+    # Calculate which output element this work item computes
+    output_row = work_item_x
+    if output_row <= N
+        val = 0.0f0
+        nb = K ÷ 256
+        
+        # Process in tiles for better cache utilization
+        tiles_per_block = cld(nb, tile_cols)
+        for tile_idx in 1:tiles_per_block
+            block_start = (tile_idx - 1) * tile_cols
+            block_end = min(block_start + tile_cols, nb)
+            
+            # Process each block within the tile
+            for i in (block_start + 1):block_end
+                base = (output_row - 1) * nb * 66 + (i - 1) * 66
+                d_raw = (UInt16(data[base+2]) << 8) | UInt16(data[base+1])
+                d = Float32(reinterpret(Float16, d_raw))
+                
+                # Process 8 sub-blocks with unrolled loops
+                for ib32 in 0:7
+                    qs_base = base + 2 + ib32 * 8
+                    
+                    # Reading 8 bytes as 2 UInt32 with aligned access
+                    aux32_1 = (UInt32(data[qs_base+1])) | (UInt32(data[qs_base+2]) << 8) | 
+                              (UInt32(data[qs_base+3]) << 16) | (UInt32(data[qs_base+4]) << 24)
+                    aux32_2 = (UInt32(data[qs_base+5])) | (UInt32(data[qs_base+6]) << 8) | 
+                              (UInt32(data[qs_base+7]) << 16) | (UInt32(data[qs_base+8]) << 24)
+                    
+                    db = d * (0.5f0 + Float32(aux32_2 >> 28)) * 0.25f0
+                    
+                    # Unrolled inner loops for better performance
+                    for l in 0:3
+                        grid_idx = Int((aux32_1 >> (8*l)) & 255) + 1
+                        grid_val = grid[grid_idx]
+                        
+                        signs_idx = Int((aux32_2 >> (7*l)) & 127) + 1
+                        signs = signs_table[signs_idx]
+                        
+                        # Process 8 elements with unrolled loop
+                        x_base = (i-1)*256 + ib32*32 + l*8
+                        for j in 0:7
+                            byte_val = Int8((grid_val >> (8 * j)) & 255) - 8
+                            is_neg = (signs & kmask[j+1]) != 0
+                            f_w = db * Float32(byte_val) * (is_neg ? -1.0f0 : 1.0f0)
+                            
+                            x_idx = x_base + j + 1
+                            val += f_w * x[x_idx]
+                        end
+                    end
+                end
+            end
+        end
+        
+        res[output_row] = val
+    end
+    
+    return nothing
+end
+
+# Original kernel for backward compatibility
+function mat_mul_iq2_xxs_kernel!(res, data, x, K, N, tables)
     n = Int(get_global_id(1))
+    grid = tables.grid
+    signs_table = tables.signs_table
+    kmask = tables.kmask
     if n <= N
         val = 0.0f0
         nb = K ÷ 256
@@ -336,7 +437,7 @@ function mat_mul_iq2_xxs_kernel!(res, data, x, K, N, grid, signs_table, kmask)
                     signs = signs_table[signs_idx]
                     
                     for j in 0:7
-                        byte_val = UInt8((grid_val >> (8 * j)) & 255)
+                        byte_val = Int8((grid_val >> (8 * j)) & 255) - 8
                         is_neg = (signs & kmask[j+1]) != 0
                         f_w = db * Float32(byte_val) * (is_neg ? -1.0f0 : 1.0f0)
                         
@@ -354,19 +455,33 @@ end
 function mat_mul!(res::oneMatrix{Float32}, weight::IQ2XXSMatrix, x::oneMatrix{Float32})
     N, K = weight.N, weight.K
     S = size(x, 2)
-    gs = min(N, 256)
-    gr = cld(N, gs)
     
     # Convert CPU data to GPU if needed
     weight_data_gpu = weight.data isa Vector{UInt8} ? oneArray(weight.data) : weight.data
     
+    tables = IQ2LookupTables(IQ2XXS_GRID_GPU[], KSIGNS_IQ2XS_GPU[], KMASK_IQ2XS_GPU[])
+
+    # Use tiled kernel for better performance with 2-bit quantization
     if S == 1
-        @oneapi items=gs groups=gr mat_mul_iq2_xxs_kernel!(res, weight_data_gpu, x, K, N, IQ2XXS_GRID_GPU[], KSIGNS_IQ2XS_GPU[], KMASK_IQ2XS_GPU[])
+        # Use optimized tiled kernel for single sequence
+        gs_x = min(N, IQ2_TILE_SIZE)
+        gs_y = 1  # Single column for vector operation
+        gr_x = cld(N, gs_x)
+        gr_y = 1
+        
+        @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_iq2_xxs_kernel!(res, weight_data_gpu, x, K, N, tables)
     else
+        # For batch processing, use tiled kernel per sequence
         for s in 1:S
             v = @view x[:, s]
             r = @view res[:, s]
-            @oneapi items=gs groups=gr mat_mul_iq2_xxs_kernel!(r, weight_data_gpu, v, K, N, IQ2XXS_GRID_GPU[], KSIGNS_IQ2XS_GPU[], KMASK_IQ2XS_GPU[])
+            
+            gs_x = min(N, IQ2_TILE_SIZE)
+            gs_y = 1
+            gr_x = cld(N, gs_x)
+            gr_y = 1
+            
+            @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_iq2_xxs_kernel!(r, weight_data_gpu, v, K, N, tables)
         end
     end
     return res
@@ -539,15 +654,6 @@ function conv1d_kernel!(out, input, weight, conv_state, kernel_size, channels, s
     return nothing
 end
 
-# GPU SiLU kernel
-function silu_kernel!(out, x, N)
-    i = get_global_id(1)
-    if i <= N
-        out[i] = x[i] * (1.0f0 / (1.0f0 + exp(-x[i])))
-    end
-    return nothing
-end
-
 # GPU L2 normalization kernel for SSM
 function l2_norm_ssm_kernel!(q, k, head_dim, num_heads, seq, eps)
     t = get_global_id(1)
@@ -576,47 +682,17 @@ function l2_norm_ssm_kernel!(q, k, head_dim, num_heads, seq, eps)
     return nothing
 end
 
-# --- SSM Delta Net recurrence on GPU ---
-function ssm_recurrence_kernel!(output, state, q, k, v, decay_gate, beta, 
-                               head_v_dim, head_k_dim, num_v_heads, seq)
-    vh = get_global_id(1)
-    t = get_global_id(2)
-    if vh <= num_v_heads && t <= seq
-        g = exp(decay_gate[vh, t])
-        b = beta[vh, t]
-        
-        kh = vh  # 1:1 mapping for simplicity
-        
-        # Update state: state = g * state + b * v * k'
-        for i in 1:head_v_dim
-            vi_b = v[i, vh, t] * b
-            for j in 1:head_k_dim
-                state[i, j, vh] = g * state[i, j, vh] + vi_b * k[j, kh, t]
-            end
-        end
-        
-        # Compute output: output = state @ q
-        for i in 1:head_v_dim
-            s = 0.0f0
-            for j in 1:head_k_dim
-                s += state[i, j, vh] * q[j, kh, t]
-            end
-            output[i, vh, t] = s
-        end
-    end
-    return nothing
-end
-
 # --- SiLU ---
 function silu(x::AbstractArray{Float32})
     return x .* (1.0f0 ./ (1.0f0 .+ exp.(-x)))
 end
 
 # --- Rotary Embedding (RoPE) ---
+# --- Rotary Embedding (RoPE) ---
 struct RotaryEmbedding
     dim::Int
     base::Float32
-    inv_freq::Vector{Float32}  # Keep on CPU for now
+    inv_freq::Vector{Float32}
 end
 
 function RotaryEmbedding(dim::Int; base=10000000.0)
@@ -624,36 +700,45 @@ function RotaryEmbedding(dim::Int; base=10000000.0)
     return RotaryEmbedding(dim, Float32(base), inv_freq)
 end
 
+function rope_kernel!(x, inv_freq, pos, d, h, seq, d_rope)
+    idx = get_global_id(1)
+    if idx <= (d_rope ÷ 2) * h * seq
+        half_d = d_rope ÷ 2
+        i = (idx - 1) % half_d + 1
+        rem = (idx - 1) ÷ half_d
+        head = rem % h + 1
+        t = rem ÷ h + 1
+        
+        idx1 = 2*i - 1
+        idx2 = 2*i
+        
+        p = Float32(pos + t - 1)
+        freq = inv_freq[i] * p
+        cos_val = cos(freq)
+        sin_val = sin(freq)
+        
+        x1 = x[idx1, head, t]
+        x2 = x[idx2, head, t]
+        
+        x[idx1, head, t] = x1 * cos_val - x2 * sin_val
+        x[idx2, head, t] = x1 * sin_val + x2 * cos_val
+    end
+    return nothing
+end
+
 function (rope::RotaryEmbedding)(x::oneArray{Float32,3}, pos::Int)
     d, h, seq = size(x)
     d_rope = min(d, rope.dim)
-    # CPU fallback for rope to avoid GPU kernel issues
-    x_cpu = collect(x)
-    positions = Float32.(pos:(pos+seq-1))
-    freqs = rope.inv_freq[1:(d_rope÷2)] * positions'
-    cos_t = reshape(cos.(freqs), d_rope ÷ 2, 1, seq)
-    sin_t = reshape(sin.(freqs), d_rope ÷ 2, 1, seq)
     
-    # Element-wise rope transformation to avoid GPU issues
-    for t in 1:seq
-        for head in 1:h
-            for i in 1:(d_rope÷2)
-                idx1 = 2*i - 1
-                idx2 = 2*i
-                if idx1 <= d && idx2 <= d
-                    cos_val = cos_t[i, 1, t]
-                    sin_val = sin_t[i, 1, t]
-                    x1 = x_cpu[idx1, head, t]
-                    x2 = x_cpu[idx2, head, t]
-                    x_cpu[idx1, head, t] = x1 * cos_val - x2 * sin_val
-                    x_cpu[idx2, head, t] = x1 * sin_val + x2 * cos_val
-                end
-            end
-        end
-    end
+    inv_freq_gpu = oneArray(rope.inv_freq)
     
-    x_gpu = oneArray(x_cpu)
-    return x_gpu
+    n_elements = (d_rope ÷ 2) * h * seq
+    gs = min(n_elements, 256)
+    gr = cld(n_elements, gs)
+    
+    @oneapi items=gs groups=gr rope_kernel!(x, inv_freq_gpu, pos, d, h, seq, d_rope)
+    
+    return x
 end
 
 # --- KV Cache ---
@@ -663,26 +748,50 @@ mutable struct KVCache
     pos::Int
 end
 
-function init_kv_cache(head_dim, n_kv, max_seq)
-    # Use smaller default to avoid driver issues on Intel Arc
-    # See: https://github.com/JuliaGPU/oneAPI.jl/issues/458
-    actual_seq = min(max_seq, 512)  # Start with 512 instead of 4096
-    
-    # Try smaller allocation first, then progressively increase if needed
-    for try_seq in [128, 256, 512]
-        try
-            seq = min(try_seq, max_seq)
-            k = oneArray(zeros(Float32, head_dim, n_kv, seq))
-            v = oneArray(zeros(Float32, head_dim, n_kv, seq))
-            return KVCache(k, v, 0)
-        catch e
-            if try_seq == 512  # Last attempt
-                @error "Failed to initialize KV cache on GPU: $e"
-                rethrow(e)
-            end
-            # Try smaller size
-            continue
+# Free GPU memory for a KVCache - call this on error/cleanup
+function free_kv_cache!(cache::KVCache)
+    try
+        if isdefined(cache, :k) && cache.k !== nothing
+            oneAPI.unsafe_free!(cache.k)
+            cache.k = oneArray{Float32,3}(undef, 0, 0, 0)  # Replace with empty array
         end
+    catch e
+        @warn "Error freeing KV cache k: $e"
+    end
+    try
+        if isdefined(cache, :v) && cache.v !== nothing
+            oneAPI.unsafe_free!(cache.v)
+            cache.v = oneArray{Float32,3}(undef, 0, 0, 0)
+        end
+    catch e
+        @warn "Error freeing KV cache v: $e"
+    end
+    cache.pos = 0
+    return nothing
+end
+
+# Free all KV caches in a vector
+function free_all_kv_caches!(caches::Vector{KVCache})
+    for cache in caches
+        free_kv_cache!(cache)
+    end
+    return nothing
+end
+
+function init_kv_cache(head_dim, n_kv, max_seq)
+    # Correct memory-efficient initialization using DeviceBuffer
+    # Avoids CPU zeros() blowup and uses explicit fill! which is 458-safe.
+    seq = min(max_seq, 512)
+    try
+        k = oneArray{Float32}(undef, head_dim, n_kv, seq)
+        v = oneArray{Float32}(undef, head_dim, n_kv, seq)
+        fill!(k, 0.0f0)
+        fill!(v, 0.0f0)
+        oneAPI.synchronize()
+        return KVCache(k, v, 0)
+    catch e
+        @error "Failed to initialize KV cache: $e"
+        rethrow(e)
     end
 end
 
@@ -819,6 +928,7 @@ function FullAttention(arch, wq, wk, wv, wqkv, wo, q_norm, k_norm, n_heads, n_kv
     decode_out_h = oneArray(zeros(Float32, hd, 1))
     wo_out_size = size(wo, 1)
     decode_wo_buf = oneArray(zeros(Float32, wo_out_size, 1))
+    oneAPI.synchronize()
     
     # Prefill buffers - fixed size for 4096 context
     prefill_scores = oneArray(zeros(Float32, max_len, n_heads))
@@ -1030,6 +1140,7 @@ struct GatedDeltaNet
     ssm_alpha::Union{oneMatrix{Float32}, QuantMatrix}   # (hidden, num_v_heads=16) — dt projection
     ssm_beta::Union{oneMatrix{Float32}, QuantMatrix}    # (hidden, num_v_heads=16) — beta projection
     ssm_conv1d::oneArray{Float32,2} # (conv_kernel=4, conv_channels=6144) — F32
+    ssm_conv1d_cpu::Matrix{Float32} # CPU copy of conv1d weights
     ssm_dt_bias::oneVector{Float32} # GPU dt bias
     ssm_norm::RMSNorm               # (head_v_dim=128,) for output norm
     # CPU state buffers (kept on CPU for efficiency)
@@ -1054,8 +1165,8 @@ struct GatedDeltaNet
     prefill_alpha::oneMatrix{Float32}
 end
 
-function GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, ssm_conv1d, ssm_dt_bias, ssm_norm,
-                       conv_state, ssm_state, num_v_heads, num_k_heads, head_k_dim, head_v_dim, d_inner, ssm_conv1d_cpu)
+function GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, ssm_conv1d, ssm_conv1d_cpu, ssm_dt_bias, ssm_norm,
+                       conv_state, ssm_state, num_v_heads, num_k_heads, head_k_dim, head_v_dim, d_inner)
     conv_channels = size(ssm_conv1d, 2)
     
     # Keep essential GPU buffers only
@@ -1071,11 +1182,12 @@ function GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, 
     max_seq = 4096
     prefill_beta = oneArray(zeros(Float32, num_v_heads, max_seq))
     prefill_alpha = oneArray(zeros(Float32, num_v_heads, max_seq))
+    oneAPI.synchronize()
     
     # Convert conv1d to GPU if needed
     ssm_conv1d_gpu = ssm_conv1d isa oneArray ? ssm_conv1d : oneArray(Float32.(ssm_conv1d))
     
-    return GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, ssm_conv1d_gpu, ssm_dt_bias, ssm_norm,
+    return GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, ssm_conv1d_gpu, ssm_conv1d_cpu, ssm_dt_bias, ssm_norm,
                          conv_state, ssm_state, num_v_heads, num_k_heads, head_k_dim, head_v_dim, d_inner,
                          decode_beta, decode_alpha, decode_decay_gate, decode_conv_out,
                          decode_z, decode_output_normed, decode_gated,
@@ -1128,7 +1240,7 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
         
         # Compute convolution
         conv_out_cpu = zeros(Float32, conv_channels, 1)
-        conv_w_cpu = collect(m.ssm_conv1d)
+        conv_w_cpu = m.ssm_conv1d_cpu
         for c in 1:conv_channels
             s = 0.0f0
             for k in 1:conv_kernel
@@ -1240,7 +1352,7 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
         # Process on CPU for prefill
         conv_out_cpu = zeros(Float32, conv_channels, seq)
         conv_state_cpu = zeros(Float32, conv_kernel, conv_channels)
-        conv_w_cpu = collect(m.ssm_conv1d)
+        conv_w_cpu = m.ssm_conv1d_cpu
         
         for t in 1:seq
             # Update conv state
@@ -1321,18 +1433,21 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
             end
         end
         
-        # Final processing - reuse decode buffers
+        # Final processing
         output_flat = reshape(output_cpu, m.head_v_dim * m.num_v_heads, seq)
         output_gpu = oneArray(output_flat)
-        rmsnorm!(m.decode_output_normed, output_gpu, m.ssm_norm)
+        
+        # Only use pre-allocated buffers if seq == 1 (decoding)
+        output_normed = if seq == 1
+            rmsnorm!(m.decode_output_normed, output_gpu, m.ssm_norm)
+        else
+            rmsnorm(output_gpu, m.ssm_norm)
+        end
         
         z_silu = z_cpu .* (1.0f0 ./ (1.0f0 .+ exp.(-z_cpu)))
-        # Ensure z_silu has same dimensions as output_normed
-        if size(z_silu, 2) != size(m.decode_output_normed, 2)
-            z_silu = z_silu[:, 1:size(m.decode_output_normed, 2)]
-        end
         z_silu_gpu = oneArray(z_silu)
-        gated = m.decode_output_normed .* z_silu_gpu
+        
+        gated = output_normed .* z_silu_gpu
         
         return mat_mul(m.ssm_out, gated)
     end
@@ -1367,6 +1482,102 @@ struct QwenModel
     rope::RotaryEmbedding
 end
 
+# Free all GPU memory associated with a QwenModel (weights, norms, etc.)
+# Note: This frees the GPU arrays but keeps the model structure for reloading
+function free_model_gpu!(model::QwenModel)
+    # Free embedding
+    try
+        if isdefined(model, :embed) && model.embed !== nothing
+            # embed is CPU-based, no GPU memory to free
+        end
+    catch e
+        @warn "Error freeing embed: $e"
+    end
+    
+    # Free layers - each layer has attention/SSM and MLP with GPU arrays
+    for layer in model.layers
+        try
+            # Free in_norm and post_norm
+            if isdefined(layer, :in_norm) && isdefined(layer.in_norm, :weight)
+                oneAPI.unsafe_free!(layer.in_norm.weight)
+            end
+            if isdefined(layer, :post_norm) && isdefined(layer.post_norm, :weight)
+                oneAPI.unsafe_free!(layer.post_norm.weight)
+            end
+        catch e
+            @warn "Error freeing layer norms: $e"
+        end
+        
+        try
+            # Free attention/SSM op
+            if layer.op isa FullAttention
+                # Free pre-allocated GPU buffers in FullAttention
+                op = layer.op
+                for field in fieldnames(FullAttention)
+                    if field in [:decode_q_full, :decode_k, :decode_v, :decode_combined, 
+                                 :decode_scores, :decode_pb, :decode_out_h, :decode_wo_buf,
+                                 :prefill_scores, :prefill_pb]
+                        try
+                            buf = getfield(op, field)
+                            if buf !== nothing
+                                oneAPI.unsafe_free!(buf)
+                            end
+                        catch
+                        end
+                    end
+                end
+            elseif layer.op isa GatedDeltaNet
+                # Free GPU buffers in GatedDeltaNet
+                op = layer.op
+                for field in fieldnames(GatedDeltaNet)
+                    if field in [:decode_beta, :decode_alpha, :decode_decay_gate, 
+                                 :decode_conv_out, :decode_z, :decode_output_normed,
+                                 :decode_gated, :prefill_beta, :prefill_alpha]
+                        try
+                            buf = getfield(op, field)
+                            if buf !== nothing
+                                oneAPI.unsafe_free!(buf)
+                            end
+                        catch
+                        end
+                    end
+                end
+            end
+        catch e
+            @warn "Error freeing layer op: $e"
+        end
+        
+        try
+            # Free MLP
+            mlp = layer.mlp
+            for field in fieldnames(MLP)
+                try
+                    w = getfield(mlp, field)
+                    if w !== nothing
+                        oneAPI.unsafe_free!(w)
+                    end
+                catch
+                end
+            end
+        catch e
+            @warn "Error freeing MLP: $e"
+        end
+    end
+    
+    # Free final_norm
+    try
+        if isdefined(model, :final_norm) && isdefined(model.final_norm, :weight)
+            oneAPI.unsafe_free!(model.final_norm.weight)
+        end
+    catch e
+        @warn "Error freeing final_norm: $e"
+    end
+    
+    # lm_head is CPU-based, no GPU memory to free
+    
+    return nothing
+end
+
 function forward!(model::QwenModel, tokens::Vector{Int}, pos::Int, caches::Vector{KVCache})
     try
         # 1. Embedding (CPU to GPU as F32)
@@ -1399,6 +1610,19 @@ function forward!(model::QwenModel, tokens::Vector{Int}, pos::Int, caches::Vecto
         st = stacktrace(catch_backtrace())
         for line in st
             println("  ", line)
+        end
+        # Cleanup on error - free caches and force GC
+        try
+            free_all_kv_caches!(caches)
+        catch
+        end
+        try
+            GC.gc(true)
+        catch
+        end
+        try
+            oneAPI.synchronize()
+        catch
         end
         rethrow(e)
     end

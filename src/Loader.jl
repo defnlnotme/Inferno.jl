@@ -112,6 +112,7 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
             ssm_beta   = get_weight(file, "$(prefix).ssm_beta.weight")
             ssm_conv1d_raw = extract_tensor(file, "$(prefix).ssm_conv1d.weight")
             ssm_conv1d_f32 = oneArray(collect(Float32.(ssm_conv1d_raw)))
+            oneAPI.synchronize()
             ssm_dt_bias    = oneArray(get_bias_or_norm(file, "$(prefix).ssm_dt.bias"))
             ssm_norm_w     = get_bias_or_norm(file, "$(prefix).ssm_norm.weight")
             ssm_norm       = Model.RMSNorm(oneArray(ssm_norm_w), config.rms_norm_eps)
@@ -131,10 +132,9 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
             ssm_conv1d_cpu = collect(Float32.(ssm_conv1d_raw))
 
             Model.GatedDeltaNet(in_proj, gate_proj, ssm_out,
-                ssm_a, ssm_alpha, ssm_beta, ssm_conv1d_f32, ssm_dt_bias, ssm_norm,
+                ssm_a, ssm_alpha, ssm_beta, ssm_conv1d_f32, ssm_conv1d_cpu, ssm_dt_bias, ssm_norm,
                 conv_state, ssm_state,
-                num_v_heads, num_k_heads, head_k_dim, head_v_dim, config.ssm_inner_size,
-                ssm_conv1d_cpu)
+                num_v_heads, num_k_heads, head_k_dim, head_v_dim, config.ssm_inner_size)
         elseif arch == :deepseek2
             # Simplified MLA loading
             q_a_proj = get_weight(file, "$(prefix).attn_q_a.weight")
