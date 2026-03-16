@@ -632,15 +632,6 @@ function conv1d_kernel!(out, input, weight, conv_state, kernel_size, channels, s
     return nothing
 end
 
-# GPU SiLU kernel
-function silu_kernel!(out, x, N)
-    i = get_global_id(1)
-    if i <= N
-        out[i] = x[i] * (1.0f0 / (1.0f0 + exp(-x[i])))
-    end
-    return nothing
-end
-
 # GPU L2 normalization kernel for SSM
 function l2_norm_ssm_kernel!(q, k, head_dim, num_heads, seq, eps)
     t = get_global_id(1)
