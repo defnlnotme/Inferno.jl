@@ -55,8 +55,26 @@ StructTypes.StructType(::Type{ChatCompletionResponse}) = StructTypes.Struct()
 
 const MODEL_REF = Ref{Union{QwenModel,Nothing}}(nothing)
 const TOK_REF = Ref{Union{BPETokenizer,Nothing}}(nothing)
+const AUTH_TOKEN_REF = Ref{String}("")
 
 # ─── Handlers ────────────────────────────────────────────────────────────────
+
+function check_auth(stream::HTTP.Stream)
+    token = AUTH_TOKEN_REF[]
+    if isempty(token)
+        return true
+    end
+
+    auth_header = HTTP.header(stream.message, "Authorization")
+    if auth_header == "Bearer $token"
+        return true
+    end
+
+    HTTP.setstatus(stream, 401)
+    HTTP.setheader(stream, "Content-Type" => "application/json")
+    write(stream, JSON3.write(Dict("error" => "Unauthorized: Invalid or missing API key")))
+    return false
+end
 
 function build_prompt(messages::Vector{Message})
     parts = String[]
@@ -74,10 +92,35 @@ function build_prompt(messages::Vector{Message})
 end
 
 function handle_chat(stream::HTTP.Stream)
+    check_auth(stream) || return
+
     try
         req = stream.message
-        body_bytes = read(stream)
-        body = JSON3.read(body_bytes, ChatCompletionRequest)
+
+        # Read body with size limit to prevent OOM / DoS (Max 4MB)
+        MAX_BODY_SIZE = 4 * 1024 * 1024
+        body_bytes = UInt8[]
+        while !eof(stream)
+            chunk = readavailable(stream)
+            append!(body_bytes, chunk)
+            if length(body_bytes) > MAX_BODY_SIZE
+                HTTP.setstatus(stream, 413)
+                HTTP.setheader(stream, "Content-Type" => "application/json")
+                HTTP.setheader(stream, "Connection" => "close")
+                write(stream, JSON3.write(Dict("error" => "Payload Too Large")))
+                return
+            end
+        end
+
+        local body
+        try
+            body = JSON3.read(body_bytes, ChatCompletionRequest)
+        catch e
+            HTTP.setstatus(stream, 400)
+            HTTP.setheader(stream, "Content-Type" => "application/json")
+            write(stream, JSON3.write(Dict("error" => "Invalid JSON payload: " * sprint(showerror, e))))
+            return
+        end
 
         model = MODEL_REF[]
         tok = TOK_REF[]
@@ -183,6 +226,8 @@ function handle_health(stream::HTTP.Stream)
 end
 
 function handle_models(stream::HTTP.Stream)
+    check_auth(stream) || return
+
     HTTP.setstatus(stream, 200)
     HTTP.setheader(stream, "Content-Type" => "application/json")
     write(stream, JSON3.write(Dict("data" => [Dict(
@@ -196,9 +241,18 @@ end
 
 function start_server(port::Int=8080;
     model::Union{QwenModel,Nothing}=nothing,
-    tokenizer::Union{BPETokenizer,Nothing}=nothing)
+    tokenizer::Union{BPETokenizer,Nothing}=nothing,
+    auth_token::Union{String,Nothing}=nothing)
     MODEL_REF[] = model
     TOK_REF[] = tokenizer
+
+    if !isnothing(auth_token)
+        AUTH_TOKEN_REF[] = auth_token
+    elseif haskey(ENV, "INFERNO_API_KEY")
+        AUTH_TOKEN_REF[] = ENV["INFERNO_API_KEY"]
+    else
+        AUTH_TOKEN_REF[] = bytes2hex(rand(UInt8, 16))
+    end
 
     router = HTTP.Router()
     # Register handlers as Stream handlers
@@ -207,6 +261,7 @@ function start_server(port::Int=8080;
     HTTP.register!(router, "GET", "/v1/models", handle_models)
 
     println("🔥 Inferno server listening on http://127.0.0.1:$(port)")
+    println("   API Token: Bearer $(AUTH_TOKEN_REF[])")
     println("   POST /v1/chat/completions")
     println("   GET  /v1/models")
     println("   GET  /health")
