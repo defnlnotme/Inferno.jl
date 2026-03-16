@@ -30,16 +30,7 @@ function main()
     # 2. Define your prompt
     println("-"^40)
     print("Enter prompt: ")
-    prompt = try
-        readline()
-    catch e
-        if e isa EOFError
-            println("\nGoodbye!")
-            exit(0)
-        else
-            rethrow(e)
-        end
-    end
+    prompt = read(stdin, String)
 
     if isempty(prompt)
         if eof(stdin)
@@ -55,7 +46,7 @@ function main()
     print("Response: ")
 
     # generate_stream yields one string token (decoded) at a time
-    stream = Inferno.generate_stream(model, tok, prompt; max_tokens=20, temperature=0.1f0)
+    stream = Inferno.generate_stream(model, tok, prompt; max_tokens=256, temperature=0.1f0)
     try
         for token in stream
             print(token)

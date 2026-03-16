@@ -217,6 +217,10 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
 
             # Prefill: pass pos=0, the KV caches will accumulate internally
             logits = Model.forward!(model, tokens, 0, kv_caches)
+            
+            # Update curr_pos after prefill
+            curr_pos = length(tokens)
+            
             # Explicitly collect only the last column of logits for sampling
             logits_vec = vec(collect(logits[:, end]))
             last_token = mask_and_sample(
@@ -225,14 +229,15 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
             token_str = Tokenizer.decode(tok, [last_token])
             put!(chan, token_str)
 
-            # Decode: each step passes current cache.pos as the position
+            # Decode: each step passes current sequence position
             for step in 1:(max_tokens-1)
                 if last_token == (stop_token === nothing ? tok.eos_id : stop_token)
                     break
                 end
 
-                curr_pos = kv_caches[1].pos  # all caches share same length after prefill
                 logits = Model.forward!(model, [last_token], curr_pos, kv_caches)
+                curr_pos += 1
+                
                 # Explicitly collect the first column (seq=1)
                 logits_vec = vec(collect(logits[:, 1]))
                 last_token = mask_and_sample(

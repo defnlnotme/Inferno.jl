@@ -777,7 +777,7 @@ end
 function init_kv_cache(head_dim, n_kv, max_seq)
     # Correct memory-efficient initialization using DeviceBuffer
     # Avoids CPU zeros() blowup and uses explicit fill! which is 458-safe.
-    seq = min(max_seq, 512)
+    seq = min(max_seq, 256)
     try
         k = oneArray{Float32}(undef, head_dim, n_kv, seq)
         v = oneArray{Float32}(undef, head_dim, n_kv, seq)
@@ -911,7 +911,7 @@ struct FullAttention
 end
 
 function FullAttention(arch, wq, wk, wv, wqkv, wo, q_norm, k_norm, n_heads, n_kv, hd)
-    q_size = (arch == :qwen || arch == :qwen2 || arch == :qwen2_5) ? hd * 2 * n_heads : hd * n_heads
+    q_size = (arch == :qwen || arch == :qwen2 || arch == :qwen2_5 || arch == :qwen35) ? hd * 2 * n_heads : hd * n_heads
     decode_q_full = oneArray(zeros(Float32, q_size, 1))
     decode_k = oneArray(zeros(Float32, hd * n_kv, 1))
     decode_v = oneArray(zeros(Float32, hd * n_kv, 1))
@@ -938,18 +938,18 @@ end
 function (m::FullAttention)(x::oneArray{Float32,2}, pos::Int, rope::RotaryEmbedding, cache::KVCache)
     hd, seq = m.head_dim, size(x, 2)
 
-    if m.architecture == :qwen || m.architecture == :qwen2 || m.architecture == :qwen2_5
+    if m.architecture == :qwen || m.architecture == :qwen2 || m.architecture == :qwen2_5 || m.architecture == :qwen35
         # 1. Packed Q+gate projection
         if seq == 1
             q_full = mat_mul!(m.decode_q_full, m.wq, x)
-            q_3d = reshape(q_full, hd * 2, m.n_heads, seq)
+            q_3d = reshape(q_full, div(size(q_full, 1), m.n_heads), m.n_heads, seq)
             q_only = view(q_3d, 1:hd, :, :)
             gate_raw = view(q_3d, hd+1:2*hd, :, :)
             k = mat_mul!(m.decode_k, m.wk, x)
             v = mat_mul!(m.decode_v, m.wv, x)
         else
             q_full = mat_mul(m.wq, x)
-            q_3d = reshape(q_full, hd * 2, m.n_heads, seq)
+            q_3d = reshape(q_full, div(size(q_full, 1), m.n_heads), m.n_heads, seq)
             q_only = view(q_3d, 1:hd, :, :)
             gate_raw = view(q_3d, hd+1:2*hd, :, :)
             k = mat_mul(m.wk, x)
@@ -1042,9 +1042,9 @@ function (m::FullAttention)(x::oneArray{Float32,2}, pos::Int, rope::RotaryEmbedd
         return mat_mul!(m.decode_wo_buf, m.wo, combined)
     else
         # Prefill path - use batched GPU softmax
-        q_final = reshape(q_gated, hd, m.n_heads, seq)
+        q_final = reshape(q_gated, size(q_gated, 1), m.n_heads, seq)
         kv_per_q = m.n_heads ÷ m.n_kv
-        combined_all = oneArray(zeros(Float32, hd * m.n_heads, seq))
+        combined_all = oneArray(zeros(Float32, size(q_gated, 1) * m.n_heads, seq))
         
         # Fixed buffers - no growth needed
         
@@ -1054,7 +1054,7 @@ function (m::FullAttention)(x::oneArray{Float32,2}, pos::Int, rope::RotaryEmbedd
             # Compute all scores for this head at once
             scores_view = view(m.prefill_scores, 1:(pos+seq), h:h)
             for s in 1:seq
-                K_v = reshape(view(K_cache, :, kh, 1:(pos+s)), hd, :)
+                K_v = reshape(view(K_cache, :, kh, 1:(pos+s)), size(k_rope, 1), :)
                 q_v = reshape(q_final[:, h, s], :, 1)
                 
                 # scores: (pos+s, 1) = K_v' * q_v
@@ -1068,10 +1068,12 @@ function (m::FullAttention)(x::oneArray{Float32,2}, pos::Int, rope::RotaryEmbedd
             
             # Compute attention output for all timesteps
             for s in 1:seq
-                V_v = reshape(view(V_cache, :, kh, 1:(pos+s)), hd, :)
+                V_v = reshape(view(V_cache, :, kh, 1:(pos+s)), size(v_2d, 1), :)
                 pb_s = view(pb_view, 1:(pos+s), :)
                 out_s = mat_mul_AB(V_v, pb_s)
-                combined_all[(h-1)*hd+1:h*hd, s] .= vec(out_s)
+                out_vec = vec(out_s)
+                slice_size = length(out_vec)
+                combined_all[(h-1)*size(q_gated, 1)+1:(h-1)*size(q_gated, 1)+slice_size, s] .= out_vec
             end
         end
         combined = combined_all
@@ -1430,6 +1432,10 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
         # Final processing
         output_flat = reshape(output_cpu, m.head_v_dim * m.num_v_heads, seq)
         output_gpu = oneArray(output_flat)
+        
+        # Persist final states back to model for subsequent decoding
+        m.ssm_state .= ssm_state_cpu
+        m.conv_state .= conv_state_cpu
         
         # Only use pre-allocated buffers if seq == 1 (decoding)
         output_normed = if seq == 1

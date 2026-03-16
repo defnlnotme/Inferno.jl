@@ -48,6 +48,8 @@ function extract_tensor(file::GGUF.GGUFFile, name::String)
         dequantize_iq3_xxs(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_IQ3_S
         dequantize_iq3_s(@view(file.tensor_data[start:end]), num_elements)
+    elseif info.type == GGUF.GGML_TYPE_IQ4_XS
+        dequantize_iq4_xs(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_Q2_K
         dequantize_q2_k(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_Q3_K
@@ -198,7 +200,8 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
                   extract_tensor(file, "output.weight") : embed
     lm_head = Float32.(lm_head_raw)  # Keep on CPU for now
 
-    rope = Model.RotaryEmbedding(config.head_dim; base=config.rope_theta)
+    rope_dim = Int(get(file.metadata, "$(arch).rope.dimension_count", config.head_dim))
+    rope = Model.RotaryEmbedding(rope_dim; base=config.rope_theta)
 
     return Model.QwenModel(config, Float32.(embed), layers, final_norm, lm_head, rope)
 end
