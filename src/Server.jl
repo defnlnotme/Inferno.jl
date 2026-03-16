@@ -76,8 +76,31 @@ end
 function handle_chat(stream::HTTP.Stream)
     try
         req = stream.message
-        body_bytes = read(stream)
-        body = JSON3.read(body_bytes, ChatCompletionRequest)
+
+        # Read body with size limit to prevent OOM / DoS (Max 4MB)
+        MAX_BODY_SIZE = 4 * 1024 * 1024
+        body_bytes = UInt8[]
+        while !eof(stream)
+            chunk = readavailable(stream)
+            append!(body_bytes, chunk)
+            if length(body_bytes) > MAX_BODY_SIZE
+                HTTP.setstatus(stream, 413)
+                HTTP.setheader(stream, "Content-Type" => "application/json")
+                HTTP.setheader(stream, "Connection" => "close")
+                write(stream, JSON3.write(Dict("error" => "Payload Too Large")))
+                return
+            end
+        end
+
+        local body
+        try
+            body = JSON3.read(body_bytes, ChatCompletionRequest)
+        catch e
+            HTTP.setstatus(stream, 400)
+            HTTP.setheader(stream, "Content-Type" => "application/json")
+            write(stream, JSON3.write(Dict("error" => "Invalid JSON payload: " * sprint(showerror, e))))
+            return
+        end
 
         model = MODEL_REF[]
         tok = TOK_REF[]

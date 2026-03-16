@@ -161,17 +161,6 @@ function temperature_scale_kernel!(scaled_logits, logits, inv_temp, N)
     return
 end
 
-# Argmax kernel
-function argmax_kernel!(result, logits, N)
-    i = get_global_id(1)
-    if i <= N
-        # Use atomic operations for reduction
-        # For simplicity, we'll collect to CPU for argmax
-        result[i] = i
-    end
-    return
-end
-
 # --- Optimized Matrix Multiplication with Tiling ---
 
 # Performance constants for 2-bit quantization
@@ -179,20 +168,27 @@ const IQ2_TILE_SIZE = 16  # Optimal for 2-bit data (16x16 tiles)
 const IQ2_VEC_TILE = 32   # Vector operations tile size
 const CACHE_LINE_SIZE = 64 # Cache line alignment
 
+struct MatMulConfig
+    N::Int
+    M::Int
+    K::Int
+    tile_size::Int
+end
+
 # Optimized tiled matrix multiplication kernel (without shared memory for oneAPI compatibility)
-function tiled_mat_mul_kernel!(res, A, B, N, M, K, tile_size)
+function tiled_mat_mul_kernel!(res, A, B, config::MatMulConfig)
     # Each work item computes one element of the output
     i = get_global_id(1)
     j = get_global_id(2)
     
-    if i <= N && j <= M
+    if i <= config.N && j <= config.M
         val = 0.0f0
         
         # Process in tiles for better cache utilization
-        num_tiles = cld(K, tile_size)
+        num_tiles = cld(config.K, config.tile_size)
         for t in 1:num_tiles
-            tile_start = (t-1) * tile_size
-            tile_end = min(tile_start + tile_size, K)
+            tile_start = (t-1) * config.tile_size
+            tile_end = min(tile_start + config.tile_size, config.K)
             
             # Unrolled loop for better performance
             k = tile_start
@@ -266,7 +262,8 @@ function mat_mul(weight::AbstractArray{Float32,2}, x::AbstractArray{Float32,2})
             gs_y = tile_size
             gr_x = cld(N, tile_size)
             gr_y = cld(M, tile_size)
-            @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_kernel!(res, weight, x, N, M, K, tile_size)
+            config = MatMulConfig(N, M, K, tile_size)
+            @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_kernel!(res, weight, x, config)
         else
             # Use optimized vector kernel for matrix-vector multiplication
             # Larger tile for vector operations to maximize throughput
@@ -294,7 +291,8 @@ function mat_mul!(res::oneMatrix{Float32}, weight::oneMatrix{Float32}, x::oneMat
         gs_y = tile_size
         gr_x = cld(N, tile_size)
         gr_y = cld(M, tile_size)
-        @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_kernel!(res, weight, x, N, M, K, tile_size)
+        config = MatMulConfig(N, M, K, tile_size)
+        @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_kernel!(res, weight, x, config)
     else
         tile_size = min(IQ2_VEC_TILE, max(32, cld(N, 8)))  # Adaptive vector tile
         gs = min(N, 256)
@@ -628,15 +626,6 @@ function conv1d_kernel!(out, input, weight, conv_state, kernel_size, channels, s
             end
             out[c, t] = s
         end
-    end
-    return nothing
-end
-
-# GPU SiLU kernel
-function silu_kernel!(out, x, N)
-    i = get_global_id(1)
-    if i <= N
-        out[i] = x[i] * (1.0f0 / (1.0f0 + exp(-x[i])))
     end
     return nothing
 end
@@ -1024,6 +1013,7 @@ struct GatedDeltaNet
     ssm_alpha::Union{oneMatrix{Float32}, QuantMatrix}   # (hidden, num_v_heads=16) — dt projection
     ssm_beta::Union{oneMatrix{Float32}, QuantMatrix}    # (hidden, num_v_heads=16) — beta projection
     ssm_conv1d::oneArray{Float32,2} # (conv_kernel=4, conv_channels=6144) — F32
+    ssm_conv1d_cpu::Matrix{Float32} # CPU copy of conv1d weights
     ssm_dt_bias::oneVector{Float32} # GPU dt bias
     ssm_norm::RMSNorm               # (head_v_dim=128,) for output norm
     # CPU state buffers (kept on CPU for efficiency)
@@ -1048,8 +1038,8 @@ struct GatedDeltaNet
     prefill_alpha::oneMatrix{Float32}
 end
 
-function GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, ssm_conv1d, ssm_dt_bias, ssm_norm,
-                       conv_state, ssm_state, num_v_heads, num_k_heads, head_k_dim, head_v_dim, d_inner, ssm_conv1d_cpu)
+function GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, ssm_conv1d, ssm_conv1d_cpu, ssm_dt_bias, ssm_norm,
+                       conv_state, ssm_state, num_v_heads, num_k_heads, head_k_dim, head_v_dim, d_inner)
     conv_channels = size(ssm_conv1d, 2)
     
     # Keep essential GPU buffers only
@@ -1070,7 +1060,7 @@ function GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, 
     # Convert conv1d to GPU if needed
     ssm_conv1d_gpu = ssm_conv1d isa oneArray ? ssm_conv1d : oneArray(Float32.(ssm_conv1d))
     
-    return GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, ssm_conv1d_gpu, ssm_dt_bias, ssm_norm,
+    return GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, ssm_conv1d_gpu, ssm_conv1d_cpu, ssm_dt_bias, ssm_norm,
                          conv_state, ssm_state, num_v_heads, num_k_heads, head_k_dim, head_v_dim, d_inner,
                          decode_beta, decode_alpha, decode_decay_gate, decode_conv_out,
                          decode_z, decode_output_normed, decode_gated,
@@ -1123,7 +1113,7 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
         
         # Compute convolution
         conv_out_cpu = zeros(Float32, conv_channels, 1)
-        conv_w_cpu = collect(m.ssm_conv1d)
+        conv_w_cpu = m.ssm_conv1d_cpu
         for c in 1:conv_channels
             s = 0.0f0
             for k in 1:conv_kernel
@@ -1235,7 +1225,7 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
         # Process on CPU for prefill
         conv_out_cpu = zeros(Float32, conv_channels, seq)
         conv_state_cpu = zeros(Float32, conv_kernel, conv_channels)
-        conv_w_cpu = collect(m.ssm_conv1d)
+        conv_w_cpu = m.ssm_conv1d_cpu
         
         for t in 1:seq
             # Update conv state

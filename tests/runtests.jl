@@ -7,6 +7,13 @@ const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
 
 @testset "Inferno Tests" begin
 
+    @testset "Security: Unbounded string allocation" begin
+        io = IOBuffer()
+        write(io, UInt64(typemax(UInt64))) # Arbitrarily large length
+        seekstart(io)
+        @test_throws ErrorException Inferno.GGUF.read_string(io)
+    end
+
     @testset "GGUF Parsing" begin
         file = Inferno.GGUF.read_gguf(MODEL_PATH)
 
@@ -52,6 +59,58 @@ const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
         decoded = Inferno.Tokenizer.decode(tok, ids)
         println("  Decoded: '$decoded'")
         @test occursin("Hello", decoded) || occursin("hello", decoded) || length(decoded) > 0
+    end
+
+    @testset "RMSNorm" begin
+        using Inferno.Model
+        using oneAPI
+
+        # Test single sequence (1D-like, but technically 2D: hidden_size x 1)
+        hidden_size = 1024
+        seq_len = 1
+        eps = 1f-6
+
+        x_cpu = rand(Float32, hidden_size, seq_len)
+        w_cpu = rand(Float32, hidden_size)
+
+        # Expected output mathematically
+        m = sum(x_cpu .* x_cpu, dims=1) .* (1.0f0 / Float32(hidden_size))
+        inv_rms = 1.0f0 ./ sqrt.(m .+ eps)
+        expected = x_cpu .* inv_rms .* w_cpu
+
+        # GPU execution
+        norm = Inferno.Model.RMSNorm(oneArray(w_cpu), eps)
+        x_gpu = oneArray(x_cpu)
+        res_gpu = norm(x_gpu)
+        res_cpu = collect(res_gpu)
+
+        @test res_cpu ≈ expected atol=1e-4
+
+        # Test batched sequence (hidden_size x seq_len)
+        seq_len = 10
+        x_cpu_batch = rand(Float32, hidden_size, seq_len)
+
+        m_batch = sum(x_cpu_batch .* x_cpu_batch, dims=1) .* (1.0f0 / Float32(hidden_size))
+        inv_rms_batch = 1.0f0 ./ sqrt.(m_batch .+ eps)
+        expected_batch = x_cpu_batch .* inv_rms_batch .* w_cpu
+
+        x_gpu_batch = oneArray(x_cpu_batch)
+        res_gpu_batch = norm(x_gpu_batch)
+        res_cpu_batch = collect(res_gpu_batch)
+
+        @test res_cpu_batch ≈ expected_batch atol=1e-4
+
+        # Test small numbers
+        x_small = rand(Float32, hidden_size, 1) .* 1f-5
+        m_small = sum(x_small .* x_small, dims=1) .* (1.0f0 / Float32(hidden_size))
+        inv_rms_small = 1.0f0 ./ sqrt.(m_small .+ eps)
+        expected_small = x_small .* inv_rms_small .* w_cpu
+
+        x_gpu_small = oneArray(x_small)
+        res_gpu_small = norm(x_gpu_small)
+        res_cpu_small = collect(res_gpu_small)
+
+        @test res_cpu_small ≈ expected_small atol=1e-6
     end
 
     @testset "Config Extraction" begin
@@ -128,6 +187,51 @@ const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
         @test y_cpu ≈ y_gpu atol=1e-3
     end
 
+    @testset "Server Prompt Building" begin
+        using Inferno.Server
+
+        # Test 1: Only user message
+        msgs1 = [Server.Message("user", "Hello!")]
+        prompt1 = Server.build_prompt(msgs1)
+        expected1 = "<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n"
+        @test prompt1 == expected1
+
+        # Test 2: System and user message
+        msgs2 = [
+            Server.Message("system", "You are a helpful assistant."),
+            Server.Message("user", "What is 2+2?")
+        ]
+        prompt2 = Server.build_prompt(msgs2)
+        expected2 = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n"
+        @test prompt2 == expected2
+
+        # Test 3: System, user, assistant, user (conversation flow)
+        msgs3 = [
+            Server.Message("system", "You are a helpful assistant."),
+            Server.Message("user", "What is 2+2?"),
+            Server.Message("assistant", "It is 4."),
+            Server.Message("user", "What about 3+3?")
+        ]
+        prompt3 = Server.build_prompt(msgs3)
+        expected3 = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\nIt is 4.<|im_end|>\n<|im_start|>user\nWhat about 3+3?<|im_end|>\n<|im_start|>assistant\n"
+        @test prompt3 == expected3
+
+        # Test 4: Edge cases (empty message array)
+        msgs4 = Server.Message[]
+        prompt4 = Server.build_prompt(msgs4)
+        expected4 = "<|im_start|>assistant\n"
+        @test prompt4 == expected4
+
+        # Test 5: Unsupported roles are ignored
+        msgs5 = [
+            Server.Message("user", "Hello!"),
+            Server.Message("unsupported_role", "This should be ignored")
+        ]
+        prompt5 = Server.build_prompt(msgs5)
+        expected5 = "<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n"
+        @test prompt5 == expected5
+    end
+
     @testset "Inference" begin
         model, tok = Inferno.load_model(MODEL_PATH)
 
@@ -186,4 +290,8 @@ const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
         @test length(full_decode) > 0
     end
 
+end
+
+@testset "Server Endpoints Tests" begin
+    include("test_server.jl")
 end
