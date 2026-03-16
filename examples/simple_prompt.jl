@@ -30,8 +30,22 @@ function main()
     # 2. Define your prompt
     println("-"^40)
     print("Enter prompt: ")
-    prompt = readline()
+    prompt = try
+        readline()
+    catch e
+        if e isa EOFError
+            println("\nGoodbye!")
+            exit(0)
+        else
+            rethrow(e)
+        end
+    end
+
     if isempty(prompt)
+        if eof(stdin)
+            println("\nGoodbye!")
+            exit(0)
+        end
         prompt = "The capital of France is"
     end
 

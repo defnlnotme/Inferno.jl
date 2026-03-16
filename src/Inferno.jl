@@ -152,13 +152,13 @@ function load_model(path::String; device::Union{Int, Nothing}=nothing)
 end
 
 """
-    main(model_path; port=8080, device=nothing)
+    main(model_path; port=8080, device=nothing, auth_token=nothing)
 
 Load model and start the HTTP server.
 """
-function main(model_path::String; port::Int=8080, device::Union{Int, Nothing}=nothing)
+function main(model_path::String; port::Int=8080, device::Union{Int, Nothing}=nothing, auth_token::Union{String, Nothing}=nothing)
     model, tok = load_model(model_path; device=device)
-    Server.start_server(port; model=model, tokenizer=tok)
+    Server.start_server(port; model=model, tokenizer=tok, auth_token=auth_token)
 end
 
 end # module

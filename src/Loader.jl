@@ -31,8 +31,11 @@ function extract_tensor(file::GGUF.GGUFFile, name::String)
         dims = Tuple(Int.(info.dimensions))
         inner = dims[1]
         outer = length(dims) > 1 ? dims[2] : 1
+        # Optimization: Upload IQ2_XXS weights to GPU once during loading
+        # to avoid massive memory churn during inference hot-path.
         raw_data = @view file.tensor_data[start:start + num_elements * 66 ÷ 256 - 1]
-        return Model.IQ2XXSMatrix(collect(raw_data), inner, outer)
+        gpu_data = oneArray(collect(raw_data))
+        return Model.IQ2XXSMatrix(gpu_data, inner, outer)
     elseif info.type == GGUF.GGML_TYPE_IQ2_XS
         dequantize_iq2_xs(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_IQ2_S
@@ -81,6 +84,8 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
 
     layers = Model.DecoderLayer[]
     for i in 0:(config.num_hidden_layers-1)
+        print(".")
+        flush(stdout)
         prefix = "blk.$(i)"
         is_ssm = haskey(file.tensors, "$(prefix).ssm_a")
 
@@ -122,10 +127,10 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
             ssm_conv1d_cpu = collect(Float32.(ssm_conv1d_raw))
 
             Model.GatedDeltaNet(in_proj, gate_proj, ssm_out,
-                ssm_a, ssm_alpha, ssm_beta, ssm_conv1d_f32, ssm_dt_bias, ssm_norm,
+                ssm_a, ssm_alpha, ssm_beta, ssm_conv1d_f32, ssm_conv1d_cpu, ssm_dt_bias, ssm_norm,
                 conv_state, ssm_state,
-                num_v_heads, num_k_heads, head_k_dim, head_v_dim, config.ssm_inner_size,
-                ssm_conv1d_cpu)
+                num_v_heads, num_k_heads, head_k_dim, head_v_dim, config.ssm_inner_size)
+
         else
             qw = get_weight(file, "$(prefix).attn_q.weight")
             kw = get_weight(file, "$(prefix).attn_k.weight")
@@ -139,10 +144,7 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
 
             # Q output has packed Q+gate: size = head_dim * 2 * n_heads
             # Use size because get_weight returns IQ2XXSMatrix or Float32 matrix
-            n_heads = size(qw, 1) ÷ (config.head_dim * 2)
-            n_kv    = size(kw, 1) ÷ config.head_dim
-
-            Model.FullAttention(qw, kw, vw, ow, q_norm, k_norm, n_heads, n_kv, config.head_dim)
+            Model.FullAttention(qw, kw, vw, ow, q_norm, k_norm, config)
         end
 
         gate_w = get_weight(file, "$(prefix).ffn_gate.weight")
@@ -152,6 +154,7 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
 
         push!(layers, Model.DecoderLayer(in_norm, op, post_norm, mlp, is_ssm))
     end
+    println()
 
     final_norm_w = get_bias_or_norm(file, "output_norm.weight")
     final_norm = Model.RMSNorm(oneArray(final_norm_w), config.rms_norm_eps)

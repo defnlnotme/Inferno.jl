@@ -72,6 +72,9 @@ end
 
 function read_string(io::IO)
     len = read(io, UInt64)
+    if len > 1048576 # 1MB limit to prevent OOM DOS
+        error("String length exceeds maximum allowed length of 1MB")
+    end
     String(read(io, len))
 end
 
