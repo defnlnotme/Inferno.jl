@@ -232,3 +232,7 @@ const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
     end
 
 end
+
+@testset "Server Endpoints Tests" begin
+    include("test_server.jl")
+end
