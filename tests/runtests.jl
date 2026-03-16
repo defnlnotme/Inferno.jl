@@ -54,6 +54,58 @@ const MODEL_PATH = joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-IQ2_XXS.gguf")
         @test occursin("Hello", decoded) || occursin("hello", decoded) || length(decoded) > 0
     end
 
+    @testset "RMSNorm" begin
+        using Inferno.Model
+        using oneAPI
+
+        # Test single sequence (1D-like, but technically 2D: hidden_size x 1)
+        hidden_size = 1024
+        seq_len = 1
+        eps = 1f-6
+
+        x_cpu = rand(Float32, hidden_size, seq_len)
+        w_cpu = rand(Float32, hidden_size)
+
+        # Expected output mathematically
+        m = sum(x_cpu .* x_cpu, dims=1) .* (1.0f0 / Float32(hidden_size))
+        inv_rms = 1.0f0 ./ sqrt.(m .+ eps)
+        expected = x_cpu .* inv_rms .* w_cpu
+
+        # GPU execution
+        norm = Inferno.Model.RMSNorm(oneArray(w_cpu), eps)
+        x_gpu = oneArray(x_cpu)
+        res_gpu = norm(x_gpu)
+        res_cpu = collect(res_gpu)
+
+        @test res_cpu ≈ expected atol=1e-4
+
+        # Test batched sequence (hidden_size x seq_len)
+        seq_len = 10
+        x_cpu_batch = rand(Float32, hidden_size, seq_len)
+
+        m_batch = sum(x_cpu_batch .* x_cpu_batch, dims=1) .* (1.0f0 / Float32(hidden_size))
+        inv_rms_batch = 1.0f0 ./ sqrt.(m_batch .+ eps)
+        expected_batch = x_cpu_batch .* inv_rms_batch .* w_cpu
+
+        x_gpu_batch = oneArray(x_cpu_batch)
+        res_gpu_batch = norm(x_gpu_batch)
+        res_cpu_batch = collect(res_gpu_batch)
+
+        @test res_cpu_batch ≈ expected_batch atol=1e-4
+
+        # Test small numbers
+        x_small = rand(Float32, hidden_size, 1) .* 1f-5
+        m_small = sum(x_small .* x_small, dims=1) .* (1.0f0 / Float32(hidden_size))
+        inv_rms_small = 1.0f0 ./ sqrt.(m_small .+ eps)
+        expected_small = x_small .* inv_rms_small .* w_cpu
+
+        x_gpu_small = oneArray(x_small)
+        res_gpu_small = norm(x_gpu_small)
+        res_cpu_small = collect(res_gpu_small)
+
+        @test res_cpu_small ≈ expected_small atol=1e-6
+    end
+
     @testset "Config Extraction" begin
         file = Inferno.GGUF.read_gguf(MODEL_PATH)
         arch = get(file.metadata, "general.architecture", "llm")
