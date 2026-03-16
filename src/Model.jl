@@ -161,17 +161,6 @@ function temperature_scale_kernel!(scaled_logits, logits, inv_temp, N)
     return
 end
 
-# Argmax kernel
-function argmax_kernel!(result, logits, N)
-    i = get_global_id(1)
-    if i <= N
-        # Use atomic operations for reduction
-        # For simplicity, we'll collect to CPU for argmax
-        result[i] = i
-    end
-    return
-end
-
 # --- Optimized Matrix Multiplication with Tiling ---
 
 # Performance constants for 2-bit quantization
