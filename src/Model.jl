@@ -179,20 +179,27 @@ const IQ2_TILE_SIZE = 16  # Optimal for 2-bit data (16x16 tiles)
 const IQ2_VEC_TILE = 32   # Vector operations tile size
 const CACHE_LINE_SIZE = 64 # Cache line alignment
 
+struct MatMulConfig
+    N::Int
+    M::Int
+    K::Int
+    tile_size::Int
+end
+
 # Optimized tiled matrix multiplication kernel (without shared memory for oneAPI compatibility)
-function tiled_mat_mul_kernel!(res, A, B, N, M, K, tile_size)
+function tiled_mat_mul_kernel!(res, A, B, config::MatMulConfig)
     # Each work item computes one element of the output
     i = get_global_id(1)
     j = get_global_id(2)
     
-    if i <= N && j <= M
+    if i <= config.N && j <= config.M
         val = 0.0f0
         
         # Process in tiles for better cache utilization
-        num_tiles = cld(K, tile_size)
+        num_tiles = cld(config.K, config.tile_size)
         for t in 1:num_tiles
-            tile_start = (t-1) * tile_size
-            tile_end = min(tile_start + tile_size, K)
+            tile_start = (t-1) * config.tile_size
+            tile_end = min(tile_start + config.tile_size, config.K)
             
             # Unrolled loop for better performance
             k = tile_start
@@ -266,7 +273,8 @@ function mat_mul(weight::AbstractArray{Float32,2}, x::AbstractArray{Float32,2})
             gs_y = tile_size
             gr_x = cld(N, tile_size)
             gr_y = cld(M, tile_size)
-            @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_kernel!(res, weight, x, N, M, K, tile_size)
+            config = MatMulConfig(N, M, K, tile_size)
+            @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_kernel!(res, weight, x, config)
         else
             # Use optimized vector kernel for matrix-vector multiplication
             # Larger tile for vector operations to maximize throughput
@@ -294,7 +302,8 @@ function mat_mul!(res::oneMatrix{Float32}, weight::oneMatrix{Float32}, x::oneMat
         gs_y = tile_size
         gr_x = cld(N, tile_size)
         gr_y = cld(M, tile_size)
-        @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_kernel!(res, weight, x, N, M, K, tile_size)
+        config = MatMulConfig(N, M, K, tile_size)
+        @oneapi items=(gs_x, gs_y) groups=(gr_x, gr_y) tiled_mat_mul_kernel!(res, weight, x, config)
     else
         tile_size = min(IQ2_VEC_TILE, max(32, cld(N, 8)))  # Adaptive vector tile
         gs = min(N, 256)
