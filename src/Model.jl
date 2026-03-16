@@ -640,6 +640,16 @@ function silu_kernel!(out, x, N)
     return nothing
 end
 
+# Fused GPU SiLU and gating kernel
+function silu_gating_kernel!(out, z, normed, N)
+    i = get_global_id(1)
+    if i <= N
+        val = z[i]
+        out[i] = val * (1.0f0 / (1.0f0 + exp(-val))) * normed[i]
+    end
+    return nothing
+end
+
 # GPU L2 normalization kernel for SSM
 function l2_norm_ssm_kernel!(q, k, head_dim, num_heads, seq, eps)
     t = get_global_id(1)
@@ -1211,7 +1221,6 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
         m.decode_decay_gate .= m.decode_alpha .* m.ssm_a
         decay_gate_cpu = collect(m.decode_decay_gate)
         beta_cpu = collect(m.decode_beta)
-        z_cpu = collect(z)
         
         # 5. 1D convolution on CPU
         qkv_cpu = collect(qkv_mixed)
@@ -1299,10 +1308,10 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
         rmsnorm!(m.decode_output_normed, output_gpu, m.ssm_norm)
         
         # GPU SiLU on z and gating
-        z_silu = z_cpu .* (1.0f0 ./ (1.0f0 .+ exp.(-z_cpu)))
-        z_silu_gpu = oneArray(z_silu)
-        m.decode_gated .= z_silu_gpu
-        m.decode_gated .*= m.decode_output_normed
+        N_z = length(z)
+        gs = min(N_z, 256)
+        gr = cld(N_z, gs)
+        @oneapi items=gs groups=gr silu_gating_kernel!(m.decode_gated, z, m.decode_output_normed, N_z)
         
         return mat_mul(m.ssm_out, m.decode_gated)
         
@@ -1331,7 +1340,6 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
         
         # CPU computation for prefill
         qkv_cpu = collect(qkv_mixed)
-        z_cpu = collect(z)
         beta_cpu = beta
         decay_gate_cpu = decay_gate
         
@@ -1430,10 +1438,11 @@ function (m::GatedDeltaNet)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbeddi
             rmsnorm(output_gpu, m.ssm_norm)
         end
         
-        z_silu = z_cpu .* (1.0f0 ./ (1.0f0 .+ exp.(-z_cpu)))
-        z_silu_gpu = oneArray(z_silu)
-        
-        gated = output_normed .* z_silu_gpu
+        gated = similar(z)
+        N_z = length(z)
+        gs = min(N_z, 256)
+        gr = cld(N_z, gs)
+        @oneapi items=gs groups=gr silu_gating_kernel!(gated, z, output_normed, N_z)
         
         return mat_mul(m.ssm_out, gated)
     end
