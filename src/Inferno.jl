@@ -76,11 +76,43 @@ function select_device!(devs, requested_device)
 end
 
 """
-    load_model(path; device=nothing) -> (QwenModel, BPETokenizer)
+    load_model(path; device=nothing, imatrix=nothing, mmproj=nothing) -> (QwenModel, BPETokenizer)
 
 Load a GGUF model file and return the constructed model + tokenizer.
+Optional `imatrix` path for importance matrix data (auto-discovered if not provided).
+Optional `mmproj` path for multimodal projection weights (auto-discovered if not provided).
 """
-function load_model(path::String; device::Union{Int, Nothing}=nothing)
+function find_related_file(model_path::String, pattern::String)
+    model_dir = dirname(model_path)
+    if isempty(model_dir)
+        model_dir = "."
+    end
+    
+    # Try exact match first
+    exact_path = joinpath(model_dir, pattern)
+    if isfile(exact_path)
+        return exact_path
+    end
+    
+    # Try case-insensitive substring match
+    try
+        files = readdir(model_dir)
+        p_lower = lowercase(pattern)
+        for f in files
+            f_lower = lowercase(f)
+            if occursin(p_lower, f_lower)
+                return joinpath(model_dir, f)
+            end
+        end
+    catch
+    end
+    
+    return nothing
+end
+
+function load_model(path::String; device::Union{Int, Nothing}=nothing, 
+                    imatrix::Union{String, Nothing}=nothing,
+                    mmproj::Union{String, Nothing}=nothing)
     model = nothing
     tok = nothing
     
@@ -92,6 +124,21 @@ function load_model(path::String; device::Union{Int, Nothing}=nothing)
     end
 
     println("Loading GGUF file: $path")
+    
+    # Automate discovery if paths are not provided
+    if imatrix === nothing
+        imatrix = find_related_file(path, "imatrix")
+        if imatrix !== nothing
+            println("  Auto-discovered imatrix: $imatrix")
+        end
+    end
+    if mmproj === nothing
+        mmproj = find_related_file(path, "mmproj")
+        if mmproj !== nothing
+            println("  Auto-discovered mmproj: $mmproj")
+        end
+    end
+    
     file = nothing
     try
         file = GGUF.read_gguf(path)
@@ -134,7 +181,20 @@ function load_model(path::String; device::Union{Int, Nothing}=nothing)
 
         println("Loading weights...")
         Model.init_gpu_tables(QuantsData.IQ2XXS_GRID, QuantsData.KSIGNS_IQ2XS, QuantsData.KMASK_IQ2XS)
-        model = Loader.load_weights(file, config)
+        
+        imatrix_file = nothing
+        if imatrix !== nothing
+            println("Loading imatrix: $imatrix")
+            imatrix_file = GGUF.read_gguf(imatrix)
+        end
+
+        mmproj_file = nothing
+        if mmproj !== nothing
+            println("Loading mmproj: $mmproj")
+            mmproj_file = GGUF.read_gguf(mmproj)
+        end
+
+        model = Loader.load_weights(file, config; imatrix=imatrix_file, mmproj=mmproj_file)
         println("Model loaded successfully.")
 
         println("Loading tokenizer...")
@@ -149,6 +209,7 @@ function load_model(path::String; device::Union{Int, Nothing}=nothing)
             if model !== nothing
                 Model.free_model_gpu!(model)
             end
+            Model.free_gpu_tables!()
         catch
         end
         try
@@ -171,6 +232,17 @@ Load model and start the HTTP server.
 function main(model_path::String; port::Int=8080, device::Union{Int, Nothing}=nothing, auth_token::Union{String, Nothing}=nothing)
     model, tok = load_model(model_path; device=device)
     Server.start_server(port; model=model, tokenizer=tok, auth_token=auth_token)
+end
+
+function __init__()
+    # Register atexit hook to ensure GPU synchronization and cleanup
+    # This helps prevent device lockups on unclean shutdowns
+    atexit() do
+        try
+            oneAPI.synchronize()
+        catch
+        end
+    end
 end
 
 end # module

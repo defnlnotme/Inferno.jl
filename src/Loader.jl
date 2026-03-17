@@ -8,10 +8,17 @@ export load_weights
 
 using ..Dequant
 
-function extract_tensor(file::GGUF.GGUFFile, name::String)
+function extract_tensor(file::GGUF.GGUFFile, name::String; imatrix::Union{GGUF.GGUFFile, Nothing}=nothing)
     if !haskey(file.tensors, name)
         @warn "Tensor $name not found, using zero surrogate"
         return zeros(Float16, 1, 1) |> oneArray # Tiny to avoid crash, will pad later
+    end
+    
+    if imatrix !== nothing && haskey(imatrix.tensors, name)
+        # In a real GGUF loader like llama.cpp, imatrix data would be used 
+        # to guide the importance-aware quantization. 
+        # Here we just acknowledge its presence for the tensor.
+        # println("  Applying imatrix for $name")
     end
     info = file.tensors[name]
     num_elements = Int(prod(info.dimensions))
@@ -69,8 +76,8 @@ function extract_tensor(file::GGUF.GGUFFile, name::String)
     return reshape(Float16.(data32), inner, outer)
 end
 
-function get_weight(file::GGUF.GGUFFile, name::String)
-    tensor = extract_tensor(file, name)
+function get_weight(file::GGUF.GGUFFile, name::String; imatrix::Union{GGUF.GGUFFile, Nothing}=nothing)
+    tensor = extract_tensor(file, name; imatrix=imatrix)
     if tensor isa Model.IQ2XXSMatrix
         return tensor
     else
@@ -78,14 +85,16 @@ function get_weight(file::GGUF.GGUFFile, name::String)
     end
 end
 
-function get_bias_or_norm(file::GGUF.GGUFFile, name::String)
-    tensor = extract_tensor(file, name)
+function get_bias_or_norm(file::GGUF.GGUFFile, name::String; imatrix::Union{GGUF.GGUFFile, Nothing}=nothing)
+    tensor = extract_tensor(file, name; imatrix=imatrix)
     return vec(collect(Float32.(tensor)))
 end
 
-function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
+function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig; 
+                      imatrix::Union{GGUF.GGUFFile, Nothing}=nothing,
+                      mmproj::Union{GGUF.GGUFFile, Nothing}=nothing)
     arch = config.architecture
-    embed = extract_tensor(file, "token_embd.weight")
+    embed = extract_tensor(file, "token_embd.weight"; imatrix=imatrix)
 
     layers = Model.DecoderLayer[]
     for i in 0:(config.num_hidden_layers-1)
@@ -99,29 +108,29 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
                       haskey(file.tensors, "$(prefix).input_layernorm.weight") ? "$(prefix).input_layernorm.weight" :
                       "$(prefix).attn_norm.weight"
 
-        in_norm_w = get_bias_or_norm(file, in_norm_key)
+        in_norm_w = get_bias_or_norm(file, in_norm_key; imatrix=imatrix)
         in_norm = Model.RMSNorm(oneArray(in_norm_w), config.rms_norm_eps)
 
         post_norm_key = haskey(file.tensors, "$(prefix).post_attention_norm.weight") ? "$(prefix).post_attention_norm.weight" :
                         haskey(file.tensors, "$(prefix).ffn_norm.weight") ? "$(prefix).ffn_norm.weight" :
                         haskey(file.tensors, "$(prefix).post_attention_layernorm.weight") ? "$(prefix).post_attention_layernorm.weight" :
                         "$(prefix).attn_norm.weight"
-        post_norm_w = get_bias_or_norm(file, post_norm_key)
+        post_norm_w = get_bias_or_norm(file, post_norm_key; imatrix=imatrix)
         post_norm = Model.RMSNorm(oneArray(post_norm_w), config.rms_norm_eps)
 
         op = if is_ssm
-            in_proj   = get_weight(file, "$(prefix).attn_qkv.weight")
-            gate_proj = get_weight(file, "$(prefix).attn_gate.weight")
-            ssm_out   = get_weight(file, "$(prefix).ssm_out.weight")
+            in_proj   = get_weight(file, "$(prefix).attn_qkv.weight"; imatrix=imatrix)
+            gate_proj = get_weight(file, "$(prefix).attn_gate.weight"; imatrix=imatrix)
+            ssm_out   = get_weight(file, "$(prefix).ssm_out.weight"; imatrix=imatrix)
 
-            ssm_a      = oneArray(get_bias_or_norm(file, "$(prefix).ssm_a"))
-            ssm_alpha  = get_weight(file, "$(prefix).ssm_alpha.weight")
-            ssm_beta   = get_weight(file, "$(prefix).ssm_beta.weight")
-            ssm_conv1d_raw = extract_tensor(file, "$(prefix).ssm_conv1d.weight")
+            ssm_a      = oneArray(get_bias_or_norm(file, "$(prefix).ssm_a"; imatrix=imatrix))
+            ssm_alpha  = get_weight(file, "$(prefix).ssm_alpha.weight"; imatrix=imatrix)
+            ssm_beta   = get_weight(file, "$(prefix).ssm_beta.weight"; imatrix=imatrix)
+            ssm_conv1d_raw = extract_tensor(file, "$(prefix).ssm_conv1d.weight"; imatrix=imatrix)
             ssm_conv1d_f32 = oneArray(collect(Float32.(ssm_conv1d_raw)))
             oneAPI.synchronize()
-            ssm_dt_bias    = oneArray(get_bias_or_norm(file, "$(prefix).ssm_dt.bias"))
-            ssm_norm_w     = get_bias_or_norm(file, "$(prefix).ssm_norm.weight")
+            ssm_dt_bias    = oneArray(get_bias_or_norm(file, "$(prefix).ssm_dt.bias"; imatrix=imatrix))
+            ssm_norm_w     = get_bias_or_norm(file, "$(prefix).ssm_norm.weight"; imatrix=imatrix)
             ssm_norm       = Model.RMSNorm(oneArray(ssm_norm_w), config.rms_norm_eps)
 
             # conv_channels = d_inner + 2 * num_k_heads * head_k_dim
@@ -156,14 +165,14 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
                 config.num_attention_heads, config.head_dim, config.q_lora_rank, config.kv_lora_rank,
                 config.qk_rope_head_dim, config.v_head_dim, 1.0f0/sqrt(Float32(config.head_dim)))
         else
-            wqkv = arch == :phi3 ? get_weight(file, "$(prefix).attn_qkv.weight") : nothing
-            qw = arch != :phi3 ? get_weight(file, "$(prefix).attn_q.weight") : nothing
-            kw = arch != :phi3 ? get_weight(file, "$(prefix).attn_k.weight") : nothing
-            vw = arch != :phi3 ? get_weight(file, "$(prefix).attn_v.weight") : nothing
-            ow = get_weight(file, "$(prefix).attn_output.weight")
+            wqkv = arch == :phi3 ? get_weight(file, "$(prefix).attn_qkv.weight"; imatrix=imatrix) : nothing
+            qw = arch != :phi3 ? get_weight(file, "$(prefix).attn_q.weight"; imatrix=imatrix) : nothing
+            kw = arch != :phi3 ? get_weight(file, "$(prefix).attn_k.weight"; imatrix=imatrix) : nothing
+            vw = arch != :phi3 ? get_weight(file, "$(prefix).attn_v.weight"; imatrix=imatrix) : nothing
+            ow = get_weight(file, "$(prefix).attn_output.weight"; imatrix=imatrix)
 
-            q_norm_w = haskey(file.tensors, "$(prefix).attn_q_norm.weight") ? get_bias_or_norm(file, "$(prefix).attn_q_norm.weight") : nothing
-            k_norm_w = haskey(file.tensors, "$(prefix).attn_k_norm.weight") ? get_bias_or_norm(file, "$(prefix).attn_k_norm.weight") : nothing
+            q_norm_w = haskey(file.tensors, "$(prefix).attn_q_norm.weight") ? get_bias_or_norm(file, "$(prefix).attn_q_norm.weight"; imatrix=imatrix) : nothing
+            k_norm_w = haskey(file.tensors, "$(prefix).attn_k_norm.weight") ? get_bias_or_norm(file, "$(prefix).attn_k_norm.weight"; imatrix=imatrix) : nothing
             q_norm = isnothing(q_norm_w) ? nothing : Model.RMSNorm(oneArray(q_norm_w), config.rms_norm_eps)
             k_norm = isnothing(k_norm_w) ? nothing : Model.RMSNorm(oneArray(k_norm_w), config.rms_norm_eps)
 
@@ -176,16 +185,16 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
         # MLP or MoE
         mlp = if haskey(file.tensors, "$(prefix).ffn_gate_exps.0.weight") || haskey(file.tensors, "$(prefix).ffn_gate_exps.weight")
             # MoE
-            gate = get_weight(file, "$(prefix).ffn_gate.weight")
+            gate = get_weight(file, "$(prefix).ffn_gate.weight"; imatrix=imatrix)
             n_exp = config.num_experts
-            experts_gate = [get_weight(file, "$(prefix).ffn_gate_exps.$(j-1).weight") for j in 1:n_exp]
-            experts_up = [get_weight(file, "$(prefix).ffn_up_exps.$(j-1).weight") for j in 1:n_exp]
-            experts_down = [get_weight(file, "$(prefix).ffn_down_exps.$(j-1).weight") for j in 1:n_exp]
+            experts_gate = [get_weight(file, "$(prefix).ffn_gate_exps.$(j-1).weight"; imatrix=imatrix) for j in 1:n_exp]
+            experts_up = [get_weight(file, "$(prefix).ffn_up_exps.$(j-1).weight"; imatrix=imatrix) for j in 1:n_exp]
+            experts_down = [get_weight(file, "$(prefix).ffn_down_exps.$(j-1).weight"; imatrix=imatrix) for j in 1:n_exp]
             Model.MoE(gate, experts_gate, experts_up, experts_down, n_exp, config.num_experts_per_tok)
         else
-            gate_w = get_weight(file, "$(prefix).ffn_gate.weight")
-            up_w   = get_weight(file, "$(prefix).ffn_up.weight")
-            down_w = get_weight(file, "$(prefix).ffn_down.weight")
+            gate_w = get_weight(file, "$(prefix).ffn_gate.weight"; imatrix=imatrix)
+            up_w   = get_weight(file, "$(prefix).ffn_up.weight"; imatrix=imatrix)
+            down_w = get_weight(file, "$(prefix).ffn_down.weight"; imatrix=imatrix)
             Model.MLP(gate_w, up_w, down_w)
         end
 
@@ -193,17 +202,26 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig)
     end
     println()
 
-    final_norm_w = get_bias_or_norm(file, "output_norm.weight")
+    final_norm_w = get_bias_or_norm(file, "output_norm.weight"; imatrix=imatrix)
     final_norm = Model.RMSNorm(oneArray(final_norm_w), config.rms_norm_eps)
 
     lm_head_raw = haskey(file.tensors, "output.weight") ?
-                  extract_tensor(file, "output.weight") : embed
+                  extract_tensor(file, "output.weight"; imatrix=imatrix) : embed
     lm_head = Float32.(lm_head_raw)  # Keep on CPU for now
 
     rope_dim = Int(get(file.metadata, "$(arch).rope.dimension_count", config.head_dim))
     rope = Model.RotaryEmbedding(rope_dim; base=config.rope_theta)
 
-    return Model.QwenModel(config, Float32.(embed), layers, final_norm, lm_head, rope)
+    mmproj_data = nothing
+    if mmproj !== nothing
+        println("Integrating mmproj tensors...")
+        mmproj_data = Dict{String, Any}()
+        for name in keys(mmproj.tensors)
+            mmproj_data[name] = get_weight(mmproj, name)
+        end
+    end
+
+    return Model.QwenModel(config, Float32.(embed), layers, final_norm, lm_head, rope, mmproj_data)
 end
 
 end # module

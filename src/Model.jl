@@ -59,7 +59,25 @@ const IQ2XXS_GRID_GPU = Ref{oneVector{UInt64}}()
 const KSIGNS_IQ2XS_GPU = Ref{oneVector{UInt8}}()
 const KMASK_IQ2XS_GPU = Ref{oneVector{UInt8}}()
 
+function free_gpu_tables!()
+    try
+        if isassigned(IQ2XXS_GRID_GPU)
+            oneAPI.unsafe_free!(IQ2XXS_GRID_GPU[])
+        end
+        if isassigned(KSIGNS_IQ2XS_GPU)
+            oneAPI.unsafe_free!(KSIGNS_IQ2XS_GPU[])
+        end
+        if isassigned(KMASK_IQ2XS_GPU)
+            oneAPI.unsafe_free!(KMASK_IQ2XS_GPU[])
+        end
+    catch
+    end
+end
+
 function init_gpu_tables(grid, signs_table, kmask)
+    # Free existing tables if already initialized to avoid VRAM leaks
+    free_gpu_tables!()
+    
     # Use DeviceBuffer but ensured by our fixed copyto! (GPU-driven)
     IQ2XXS_GRID_GPU[] = oneArray(grid)
     KSIGNS_IQ2XS_GPU[] = oneArray(signs_table)
@@ -1054,12 +1072,12 @@ function (m::FullAttention)(x::oneArray{Float32,2}, pos::Int, rope::RotaryEmbedd
             # Compute all scores for this head at once
             scores_view = view(m.prefill_scores, 1:(pos+seq), h:h)
             for s in 1:seq
-                K_v = reshape(view(K_cache, :, kh, 1:(pos+s)), size(k_rope, 1), :)
-                q_v = reshape(q_final[:, h, s], :, 1)
+                K_v = view(K_cache, :, kh, 1:(pos+s))
+                q_v = view(q_final, :, h, s)
                 
                 # scores: (pos+s, 1) = K_v' * q_v
-                scores_s = mat_mul_AB(transpose(K_v), q_v)
-                scores_view[1:(pos+s), 1] .= vec(scores_s)
+                sc_s_view = view(scores_view, 1:(pos+s), 1:1)
+                mat_mul_AT_B!(sc_s_view, K_v, reshape(q_v, :, 1))
             end
             
             # Apply GPU softmax to all scores at once
@@ -1481,6 +1499,7 @@ struct QwenModel
     final_norm::RMSNorm
     lm_head::Matrix{Float32} # CPU-based (kept for compatibility)
     rope::RotaryEmbedding
+    mmproj::Union{Dict{String, Any}, Nothing}
 end
 
 # Free all GPU memory associated with a QwenModel (weights, norms, etc.)
@@ -1576,6 +1595,23 @@ function free_model_gpu!(model::QwenModel)
     
     # lm_head is CPU-based, no GPU memory to free
     
+    # Free global lookup tables if they were initialized
+    # This prevents memory leaks across multiple model loads
+    try
+        if isassigned(IQ2XXS_GRID_GPU)
+            oneAPI.unsafe_free!(IQ2XXS_GRID_GPU[])
+            # We don't null out Ref, as it's a const, but the underlying device memory is freed
+        end
+        if isassigned(KSIGNS_IQ2XS_GPU)
+            oneAPI.unsafe_free!(KSIGNS_IQ2XS_GPU[])
+        end
+        if isassigned(KMASK_IQ2XS_GPU)
+            oneAPI.unsafe_free!(KMASK_IQ2XS_GPU[])
+        end
+    catch
+        # Best effort cleanup
+    end
+    
     return nothing
 end
 
@@ -1627,6 +1663,11 @@ function forward!(model::QwenModel, tokens::Vector{Int}, pos::Int, caches::Vecto
         end
         rethrow(e)
     end
+end
+
+function reset_states!(m::GatedDeltaNet)
+    fill!(m.conv_state, 0.0f0)
+    fill!(m.ssm_state, 0.0f0)
 end
 
 function reset_states!(model::QwenModel)

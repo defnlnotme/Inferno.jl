@@ -13,6 +13,12 @@ function parse_commandline()
             help = "GPU device index to use (1-based, e.g., 2 for second GPU)"
             arg_type = Int
             default = 2
+        "--imatrix"
+            help = "Path to imatrix file"
+            arg_type = String
+        "--mmproj"
+            help = "Path to mmproj file"
+            arg_type = String
     end
     
     return parse_args(s)
@@ -25,7 +31,10 @@ function main()
     args = parse_commandline()
     
     # 1. Load the model and tokenizer
-    model, tok = Inferno.load_model(args["model"]; device=args["device"])
+    model, tok = Inferno.load_model(args["model"]; 
+                                    device=args["device"], 
+                                    imatrix=args["imatrix"],
+                                    mmproj=args["mmproj"])
 
     # 2. Define your prompt
     println("-"^40)
@@ -46,7 +55,7 @@ function main()
     print("Response: ")
 
     # generate_stream yields one string token (decoded) at a time
-    stream = Inferno.generate_stream(model, tok, prompt; max_tokens=256, temperature=0.1f0)
+    stream = Inferno.generate_stream(model, tok, prompt; max_tokens=256, temperature=0.7f0, top_p=0.8f0, top_k=20)
     try
         for token in stream
             print(token)

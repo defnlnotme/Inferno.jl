@@ -21,6 +21,7 @@ struct ChatCompletionRequest
     max_tokens::Union{Int,Nothing}
     temperature::Union{Float64,Nothing}
     top_p::Union{Float64,Nothing}
+    top_k::Union{Int,Nothing}
     stream::Union{Bool,Nothing}
 end
 
@@ -134,13 +135,14 @@ function handle_chat(stream::HTTP.Stream)
         prompt = build_prompt(body.messages)
         max_tokens = something(body.max_tokens, 128)
         temperature = Float32(something(body.temperature, 0.7))
-        top_p = Float32(something(body.top_p, 0.9))
+        top_p = Float32(something(body.top_p, 0.8))
+        top_k = Int(something(body.top_k, 20))
         do_stream = something(body.stream, false)
 
         if do_stream
-            handle_stream(stream, model, tok, prompt, max_tokens, temperature, top_p, body.model)
+            handle_stream(stream, model, tok, prompt, max_tokens, temperature, top_p, top_k, body.model)
         else
-            handle_completion(stream, model, tok, prompt, max_tokens, temperature, top_p, body.model)
+            handle_completion(stream, model, tok, prompt, max_tokens, temperature, top_p, top_k, body.model)
         end
     catch e
         @error "Error in handle_chat" exception = (e, catch_backtrace())
@@ -157,11 +159,11 @@ function handle_chat(stream::HTTP.Stream)
 end
 
 function handle_completion(stream::HTTP.Stream, model, tok, prompt,
-    max_tokens, temperature, top_p, model_name)
+    max_tokens, temperature, top_p, top_k, model_name)
     try
         prompt_ids = Tokenizer.encode(tok, prompt)
         response_text = Engine.generate(model, tok, prompt;
-            max_tokens, temperature, top_p)
+            max_tokens, temperature, top_p, top_k)
         completion_ids = Tokenizer.encode(tok, response_text)
 
         resp = ChatCompletionResponse(
@@ -194,7 +196,7 @@ end
 # ─── SSE Streaming ───────────────────────────────────────────────────────────
 
 function handle_stream(stream::HTTP.Stream, model, tok, prompt,
-    max_tokens, temperature, top_p, model_name)
+    max_tokens, temperature, top_p, top_k, model_name)
     HTTP.setstatus(stream, 200)
     HTTP.setheader(stream, "Content-Type" => "text/event-stream")
     HTTP.setheader(stream, "Cache-Control" => "no-cache")
@@ -206,7 +208,7 @@ function handle_stream(stream::HTTP.Stream, model, tok, prompt,
     try
         id = "chatcmpl-" * string(rand(UInt32), base=16)
         token_stream = Engine.generate_stream(model, tok, prompt;
-            max_tokens, temperature, top_p)
+            max_tokens, temperature, top_p, top_k)
 
         for token_str in token_stream
             chunk = Dict(

@@ -44,7 +44,7 @@ function simple_sample(probs::Vector{Float32})
     return length(probs)
 end
 
-function sample(logits::Vector{Float32}, temperature::Float32, top_p::Float32)
+function sample(logits::Vector{Float32}, temperature::Float32, top_p::Float32, top_k::Int=40)
     # Try GPU acceleration if available
     try
         # Move logits to GPU for processing
@@ -61,16 +61,16 @@ function sample(logits::Vector{Float32}, temperature::Float32, top_p::Float32)
         # Continue with CPU processing for top-p and sampling
         # (can be GPU-accelerated in future optimizations)
         scaled_logits = collect(scaled_logits_gpu)
-        return cpu_sample_from_scaled(scaled_logits, temperature, top_p)
+        return cpu_sample_from_scaled(scaled_logits, temperature, top_p, top_k)
         
     catch e
         # Fallback to CPU implementation
-        return cpu_sample(logits, temperature, top_p)
+        return cpu_sample(logits, temperature, top_p, top_k)
     end
 end
 
 # CPU sampling implementation (original code)
-function cpu_sample(logits::Vector{Float32}, temperature::Float32, top_p::Float32)
+function cpu_sample(logits::Vector{Float32}, temperature::Float32, top_p::Float32, top_k::Int=40)
     # Sanitize logits
     @inbounds for i in eachindex(logits)
         if !isfinite(logits[i])
@@ -80,6 +80,19 @@ function cpu_sample(logits::Vector{Float32}, temperature::Float32, top_p::Float3
 
     if temperature == 0.0f0
         return argmax(logits)
+    end
+
+    # Top-k sampling
+    if top_k > 0 && top_k < length(logits)
+        # Get top-k indices
+        top_k_indices = partialsortperm(logits, 1:top_k, rev=true)
+        
+        # Create a mask for non-top-k elements
+        for i in eachindex(logits)
+            if i ∉ top_k_indices
+                logits[i] = -Inf32
+            end
+        end
     end
 
     # Temperature scaling + softmax in one pass (minimise allocations)
@@ -132,10 +145,29 @@ function cpu_sample(logits::Vector{Float32}, temperature::Float32, top_p::Float3
 end
 
 # CPU sampling from already scaled logits
-function cpu_sample_from_scaled(scaled_logits::Vector{Float32}, temperature::Float32, top_p::Float32)
+function cpu_sample_from_scaled(scaled_logits::Vector{Float32}, temperature::Float32, top_p::Float32, top_k::Int=40)
     mx = maximum(scaled_logits)
     exp_vals = exp.(scaled_logits .- mx)
     probs = exp_vals ./ sum(exp_vals)
+    
+    # Top-k sampling
+    if top_k > 0 && top_k < length(scaled_logits)
+        # Get top-k indices based on probabilities
+        top_k_indices = partialsortperm(probs, 1:min(top_k, length(probs)), rev=true)
+        
+        # Zero out non-top-k probabilities
+        for i in eachindex(probs)
+            if i ∉ top_k_indices
+                probs[i] = 0.0f0
+            end
+        end
+        
+        # Renormalize
+        total_prob = sum(probs)
+        if total_prob > 0.0f0
+            probs ./= total_prob
+        end
+    end
     
     # Top-p sampling
     if top_p < 1.0f0
@@ -167,7 +199,7 @@ end
 # mask_and_sample: wrapper over `sample` which will avoid returning PAD-like tokens
 # when streaming. We defensively re-sample a few times while masking offending ids.
 # This is intentionally conservative (max_attempts) to avoid infinite loops.
-function mask_and_sample(logits::AbstractVector{Float32}, pad_ids::Vector{Int}, temperature::Float32, top_p::Float32; max_attempts::Int=5)
+function mask_and_sample(logits::AbstractVector{Float32}, pad_ids::Vector{Int}, temperature::Float32, top_p::Float32, top_k::Int=40; max_attempts::Int=5)
     # Reuse the vector in-place if already CPU, otherwise collect once
     logits_copy = logits isa Vector{Float32} ? copy(logits) : Vector{Float32}(logits)
 
@@ -181,7 +213,7 @@ function mask_and_sample(logits::AbstractVector{Float32}, pad_ids::Vector{Int}, 
     end
 
     for attempt in 1:max_attempts
-        cand = sample(logits_copy, temperature, top_p)
+        cand = sample(logits_copy, temperature, top_p, top_k)
         if !isempty(pad_ids) && cand <= length(logits_copy) && logits_copy[cand] <= -1e8
             logits_copy[cand] = -Inf32
             continue
@@ -193,7 +225,7 @@ function mask_and_sample(logits::AbstractVector{Float32}, pad_ids::Vector{Int}, 
 end
 
 function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::String;
-    max_tokens=64, temperature=0.7f0, top_p=0.9f0, stop_token=nothing)
+    max_tokens=64, temperature=0.7f0, top_p=0.8f0, top_k=20, stop_token=nothing)
 
     tokens = Tokenizer.encode(tok, prompt)
     if isempty(tokens)
@@ -224,7 +256,7 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
             # Explicitly collect only the last column of logits for sampling
             logits_vec = vec(collect(logits[:, end]))
             last_token = mask_and_sample(
-                logits_vec, [tok.eos_id], Float32(temperature), Float32(top_p))
+                logits_vec, [tok.eos_id], Float32(temperature), Float32(top_p), top_k)
 
             token_str = Tokenizer.decode(tok, [last_token])
             put!(chan, token_str)
@@ -241,7 +273,7 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
                 # Explicitly collect the first column (seq=1)
                 logits_vec = vec(collect(logits[:, 1]))
                 last_token = mask_and_sample(
-                    logits_vec, [tok.eos_id], Float32(temperature), Float32(top_p))
+                    logits_vec, [tok.eos_id], Float32(temperature), Float32(top_p), top_k)
 
                 token_str = Tokenizer.decode(tok, [last_token])
                 put!(chan, token_str)
@@ -251,6 +283,9 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
                     GC.gc(false)
                 end
             end
+            
+            # Synchronize after finishing the stream
+            oneAPI.synchronize()
         catch e
             if e isa InterruptException
                 # Interrupt - just close the channel, don't rethrow
@@ -294,9 +329,9 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
 end
 
 function generate(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::String;
-    max_tokens=64, temperature=0.7f0, top_p=0.9f0, stop_token=nothing)
+    max_tokens=64, temperature=0.7f0, top_p=0.8f0, top_k=20, stop_token=nothing)
 
-    stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, stop_token)
+    stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, top_k, stop_token)
     res = String[]
     for token_str in stream
         push!(res, token_str)
