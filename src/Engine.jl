@@ -8,7 +8,9 @@ function gpu_temperature_scale(logits::oneVector{Float32}, temperature::Float32)
     
     inv_temp = 1.0f0 / temperature
     N = length(logits)
-    scaled_logits = oneArray(zeros(Float32, N))
+    # Optimization: Direct GPU allocation to avoid host-to-device transfer
+    scaled_logits = oneArray{Float32}(undef, N)
+    fill!(scaled_logits, 0.0f0)
     
     gs = min(N, 256)
     gr = cld(N, gs)
