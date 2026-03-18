@@ -866,7 +866,9 @@ function (m::MoE)(x::oneMatrix{Float32})
     # Expert selection on CPU
     gate_logits_cpu = collect(gate_logits)
 
-    output = oneArray(zeros(Float32, hidden_size, seq_len))
+    # Optimization: Allocate directly on GPU and fill to avoid host-to-device transfer
+    output = oneArray{Float32}(undef, hidden_size, seq_len)
+    fill!(output, 0.0f0)
 
     for t in 1:seq_len
         logits = gate_logits_cpu[:, t]
@@ -930,23 +932,34 @@ end
 
 function FullAttention(arch, wq, wk, wv, wqkv, wo, q_norm, k_norm, n_heads, n_kv, hd)
     q_size = (arch == :qwen || arch == :qwen2 || arch == :qwen2_5 || arch == :qwen35) ? hd * 2 * n_heads : hd * n_heads
-    decode_q_full = oneArray(zeros(Float32, q_size, 1))
-    decode_k = oneArray(zeros(Float32, hd * n_kv, 1))
-    decode_v = oneArray(zeros(Float32, hd * n_kv, 1))
-    decode_combined = oneArray(zeros(Float32, hd * n_heads, 1))
+    # Optimization: Allocate pre-allocated buffers directly on GPU to avoid massive host-to-device transfers during model load.
+    decode_q_full = oneArray{Float32}(undef, q_size, 1)
+    decode_k = oneArray{Float32}(undef, hd * n_kv, 1)
+    decode_v = oneArray{Float32}(undef, hd * n_kv, 1)
+    decode_combined = oneArray{Float32}(undef, hd * n_heads, 1)
+    fill!(decode_q_full, 0.0f0)
+    fill!(decode_k, 0.0f0)
+    fill!(decode_v, 0.0f0)
+    fill!(decode_combined, 0.0f0)
     
     # Fixed buffer sizes - sufficient for 4096 context
     max_len = 4096
-    decode_scores = oneArray(zeros(Float32, max_len, 1))
-    decode_pb = oneArray(zeros(Float32, max_len, 1))
-    decode_out_h = oneArray(zeros(Float32, hd, 1))
+    decode_scores = oneArray{Float32}(undef, max_len, 1)
+    decode_pb = oneArray{Float32}(undef, max_len, 1)
+    decode_out_h = oneArray{Float32}(undef, hd, 1)
     wo_out_size = size(wo, 1)
-    decode_wo_buf = oneArray(zeros(Float32, wo_out_size, 1))
+    decode_wo_buf = oneArray{Float32}(undef, wo_out_size, 1)
+    fill!(decode_scores, 0.0f0)
+    fill!(decode_pb, 0.0f0)
+    fill!(decode_out_h, 0.0f0)
+    fill!(decode_wo_buf, 0.0f0)
     oneAPI.synchronize()
     
     # Prefill buffers - fixed size for 4096 context
-    prefill_scores = oneArray(zeros(Float32, max_len, n_heads))
-    prefill_pb = oneArray(zeros(Float32, max_len, n_heads))
+    prefill_scores = oneArray{Float32}(undef, max_len, n_heads)
+    prefill_pb = oneArray{Float32}(undef, max_len, n_heads)
+    fill!(prefill_scores, 0.0f0)
+    fill!(prefill_pb, 0.0f0)
     
     return FullAttention(arch, wq, wk, wv, wqkv, wo, q_norm, k_norm, n_heads, n_kv, hd,
         decode_q_full, decode_k, decode_v, decode_combined, decode_scores, decode_pb, decode_out_h,
@@ -1062,7 +1075,9 @@ function (m::FullAttention)(x::oneArray{Float32,2}, pos::Int, rope::RotaryEmbedd
         # Prefill path - use batched GPU softmax
         q_final = reshape(q_gated, size(q_gated, 1), m.n_heads, seq)
         kv_per_q = m.n_heads ÷ m.n_kv
-        combined_all = oneArray(zeros(Float32, size(q_gated, 1) * m.n_heads, seq))
+        # Optimization: Direct GPU allocation for large prefill tensors
+        combined_all = oneArray{Float32}(undef, size(q_gated, 1) * m.n_heads, seq)
+        fill!(combined_all, 0.0f0)
         
         # Fixed buffers - no growth needed
         
@@ -1143,7 +1158,9 @@ function (m::MLAttention)(x::oneMatrix{Float32}, pos::Int, rope::RotaryEmbedding
     # We still need a proper MLA implementation.
     # For now, just a slightly better skeleton that uses some inputs.
     # Return zero for now as the full implementation is out of scope for a quick fix.
-    return oneArray(zeros(Float32, size(x, 1), seq))
+    res = oneArray{Float32}(undef, size(x, 1), seq)
+    fill!(res, 0.0f0)
+    return res
 end
 
 # --- Gated Delta Net (SSM Layer) ---
@@ -1185,19 +1202,28 @@ function GatedDeltaNet(in_proj, gate_proj, ssm_out, ssm_a, ssm_alpha, ssm_beta, 
                        conv_state, ssm_state, num_v_heads, num_k_heads, head_k_dim, head_v_dim, d_inner)
     conv_channels = size(ssm_conv1d, 2)
     
-    # Keep essential GPU buffers only
-    decode_beta = oneArray(zeros(Float32, num_v_heads, 1))
-    decode_alpha = oneArray(zeros(Float32, num_v_heads, 1))
-    decode_decay_gate = oneArray(zeros(Float32, num_v_heads, 1))
-    decode_conv_out = oneArray(zeros(Float32, conv_channels, 1))
-    decode_z = oneArray(zeros(Float32, d_inner, 1))
-    decode_output_normed = oneArray(zeros(Float32, head_v_dim * num_v_heads, 1))
-    decode_gated = oneArray(zeros(Float32, d_inner, 1))
+    # Optimization: Direct GPU allocation for pre-allocated buffers to avoid host-to-device transfers
+    decode_beta = oneArray{Float32}(undef, num_v_heads, 1)
+    decode_alpha = oneArray{Float32}(undef, num_v_heads, 1)
+    decode_decay_gate = oneArray{Float32}(undef, num_v_heads, 1)
+    decode_conv_out = oneArray{Float32}(undef, conv_channels, 1)
+    decode_z = oneArray{Float32}(undef, d_inner, 1)
+    decode_output_normed = oneArray{Float32}(undef, head_v_dim * num_v_heads, 1)
+    decode_gated = oneArray{Float32}(undef, d_inner, 1)
+    fill!(decode_beta, 0.0f0)
+    fill!(decode_alpha, 0.0f0)
+    fill!(decode_decay_gate, 0.0f0)
+    fill!(decode_conv_out, 0.0f0)
+    fill!(decode_z, 0.0f0)
+    fill!(decode_output_normed, 0.0f0)
+    fill!(decode_gated, 0.0f0)
     
     # Prefill buffers - sized for max context
     max_seq = 4096
-    prefill_beta = oneArray(zeros(Float32, num_v_heads, max_seq))
-    prefill_alpha = oneArray(zeros(Float32, num_v_heads, max_seq))
+    prefill_beta = oneArray{Float32}(undef, num_v_heads, max_seq)
+    prefill_alpha = oneArray{Float32}(undef, num_v_heads, max_seq)
+    fill!(prefill_beta, 0.0f0)
+    fill!(prefill_alpha, 0.0f0)
     oneAPI.synchronize()
     
     # Convert conv1d to GPU if needed
