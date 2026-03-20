@@ -98,7 +98,7 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig;
 
     layers = Model.DecoderLayer[]
     for i in 0:(config.num_hidden_layers-1)
-        print(".")
+        print("\rLoading layers: $(i+1)/$(config.num_hidden_layers)")
         flush(stdout)
         prefix = "blk.$(i)"
         is_ssm = haskey(file.tensors, "$(prefix).ssm_a")
@@ -200,7 +200,7 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig;
 
         push!(layers, Model.DecoderLayer(in_norm, op, post_norm, mlp, is_ssm))
     end
-    println()
+    println("\rLoading layers: $(config.num_hidden_layers)/$(config.num_hidden_layers)... Done.")
 
     final_norm_w = get_bias_or_norm(file, "output_norm.weight"; imatrix=imatrix)
     final_norm = Model.RMSNorm(oneArray(final_norm_w), config.rms_norm_eps)
