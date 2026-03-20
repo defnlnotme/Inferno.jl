@@ -35,7 +35,8 @@ function probe_device(dev)::Symbol
         arr = oneArray(Int32[1])
         oneAPI.unsafe_free!(arr)
         # Medium probe to detect partial failures (256KB)
-        arr2 = oneArray(zeros(Float32, 64 * 1024))
+        # Optimized: direct GPU allocation with undef and fill!
+        arr2 = oneArray{Float32}(undef, 64 * 1024); fill!(arr2, 0.0f0)
         oneAPI.unsafe_free!(arr2)
         return :ok
     catch
