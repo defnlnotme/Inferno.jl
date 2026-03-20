@@ -31,15 +31,33 @@ function main()
     args = parse_commandline()
     
     # 1. Load the model and tokenizer
-    model, tok = Inferno.load_model(args["model"]; 
-                                    device=args["device"], 
-                                    imatrix=args["imatrix"],
-                                    mmproj=args["mmproj"])
+    model, tok = try
+        Inferno.load_model(args["model"];
+                           device=args["device"],
+                           imatrix=args["imatrix"],
+                           mmproj=args["mmproj"])
+    catch e
+        if e isa InterruptException
+            println("\n\e[31m[Loading Interrupted]\e[0m")
+            exit(0)
+        else
+            rethrow(e)
+        end
+    end
 
     # 2. Define your prompt
     println("-"^40)
-    print("Enter prompt: ")
-    prompt = read(stdin, String)
+    print("Enter prompt (Ctrl+D to submit): ")
+    prompt = try
+        read(stdin, String)
+    catch e
+        if e isa InterruptException
+            println("\n\nInterrupted!")
+            exit(0)
+        else
+            rethrow(e)
+        end
+    end
 
     if isempty(prompt)
         if eof(stdin)
