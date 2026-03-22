@@ -98,7 +98,7 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig;
 
     layers = Model.DecoderLayer[]
     for i in 0:(config.num_hidden_layers-1)
-        print(".")
+        print("\r\e[36mLoading layers: $(i+1)/$(config.num_hidden_layers)\e[0m")
         flush(stdout)
         prefix = "blk.$(i)"
         is_ssm = haskey(file.tensors, "$(prefix).ssm_a")
