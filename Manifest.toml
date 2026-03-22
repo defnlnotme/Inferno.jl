@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "32a120a6e72baad30fa9a19d6217d55592301a74"
+project_hash = "5298f1c48a78fea7ff8745e1ae5c21f32b70ec1d"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -185,7 +185,7 @@ uuid = "e33a78d0-f292-5ffc-b300-72abe9b543c8"
 version = "2.13.0+0"
 
 [[deps.Inferno]]
-deps = ["ArgParse", "HTTP", "JSON3", "Libdl", "LinearAlgebra", "Mmap", "Random", "Sockets", "Statistics", "StructTypes"]
+deps = ["ArgParse", "HTTP", "JSON", "JSON3", "Libdl", "LinearAlgebra", "Mmap", "OrderedCollections", "Random", "Sockets", "Statistics", "StructTypes", "Tar", "oneAPI"]
 path = "."
 uuid = "4e1e2c4b-a6e7-48e4-a8cc-a3a3a2d64561"
 version = "0.1.0"
@@ -205,6 +205,12 @@ deps = ["Artifacts", "Preferences"]
 git-tree-sha1 = "0533e564aae234aff59ab625543145446d8b6ec2"
 uuid = "692b3bcd-3c85-4b1f-b108-f13ce0eb3210"
 version = "1.7.1"
+
+[[deps.JSON]]
+deps = ["Dates", "Mmap", "Parsers", "Unicode"]
+git-tree-sha1 = "31e996f0a15c7b280ba9f76636b3ff9e2ae58c9a"
+uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+version = "0.21.4"
 
 [[deps.JSON3]]
 deps = ["Dates", "Mmap", "Parsers", "PrecompileTools", "StructTypes", "UUIDs"]
@@ -406,6 +412,11 @@ deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "Libdl"]
 git-tree-sha1 = "1346c9208249809840c91b26703912dff463d335"
 uuid = "efe28fd5-8261-553b-a9e1-b2916fc3738e"
 version = "0.5.6+0"
+
+[[deps.OrderedCollections]]
+git-tree-sha1 = "05868e21324cede2207c6f0f466b4bfef6d5e7ee"
+uuid = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
+version = "1.8.1"
 
 [[deps.Parsers]]
 deps = ["Dates", "PrecompileTools", "UUIDs"]

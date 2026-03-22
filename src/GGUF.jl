@@ -118,27 +118,27 @@ end
 export read_gguf
 function read_gguf(path::AbstractString)
     io = open(path, "r")
-    
+
     magic = read(io, UInt32)
     if magic != GGUF_MAGIC
         error("Not a valid GGUF file")
     end
-    
+
     version = read(io, UInt32)
     if version != GGUF_VERSION
-        @warn "Unsupported GGUF version: $version (expected $GGUF_VERSION)"
+        @warn "Unsupported GGUF version" version=version expected=GGUF_VERSION
     end
-    
+
     tensor_count = read(io, UInt64)
     kv_count = read(io, UInt64)
-    
+
     metadata = Dict{String, Any}()
     for _ in 1:kv_count
         key = read_string(io)
         vtype = GGUFValueType(read(io, UInt32))
         metadata[key] = read_value(io, vtype)
     end
-    
+
     tensors = Dict{String, TensorInfo}()
     for _ in 1:tensor_count
         name = read_string(io)
@@ -148,19 +148,19 @@ function read_gguf(path::AbstractString)
         offset = read(io, UInt64)
         tensors[name] = TensorInfo(name, dims, type, offset)
     end
-    
+
     alignment = get(metadata, "general.alignment", 32)
     padding = alignment - (position(io) % alignment)
     if padding != alignment && padding > 0
         read(io, padding)
     end
-    
+
     data_offset = position(io)
     close(io)
-    
+
     # Memory map the tensor data
     mapped_data = Mmap.mmap(path)
-    
+
     return GGUFFile(metadata, tensors, data_offset, mapped_data)
 end
 
@@ -169,10 +169,10 @@ function get_tensor(file::GGUFFile, name::String)
     if !haskey(file.tensors, name)
         error("Tensor not found: $name")
     end
-    
+
     info = file.tensors[name]
     start_idx = file.data_offset + info.offset + 1
-    
+
     # Calculate bytes based on type and dimensions
     # For simplicity, assuming f32 or f16 for now to get length, complex types need block sizing
     # It would be better to return a pointer or a view of the bytes

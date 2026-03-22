@@ -11,3 +11,6 @@ julia-1.12.0-rc1/
 julia-1.12.0-rc1-linux-x86_64.tar.gz
 sources/
 logs/
+examples/reference_outputs
+examples/checks/reference_outputs
+**/__pycache__

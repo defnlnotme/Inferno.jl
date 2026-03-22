@@ -134,8 +134,8 @@ function handle_chat(stream::HTTP.Stream)
 
         prompt = build_prompt(body.messages)
         max_tokens = something(body.max_tokens, 128)
-        temperature = Float32(something(body.temperature, 0.7))
-        top_p = Float32(something(body.top_p, 0.8))
+        temperature = Float16(something(body.temperature, 0.7))
+        top_p = Float16(something(body.top_p, 0.8))
         top_k = Int(something(body.top_k, 20))
         do_stream = something(body.stream, false)
 
@@ -279,11 +279,7 @@ function start_server(port::Int=8080;
     HTTP.register!(router, "GET", "/health", handle_health)
     HTTP.register!(router, "GET", "/v1/models", handle_models)
 
-    println("🔥 Inferno server listening on http://127.0.0.1:$(port)")
-    println("   API Token: Bearer $(AUTH_TOKEN_REF[])")
-    println("   POST /v1/chat/completions")
-    println("   GET  /v1/models")
-    println("   GET  /health")
+    @info "Inferno server started" url="http://127.0.0.1:$(port)" endpoints=["POST /v1/chat/completions", "GET /v1/models", "GET /health"]
 
     # Use the stream-oriented serve
     HTTP.serve(router, Sockets.localhost, port; stream=true)

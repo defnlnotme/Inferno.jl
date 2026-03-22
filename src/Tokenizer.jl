@@ -1,6 +1,7 @@
 module Tokenizer
 
 import Base: show
+using Unicode
 export BPETokenizer, encode, decode, load_tokenizer
 
 """
@@ -12,15 +13,24 @@ struct BPETokenizer
     token_to_id::Dict{String, Int}
     id_to_token::Vector{String}
     merges::Vector{Tuple{String, String}}
+    merge_priority::Dict{Tuple{String, String}, Int}
+    special_tokens::Vector{String}
+    pretokenizer::String
     bos_id::Int
     eos_id::Int
 end
 
+const QWEN_PRETOKENIZER_RE = Regex(
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+)
+
 function load_tokenizer(metadata::Dict{String, Any})
     tokens = get(metadata, "tokenizer.ggml.tokens", String[])
     merges_raw = get(metadata, "tokenizer.ggml.merges", String[])
-    bos_id = Int(get(metadata, "tokenizer.ggml.bos_token_id", 1))
-    eos_id = Int(get(metadata, "tokenizer.ggml.eos_token_id", 2))
+    bos_id_raw = Int(get(metadata, "tokenizer.ggml.bos_token_id", -1))
+    eos_id_raw = Int(get(metadata, "tokenizer.ggml.eos_token_id", -1))
+    pretokenizer = String(get(metadata, "tokenizer.ggml.pre", "default"))
+    token_types = get(metadata, "tokenizer.ggml.token_type", Any[])
 
     token_to_id = Dict{String, Int}()
     id_to_token = Vector{String}(undef, length(tokens))
@@ -38,7 +48,33 @@ function load_tokenizer(metadata::Dict{String, Any})
         end
     end
 
-    BPETokenizer(token_to_id, id_to_token, merges, bos_id, eos_id)
+    merge_priority = Dict{Tuple{String, String}, Int}()
+    for (i, pair) in enumerate(merges)
+        merge_priority[pair] = i
+    end
+
+    special_tokens = String[]
+    if token_types isa AbstractVector && length(token_types) == length(tokens)
+        for i in eachindex(tokens, token_types)
+            tok_type = try
+                Int(token_types[i])
+            catch
+                1
+            end
+            if tok_type != 1
+                tok = String(tokens[i])
+                if startswith(tok, "<") && endswith(tok, ">")
+                    push!(special_tokens, tok)
+                end
+            end
+        end
+    end
+    sort!(unique!(special_tokens); by = s -> (-ncodeunits(s), s))
+
+    bos_id = bos_id_raw >= 0 ? bos_id_raw + 1 : bos_id_raw
+    eos_id = eos_id_raw >= 0 ? eos_id_raw + 1 : eos_id_raw
+
+    BPETokenizer(token_to_id, id_to_token, merges, merge_priority, special_tokens, pretokenizer, bos_id, eos_id)
 end
 
 function get_byte_map()
@@ -62,33 +98,34 @@ end
 const BYTE_TO_CHAR = get_byte_map()
 const CHAR_TO_BYTE = Dict(v => k for (k, v) in BYTE_TO_CHAR)
 
-"""
-    encode(tok, text) -> Vector{Int}
+function _append_fallback_ids!(ids::Vector{Int}, tok::BPETokenizer, symbol::String)
+    for c in symbol
+        b = get(CHAR_TO_BYTE, c, nothing)
+        b === nothing && error("Tokenizer fallback failed for symbol: $(repr(symbol))")
+        fb = string("<0x", uppercase(string(b, base=16, pad=2)), ">")
+        fbid = get(tok.token_to_id, fb, 0)
+        fbid > 0 || error("Missing byte fallback token $fb in vocabulary")
+        push!(ids, fbid)
+    end
+end
 
-Byte-level BPE encoding.
-"""
-function encode(tok::BPETokenizer, text::String)
-    # Map raw UTF-8 bytes to unicode characters using standard BPE mapping
+function _encode_piece!(ids::Vector{Int}, tok::BPETokenizer, piece::AbstractString)
+    isempty(piece) && return ids
+
     symbols = String[]
-    for b in Vector{UInt8}(text)
-        push!(symbols, string(get(BYTE_TO_CHAR, b, Char(b))))
-    end
-    # Build a priority lookup: merge pair -> priority (lower = higher priority)
-    merge_priority = Dict{Tuple{String,String}, Int}()
-    for (i, (a, b)) in enumerate(tok.merges)
-        merge_priority[(a, b)] = i
+    for b in codeunits(piece)
+        push!(symbols, string(BYTE_TO_CHAR[UInt8(b)]))
     end
 
-    # Iteratively apply merges
     changed = true
     while changed && length(symbols) > 1
         changed = false
         best_idx = 0
         best_pri = typemax(Int)
 
-        for i in 1:(length(symbols) - 1)
-            pair = (symbols[i], symbols[i+1])
-            pri = get(merge_priority, pair, typemax(Int))
+        @inbounds for i in 1:(length(symbols) - 1)
+            pair = (symbols[i], symbols[i + 1])
+            pri = get(tok.merge_priority, pair, typemax(Int))
             if pri < best_pri
                 best_pri = pri
                 best_idx = i
@@ -96,26 +133,88 @@ function encode(tok::BPETokenizer, text::String)
         end
 
         if best_idx > 0 && best_pri < typemax(Int)
-            merged = symbols[best_idx] * symbols[best_idx + 1]
+            symbols[best_idx] = symbols[best_idx] * symbols[best_idx + 1]
             deleteat!(symbols, best_idx + 1)
-            symbols[best_idx] = merged
             changed = true
         end
     end
 
-    # Convert symbols to IDs
-    ids = Int[]
     for s in symbols
         id = get(tok.token_to_id, s, 0)
         if id > 0
             push!(ids, id)
         else
-            # Unknown token — try byte fallback <0xHH>
-            for b in Vector{UInt8}(s)
-                fb = string("<0x", uppercase(string(b, base=16, pad=2)), ">")
-                fbid = get(tok.token_to_id, fb, 0)
-                push!(ids, fbid > 0 ? fbid : 1)  # fallback to BOS/UNK
+            _append_fallback_ids!(ids, tok, s)
+        end
+    end
+
+    return ids
+end
+
+function _append_pretokenized_ids!(ids::Vector{Int}, tok::BPETokenizer, text::AbstractString)
+    isempty(text) && return ids
+    normalized = Unicode.normalize(String(text), :NFC)
+
+    if tok.pretokenizer == "qwen2"
+        for m in eachmatch(QWEN_PRETOKENIZER_RE, normalized)
+            _encode_piece!(ids, tok, m.match)
+        end
+    else
+        _encode_piece!(ids, tok, normalized)
+    end
+
+    return ids
+end
+
+function _split_special_tokens(tok::BPETokenizer, text::String)
+    isempty(tok.special_tokens) && return Any[(false, text)]
+
+    parts = Any[]
+    cursor = firstindex(text)
+
+    while cursor <= lastindex(text)
+        found_range = nothing
+        found_token = nothing
+
+        for special in tok.special_tokens
+            r = findnext(special, text, cursor)
+            if r !== nothing && (found_range === nothing || first(r) < first(found_range))
+                found_range = r
+                found_token = special
+                first(r) == cursor && break
             end
+        end
+
+        if found_range === nothing
+            push!(parts, (false, SubString(text, cursor)))
+            break
+        end
+
+        if first(found_range) > cursor
+            push!(parts, (false, SubString(text, cursor, prevind(text, first(found_range)))))
+        end
+
+        push!(parts, (true, found_token))
+        cursor = nextind(text, last(found_range))
+    end
+
+    return parts
+end
+
+"""
+    encode(tok, text) -> Vector{Int}
+
+Byte-level BPE encoding.
+"""
+function encode(tok::BPETokenizer, text::String)
+    ids = Int[]
+    for (is_special, piece) in _split_special_tokens(tok, text)
+        if is_special
+            id = get(tok.token_to_id, String(piece), 0)
+            id > 0 || error("Missing special token in vocabulary: $(repr(piece))")
+            push!(ids, id)
+        else
+            _append_pretokenized_ids!(ids, tok, String(piece))
         end
     end
 

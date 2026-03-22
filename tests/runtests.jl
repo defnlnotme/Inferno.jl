@@ -3,7 +3,13 @@ using Inferno
 using Statistics
 using oneAPI
 
-const MODEL_PATH = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "models", "Qwen3.5-0.8B-UD-Q4_K_XL.gguf"))
+const MODEL_PATH = get(ENV, "INFERNO_MODEL", "unsloth/Qwen3.5-0.8B-GGUF")
+
+# Skip the Python comparison test for now - it requires HuggingFace setup
+# @testset "Julia vs Python Comparison Tests" failfast=true begin
+#  include("julia_vs_python/test_prefill_comparison.jl")
+# end
+# exit()
 
 @testset "Inferno Tests" begin
 
@@ -35,7 +41,7 @@ const MODEL_PATH = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "models", "Qwen3
         @test haskey(file.metadata, "$(arch).block_count")
         @test haskey(file.metadata, "$(arch).embedding_length")
 
-        # Tensor count should match model  
+        # Tensor count should match model
         println("  Architecture: $arch")
         println("  Metadata keys: $(length(file.metadata))")
         println("  Tensor count: $(length(file.tensors))")
@@ -73,14 +79,14 @@ const MODEL_PATH = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "models", "Qwen3
         # Test single sequence (1D-like, but technically 2D: hidden_size x 1)
         hidden_size = 1024
         seq_len = 1
-        eps = 1f-6
+        eps = Float16(1e-6)
 
-        x_cpu = rand(Float32, hidden_size, seq_len)
-        w_cpu = rand(Float32, hidden_size)
+        x_cpu = rand(Float16, hidden_size, seq_len)
+        w_cpu = rand(Float16, hidden_size)
 
         # Expected output mathematically
-        m = sum(x_cpu .* x_cpu, dims=1) .* (1.0f0 / Float32(hidden_size))
-        inv_rms = 1.0f0 ./ sqrt.(m .+ eps)
+        m = sum(x_cpu .* x_cpu, dims=1) .* (Float16(1.0) / Float16(hidden_size))
+        inv_rms = Float16(1.0) ./ sqrt.(m .+ eps)
         expected = x_cpu .* inv_rms .* w_cpu
 
         # GPU execution
@@ -93,10 +99,10 @@ const MODEL_PATH = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "models", "Qwen3
 
         # Test batched sequence (hidden_size x seq_len)
         seq_len = 10
-        x_cpu_batch = rand(Float32, hidden_size, seq_len)
+        x_cpu_batch = rand(Float16, hidden_size, seq_len)
 
-        m_batch = sum(x_cpu_batch .* x_cpu_batch, dims=1) .* (1.0f0 / Float32(hidden_size))
-        inv_rms_batch = 1.0f0 ./ sqrt.(m_batch .+ eps)
+        m_batch = sum(x_cpu_batch .* x_cpu_batch, dims=1) .* (Float16(1.0) / Float16(hidden_size))
+        inv_rms_batch = Float16(1.0) ./ sqrt.(m_batch .+ eps)
         expected_batch = x_cpu_batch .* inv_rms_batch .* w_cpu
 
         x_gpu_batch = oneArray(x_cpu_batch)
@@ -106,9 +112,9 @@ const MODEL_PATH = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "models", "Qwen3
         @test res_cpu_batch ≈ expected_batch atol=1e-4
 
         # Test small numbers
-        x_small = rand(Float32, hidden_size, 1) .* 1f-5
-        m_small = sum(x_small .* x_small, dims=1) .* (1.0f0 / Float32(hidden_size))
-        inv_rms_small = 1.0f0 ./ sqrt.(m_small .+ eps)
+        x_small = rand(Float16, hidden_size, 1) .* 1f-5
+        m_small = sum(x_small .* x_small, dims=1) .* (Float16(1.0) / Float16(hidden_size))
+        inv_rms_small = Float16(1.0) ./ sqrt.(m_small .+ eps)
         expected_small = x_small .* inv_rms_small .* w_cpu
 
         x_gpu_small = oneArray(x_small)
@@ -145,23 +151,23 @@ const MODEL_PATH = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "models", "Qwen3
         @testset "IQ2_XXS" begin
             data = zeros(UInt8, 66); data[1] = 0x00; data[2] = 0x3c # d = 1.0
             y = dequantize_iq2_xxs(data, 256)
-            @test all(y .== 0.0f0)
+            @test all(y .== Float16(0.0))
             data[3] = 0x01 # grid[2] = 0x08...082b
             y = dequantize_iq2_xxs(data, 256)
-            @test y[1] == 4.375f0 # (43-8) * 0.125
-            @test all(y[2:8] .== 0.0f0)
+            @test y[1] == Float16(4.375) # (43-8) * 0.125
+            @test all(y[2:8] .== Float16(0.0))
         end
 
         @testset "IQ2_XS" begin
             data = zeros(UInt8, 74); data[1] = 0x00; data[2] = 0x3c
             y = dequantize_iq2_xs(data, 256)
-            @test all(y .== 0.0f0)
+            @test all(y .== Float16(0.0))
         end
 
         @testset "IQ3_XXS" begin
             data = zeros(UInt8, 98); data[1] = 0x00; data[2] = 0x3c
             y = dequantize_iq3_xxs(data, 256)
-            @test all(y .== 0.0f0)
+            @test all(y .== Float16(0.0))
         end
     end
 
@@ -169,25 +175,25 @@ const MODEL_PATH = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "models", "Qwen3
         using Inferno.Model
         using Inferno.Dequant
         using Inferno.QuantsData
-        
+
         N, K = 1, 1024
         data = rand(UInt8, 66 * 4)
         for i in 1:4
             base = (i-1)*66
             data[base+1] = 0x00; data[base+2] = 0x3c
         end
-        
+
         weight_cpu = dequantize_iq2_xxs(data, K)
         Model.init_gpu_tables(QuantsData.IQ2XXS_GRID, QuantsData.KSIGNS_IQ2XS, QuantsData.KMASK_IQ2XS)
-        
+
         weight_gpu = Model.IQ2XXSMatrix(oneArray(data), K, N)
-        x_cpu = rand(Float32, K)
+        x_cpu = rand(Float16, K)
         x_gpu = oneArray(x_cpu)
-        
+
         y_cpu = sum(weight_cpu .* x_cpu)
         res_gpu = Model.mat_mul(weight_gpu, reshape(x_gpu, K, 1))
         y_gpu = collect(res_gpu)[1]
-        
+
         println("  Consistency diff: $(abs(y_cpu - y_gpu))")
         @test y_cpu ≈ y_gpu atol=1e-3
     end
@@ -250,10 +256,7 @@ const MODEL_PATH = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "models", "Qwen3
         println("  Prompt: \"$prompt\" -> $(length(tokens)) tokens")
 
         # Init KV caches
-        caches = [Inferno.Model.init_kv_cache(
-            model.config.head_dim,
-            model.config.num_key_value_heads,
-            model.config.max_position_embeddings)
+        caches = [Inferno.Model.init_kv_cache(model.config)
             for _ in 1:model.config.num_hidden_layers]
 
         # Prefill
@@ -262,8 +265,8 @@ const MODEL_PATH = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "models", "Qwen3
 
         # Logits should be finite real numbers
         @test all(isfinite, last_logits)
-        @test maximum(last_logits) > -1000.0f0
-        @test minimum(last_logits) < 1000.0f0
+        @test maximum(last_logits) > -Float16(1000.0)
+        @test minimum(last_logits) < Float16(1000.0)
         println("  Logits: mean=$(round(mean(last_logits), digits=2)), max=$(round(maximum(last_logits), digits=2)), min=$(round(minimum(last_logits), digits=2))")
 
         # Generate 3 greedy tokens
@@ -297,22 +300,26 @@ const MODEL_PATH = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "models", "Qwen3
 
     @testset "Engine.sample" begin
         # Test sample with temperature 0.0 (argmax)
-        logits1 = Float32[1.0, 5.0, 2.0, 4.0]
-        result1 = Inferno.Engine.sample(logits1, 0.0f0, 1.0f0)
+        logits1 = Float16[1.0, 5.0, 2.0, 4.0]
+        result1 = Inferno.Engine.sample(logits1, Float16(0.0), Float16(1.0))
         @test result1 == 2
 
-        logits2 = Float32[-10.0, -5.0, -1.0]
-        result2 = Inferno.Engine.sample(logits2, 0.0f0, 1.0f0)
+        logits2 = Float16[-10.0, -5.0, -1.0]
+        result2 = Inferno.Engine.sample(logits2, Float16(0.0), Float16(1.0))
         @test result2 == 3
 
         # Test with duplicate max (argmax should return first index)
-        logits3 = Float32[1.0, 5.0, 2.0, 5.0]
-        result3 = Inferno.Engine.sample(logits3, 0.0f0, 1.0f0)
+        logits3 = Float16[1.0, 5.0, 2.0, 5.0]
+        result3 = Inferno.Engine.sample(logits3, Float16(0.0), Float16(1.0))
         @test result3 == 2
     end
 
 end
 
 @testset "Server Endpoints Tests" begin
-    include("test_server.jl")
+    include("integration/test_server.jl")
+end
+
+@testset "Julia vs Python Comparison Tests" begin
+    include("julia_vs_python/test_prefill_comparison.jl")
 end

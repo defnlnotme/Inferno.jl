@@ -38,6 +38,6 @@ function diagnose(model_path)
 
 end
 
-model_path = length(ARGS) > 0 ? ARGS[1] : get(ENV, "INFERNO_MODEL", "tests/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
+model_path = length(ARGS) > 0 ? ARGS[1] : get(ENV, "INFERNO_MODEL", "unsloth/Qwen3.5-0.8B-GGUF")
 diagnose(model_path)
 flush(stdout)

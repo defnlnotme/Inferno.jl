@@ -426,8 +426,8 @@ function dequantize_q5_k(data::AbstractVector{UInt8}, num_elements::Int)
             d1, min1 = d * sc1, dmin * m1
             d2, min2 = d * sc2, dmin * m2
             
-            u1 = UInt8(1 << j)
-            u2 = UInt8(1 << (j + 4))
+            u1 = UInt8(1 << (2 * j))
+            u2 = UInt8(1 << (2 * j + 1))
 
             for l in 0:31
                 ql_val = qs[j * 32 + l + 1]
@@ -615,17 +615,22 @@ function dequantize_iq4_xs(data::AbstractVector{UInt8}, num_elements::Int)
         offset = i * block_size + 1
         d = Float32(reinterpret(Float16, data[offset:(offset + 1)])[1])
         scales_h = UInt16(data[offset + 2]) | (UInt16(data[offset + 3]) << 8)
-        scales_l = @view data[(offset + 4):(offset + 7)]
-        qs = @view data[(offset + 8):(offset + 135)]
         
         idx_base = i * 256
         
         for ib in 0:7
-            ls = ((scales_l[ib ÷ 2 + 1] >> 4 * (ib % 2)) & 0x0f) | (((scales_h >> 2 * ib) & 0x03) << 4)
+            byte_idx = offset + 4 + ib ÷ 2
+            shift_amt = 4 * (ib % 2)
+            byte_val = data[byte_idx]
+            low_bits = (byte_val >> shift_amt) & 0x0f
+            shift_h = 2 * ib
+            shifted = scales_h >> shift_h
+            high_bits = shifted & 0x03
+            ls = low_bits | (high_bits << 4)
             dl = d * Float32(Int32(ls) - 32)
             
             for j in 0:15
-                q_val = qs[ib * 16 + j + 1]
+                q_val = data[offset + 8 + ib * 16 + j]
                 weights[idx_base + ib * 32 + j + 1] = dl * Float32(KVALUES_IQ4NL[(q_val & 0x0f) + 1])
                 weights[idx_base + ib * 32 + j + 16 + 1] = dl * Float32(KVALUES_IQ4NL[(q_val >> 4) + 1])
             end
