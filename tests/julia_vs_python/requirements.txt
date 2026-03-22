@@ -1,0 +1,4 @@
+# Python dependencies for Julia vs Python comparison tests
+transformers>=4.30.0
+torch>=2.0.0
+accelerate>=0.20.0
