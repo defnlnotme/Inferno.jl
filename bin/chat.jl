@@ -106,7 +106,7 @@ function main()
         push!(messages, "user" => args["prompt"])
         prompt_text = format_messages(args["system-prompt"], messages)
         
-        print("\n\e[1;32mAssistant:\e[0m ")
+        print("\n\e[1;32mAssistant:\e[0m \e[2m...\e[0m")
         flush(stdout)
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
                                               max_tokens=args["max-tokens"], 
@@ -114,8 +114,13 @@ function main()
                                               top_p=Float32(args["top-p"]))
         
         full_response = ""
+        is_first_token = true
         try
             for token_text in stream
+                if is_first_token
+                    print("\b\b\b   \b\b\b")
+                    is_first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
@@ -188,7 +193,7 @@ function main()
         push!(messages, "user" => user_input)
         prompt_text = format_messages(args["system-prompt"], messages)
         
-        print("\e[1;32mAssistant:\e[0m ")
+        print("\e[1;32mAssistant:\e[0m \e[2m...\e[0m")
         flush(stdout)
         
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
@@ -197,8 +202,13 @@ function main()
                                               top_p=Float32(args["top-p"]))
                                               
         full_response = ""
+        is_first_token = true
         try
             for token_text in stream
+                if is_first_token
+                    print("\b\b\b   \b\b\b")
+                    is_first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
