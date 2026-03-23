@@ -458,32 +458,33 @@ function (m::MLP)(x::oneMatrix{Float16}, cache::KVCache)
     branch_out_cpu = Float32.(Array(result))
     branch_out_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
 
-    if !all(isfinite, branch_out_cpu) || branch_out_rms > Float32(4.0)
-        # Get or create CPU weights cache
-        weights = get!(_mlp_cpu_cache(), m.index) do
-            (
-                gate=Float32.(Array(m.gate_weight)),
-                up=Float32.(Array(m.up_weight)),
-                down=Float32.(Array(m.down_weight)),
-            )
-        end
+ if !all(isfinite, branch_out_cpu) || branch_out_rms > Float32(4.0)
+ # Get or create CPU weights cache
+ weights = get!(_mlp_cpu_cache(), m.index) do
+ (
+ gate=Float32.(Array(m.gate_weight)),
+ up=Float32.(Array(m.up_weight)),
+ down=Float32.(Array(m.down_weight)),
+ )
+ end
 
-        x_norm_cpu = Float32.(Array(x))
-        gate_cpu = weights.gate * x_norm_cpu
-        up_cpu = weights.up * x_norm_cpu
-        @. gate_cpu = gate_cpu * (Float32(1.0) / (Float32(1.0) + exp(-gate_cpu)))
-        gate_cpu .*= up_cpu
-        branch_out_cpu = weights.down * gate_cpu
+ x_norm_cpu = Float32.(Array(x))
+ gate_cpu = weights.gate * x_norm_cpu
+ up_cpu = weights.up * x_norm_cpu
+ @. gate_cpu = gate_cpu * (Float32(1.0) / (Float32(1.0) + exp(-gate_cpu)))
+ gate_cpu .*= up_cpu
+ branch_out_cpu = weights.down * gate_cpu
 
-        copyto!(cache.branch_out, reshape(Float16.(branch_out_cpu), :, 1))
+ copyto!(cache.branch_out, reshape(Float16.(branch_out_cpu), :, 1))
+ result = cache.branch_out # Update result to use CPU fallback
 
  if m.index ∉ _mlp_cpu_warned_layers()
  push!(_mlp_cpu_warned_layers(), m.index)
-            @warn "Falling back to CPU Float32 MLP for unstable layer" layer = m.index gpu_rms = branch_out_rms cpu_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
-        end
-    end
+ @warn "Falling back to CPU Float32 MLP for unstable layer" layer = m.index gpu_rms = branch_out_rms cpu_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
+ end
+ end
 
-    return result
+ return result
 end
 
 function (m::MLP)(x::oneMatrix{Float16})
@@ -1332,15 +1333,16 @@ function (m::GatedDeltaNet)(x::AbstractArray{Float16,2}, pos::Int, rope::RotaryE
         ssm_out_w = Float32.(Array(m.ssm_out))
         branch_out_cpu = ssm_out_w * vec(y_reshaped)
 
-        copyto!(m.branch_out, reshape(Float16.(branch_out_cpu), :, 1))
+ copyto!(m.branch_out, reshape(Float16.(branch_out_cpu), :, 1))
+ result = m.branch_out # Update result to use CPU fallback
 
-        if m.index ∉ _ssm_cpu_fallback_layers()
-            push!(_ssm_cpu_fallback_layers(), m.index)
-            @warn "Falling back to CPU Float32 SSM for unstable layer" layer = m.index gpu_rms = branch_out_rms cpu_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
-        end
-    end
+ if m.index ∉ _ssm_cpu_fallback_layers()
+ push!(_ssm_cpu_fallback_layers(), m.index)
+ @warn "Falling back to CPU Float32 SSM for unstable layer" layer = m.index gpu_rms = branch_out_rms cpu_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
+ end
+ end
 
-    return result
+ return result
 end
 
 # --- Decoder Layer ---
