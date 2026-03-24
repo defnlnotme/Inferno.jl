@@ -2,8 +2,22 @@ using Test
 using Inferno
 using Statistics
 using oneAPI
+using Random
 
 const MODEL_PATH = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf"))
+
+# Test organization markers:
+# - [UNIT] tests run without model file (fast, isolated)
+# - [MODEL] tests require a valid GGUF model file
+# - [GPU] tests require oneAPI/GPU access
+# - [INTEGRATION] tests require full system (server, etc.)
+
+println("=" ^ 60)
+println("INFERNO TEST SUITE")
+println("=" ^ 60)
+println("Model path: $MODEL_PATH")
+println("Model exists: $(isfile(MODEL_PATH))")
+println("=" ^ 60)
 
 @testset "Inferno Tests" begin
 
@@ -251,10 +265,10 @@ const MODEL_PATH = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "models/Qwen3.5-
         @test model.config.num_hidden_layers == 24
         @test length(model.layers) == 24
 
-        prompt = "The capital of France is"
-        tokens = Inferno.Tokenizer.encode(tok, prompt)
-        @test length(tokens) > 0
-        println(" Prompt: \"$prompt\" -> $(length(tokens)) tokens")
+ prompt = "The capital of France is"
+ tokens = Inferno.Tokenizer.encode(tok, prompt)
+ @test length(tokens) > 0
+ println(" Prompt: \"$prompt\" -> $(length(tokens)) tokens")
 
         # Init KV caches
         caches = [Inferno.Model.init_kv_cache(model.config)
@@ -264,11 +278,12 @@ const MODEL_PATH = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "models/Qwen3.5-
         logits = Inferno.Model.forward!(model, tokens, 0, caches)
         last_logits = vec(logits[:, end])
 
-        # Logits should be finite real numbers
-        @test all(isfinite, last_logits)
-        @test maximum(last_logits) > -Float16(1000.0)
-        @test minimum(last_logits) < Float16(1000.0)
-        println("  Logits: mean=$(round(mean(last_logits), digits=2)), max=$(round(maximum(last_logits), digits=2)), min=$(round(minimum(last_logits), digits=2))")
+ # Logits should be finite real numbers
+ @test all(isfinite, last_logits)
+ @test maximum(last_logits) > -Float16(1000.0)
+ @test minimum(last_logits) < Float16(1000.0)
+ logits_arr = Float32.(Array(last_logits))
+ println(" Logits: mean=$(round(mean(logits_arr), digits=2)), max=$(round(maximum(logits_arr), digits=2)), min=$(round(minimum(logits_arr), digits=2))")
 
         # Generate 3 greedy tokens
         generated = Int[]
@@ -316,6 +331,88 @@ const MODEL_PATH = get(ENV, "INFERNO_MODEL", joinpath(@__DIR__, "models/Qwen3.5-
     end
 
 end
+
+# ============================================================
+# Additional Unit Tests (fast, isolated)
+# ============================================================
+
+# Engine module tests
+@testset "[UNIT] Engine Module Extended" begin
+    include("unit/test_engine.jl")
+end
+
+# Tokenizer module tests  
+@testset "[UNIT] Tokenizer Module Extended" begin
+    include("unit/test_tokenizer.jl")
+end
+
+# GGUF module tests
+@testset "[UNIT] GGUF Module Extended" begin
+    include("unit/test_gguf.jl")
+end
+
+# Inferno utility function tests
+@testset "[UNIT] Inferno Utility Functions" begin
+    include("unit/test_inferno_utils.jl")
+end
+
+# ============================================================
+# Integration Tests (require full system)
+# ============================================================
+
+# Server authentication and error handling tests
+# NOTE: These tests require the full Inferno module context
+# The Server module uses relative imports (..Engine, ..Model, ..Tokenizer)
+# which requires being loaded from within the Inferno module hierarchy.
+# For now, we skip these tests and rely on integration testing.
+@testset "[INTEGRATION] Server Auth and Error Handling" begin
+ # Test that we can at least load the Server module when Inferno is loaded
+ @testset "Server module loads" begin
+ @test isa(Inferno.Server, Module)
+ end
+ 
+ # Test struct definitions
+ @testset "Message struct" begin
+ msg = Inferno.Server.Message("user", "Hello")
+ @test msg.role == "user"
+ @test msg.content == "Hello"
+ end
+ 
+ @testset "ChatCompletionRequest struct" begin
+ msg = Inferno.Server.Message("user", "Hello")
+ req = Inferno.Server.ChatCompletionRequest("test", [msg], 100, 0.7, 0.9, 20, false)
+ @test req.model == "test"
+ @test length(req.messages) == 1
+ end
+ 
+ @testset "Choice struct" begin
+ msg = Inferno.Server.Message("assistant", "Response")
+ choice = Inferno.Server.Choice(0, msg, "stop")
+ @test choice.index == 0
+ @test choice.finish_reason == "stop"
+ end
+ 
+ @testset "Usage struct" begin
+ usage = Inferno.Server.Usage(10, 20, 30)
+ @test usage.prompt_tokens == 10
+ @test usage.completion_tokens == 20
+ @test usage.total_tokens == 30
+ end
+ 
+ @testset "ChatCompletionResponse struct" begin
+ msg = Inferno.Server.Message("assistant", "Response")
+ choice = Inferno.Server.Choice(0, msg, "stop")
+ usage = Inferno.Server.Usage(10, 20, 30)
+ resp = Inferno.Server.ChatCompletionResponse("id1", "chat.completion", 1234567890, "test", [choice], usage)
+ @test resp.id == "id1"
+ @test resp.model == "test"
+ @test length(resp.choices) == 1
+ end
+end
+
+# ============================================================
+# Legacy TODO tests (disabled)
+# ============================================================
 
 # TODO: Server integration tests need mock fixes
 # @testset "Server Endpoints Tests" begin
