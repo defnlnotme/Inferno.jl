@@ -178,14 +178,38 @@ function mask_and_sample(logits::AbstractVector{Float16}, pad_ids::Vector{Int}, 
     return argmax(logits_copy)
 end
 
+# Apply presence penalty to logits based on token counts
+# Presence penalty reduces the probability of tokens that have already appeared,
+# encouraging the model to generate more diverse content.
+function apply_presence_penalty!(logits::AbstractVector{Float16}, token_counts::Dict{Int,Int}, penalty::Float16)
+    if penalty == Float16(0.0)
+        return logits
+    end
+    for (tokid, cnt) in token_counts
+        if 1 <= tokid <= length(logits)
+            # Penalty is proportional to token count
+            # Each occurrence adds penalty, discouraging repetition
+            logits[tokid] -= Float16(cnt) * penalty
+        end
+    end
+    return logits
+end
+
 function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::String;
-    max_tokens=100, temperature=Float16(0.7), top_p=Float16(0.8), top_k=20, stop_token=nothing)
+    max_tokens::Int=100, temperature::Float16=Float16(0.7), top_p::Float16=Float16(0.8), 
+    top_k::Int=20, presence_penalty::Float16=Float16(0.0), stop_token::Union{Int,Nothing}=nothing)
 
     tokens = Tokenizer.encode(tok, prompt)
     if isempty(tokens)
         return Channel{String}(0) do chan
             close(chan)
         end
+    end
+
+    # Track token occurrences for presence penalty
+    token_counts = Dict{Int,Int}()
+    for t in tokens
+        token_counts[t] = get(token_counts, t, 0) + 1
     end
 
     kv_caches = Vector{Model.KVCache}()
@@ -208,10 +232,15 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
 
             # Sample from last position
             logits_vec = vec(collect(logits[:, end]))
-            last_token = mask_and_sample(logits_vec, [tok.eos_id], Float16(temperature), Float16(top_p), top_k)
+            # Apply presence penalty to prompt tokens
+            apply_presence_penalty!(logits_vec, token_counts, presence_penalty)
+            last_token = mask_and_sample(logits_vec, [tok.eos_id], temperature, top_p, top_k)
 
             token_str = Tokenizer.decode(tok, [last_token])
             put!(chan, token_str)
+
+            # Track generated token for presence penalty
+            token_counts[last_token] = get(token_counts, last_token, 0) + 1
 
             # Decode loop
             for step in 1:(max_tokens-1)
@@ -223,10 +252,15 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
                 curr_pos += 1
 
                 logits_vec = vec(collect(logits[:, 1]))
-                last_token = mask_and_sample(logits_vec, [tok.eos_id], Float16(temperature), Float16(top_p), top_k)
+                # Apply presence penalty to all seen tokens (prompt + generated)
+                apply_presence_penalty!(logits_vec, token_counts, presence_penalty)
+                last_token = mask_and_sample(logits_vec, [tok.eos_id], temperature, top_p, top_k)
 
                 token_str = Tokenizer.decode(tok, [last_token])
                 put!(chan, token_str)
+
+                # Track generated token for presence penalty
+                token_counts[last_token] = get(token_counts, last_token, 0) + 1
 
                 if step % 4 == 0
                     GC.gc(false)
@@ -237,7 +271,7 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
 
         catch e
             if !(e isa InterruptException) && !(e isa InvalidStateException)
-                @error "ERROR during generation stream" exception = (e, catch_backtrace())
+                @error "ERROR during generation stream" exception=(e, catch_backtrace())
             end
         finally
             try
@@ -259,9 +293,10 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
 end
 
 function generate(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::String;
-    max_tokens=100, temperature=Float16(0.7), top_p=Float16(0.8), top_k=20, stop_token=nothing)
+    max_tokens::Int=100, temperature::Float16=Float16(0.7), top_p::Float16=Float16(0.8), 
+    top_k::Int=20, presence_penalty::Float16=Float16(0.0), stop_token::Union{Int,Nothing}=nothing)
 
-    stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, top_k, stop_token)
+    stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, top_k, presence_penalty, stop_token)
     res = String[]
     for token_str in stream
         push!(res, token_str)
@@ -271,8 +306,9 @@ end
 
 # Stream directly to stdout for interactive use
 function stream_to_stdout(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::String;
-    max_tokens=100, temperature=Float16(0.7), top_p=Float16(0.8), top_k=20)
-    stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, top_k)
+    max_tokens::Int=100, temperature::Float16=Float16(0.7), top_p::Float16=Float16(0.8), 
+    top_k::Int=20, presence_penalty::Float16=Float16(0.0))
+    stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, top_k, presence_penalty)
     for token_str in stream
         print(token_str)
     end

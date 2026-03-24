@@ -244,16 +244,34 @@ end
 
 """
     stream_to_stdout(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::AbstractString; 
-    max_tokens=100, temperature=0.7, top_p=0.8, top_k=20, io=stdout)
+    max_tokens=100, temperature=0.7, top_p=0.8, top_k=20, presence_penalty=0.0, io=stdout)
 
 Generate text from a prompt and stream tokens to stdout as they are generated.
 Returns the complete generated text as a string.
+
+# Arguments
+- `model`: The loaded QwenModel
+- `tok`: The BPETokenizer
+- `prompt`: The input prompt string
+- `max_tokens`: Maximum number of tokens to generate (default: 100)
+- `temperature`: Sampling temperature (default: 0.7)
+- `top_p`: Nucleus sampling probability (default: 0.8)
+- `top_k`: Top-k sampling parameter (default: 20)
+- `presence_penalty`: Penalty for repeated tokens - higher values discourage repetition (default: 0.0)
+- `io`: Output IO stream (default: stdout)
+
+# Presence Penalty
+The presence_penalty parameter helps reduce repetition by penalizing tokens that have 
+already appeared in the output. A value of 0.0 means no penalty, while higher values
+(e.g., 1.0-2.0) more strongly discourage repetition.
 """
 function stream_to_stdout(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::AbstractString;
-    max_tokens=100, temperature=Float16(0.7), top_p=Float16(0.8), top_k=20, io::IO=stdout)
+    max_tokens::Int=100, temperature::Float16=Float16(0.7), top_p::Float16=Float16(0.8), 
+    top_k::Int=20, presence_penalty::Float16=Float16(0.0), io::IO=stdout)
     
     stream = Engine.generate_stream(model, tok, prompt;
-        max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k)
+        max_tokens=max_tokens, temperature=temperature, top_p=top_p, 
+        top_k=top_k, presence_penalty=presence_penalty)
     
     generated_text = IOBuffer()
     for token in stream
