@@ -2,9 +2,10 @@ module Engine
 
 using ..Model
 using ..Tokenizer
+using ..oneAPI
 using Random
 
-export generate, generate_stream, sample
+export generate, generate_stream, sample, stream_to_stdout
 
 function simple_sample(probs::Vector{Float16})
     r = rand()
@@ -21,9 +22,10 @@ end
 function sample(logits::Vector{Float16}, temperature::Float16, top_p::Float16, top_k::Int=40)
     return cpu_sample(logits, temperature, top_p, top_k)
 end
+
 # CPU sampling implementation (original code)
 function cpu_sample(logits::Vector{Float16}, temperature::Float16, top_p::Float16, top_k::Int=40)
-    # Sanitize logits
+    # Sanitize logits - replace NaN and Inf with -Inf so they're never selected
     @inbounds for i in eachindex(logits)
         if !isfinite(logits[i])
             logits[i] = -Float16(Inf)
@@ -64,10 +66,10 @@ function cpu_sample(logits::Vector{Float16}, temperature::Float16, top_p::Float1
     inv_s = Float16(1.0) / s
     @inbounds probs .*= inv_s
 
-    # Top-p (Nucleus) — partialsortperm avoids full O(N log N) sort over 150k vocab
+    # Top-p (Nucleus) - partialsortperm avoids full O(N log N) sort over 150k vocab
     if top_p < Float16(1.0)
         n = length(probs)
-        k_max = min(n, 1024)  # top-p usually keeps well under 1024 tokens
+        k_max = min(n, 1024) # top-p usually keeps well under 1024 tokens
         top_indices = partialsortperm(probs, 1:k_max, rev=true)
         cum = Float16(0.0)
         cutoff = k_max
@@ -177,7 +179,7 @@ function mask_and_sample(logits::AbstractVector{Float16}, pad_ids::Vector{Int}, 
 end
 
 function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::String;
-    max_tokens=64, temperature=Float16(0.7), top_p=Float16(0.8), top_k=20, stop_token=nothing)
+    max_tokens=100, temperature=Float16(0.7), top_p=Float16(0.8), top_k=20, stop_token=nothing)
 
     tokens = Tokenizer.encode(tok, prompt)
     if isempty(tokens)
@@ -186,29 +188,32 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
         end
     end
 
-    kv_caches = Vector{Model.KVCache}()  # Initialize empty, populate in try block
+    kv_caches = Vector{Model.KVCache}()
     return Channel{String}(32) do chan
         try
+            # Ensure we're on the correct GPU device
+            devs = collect(oneAPI.devices())
+            if !isempty(devs)
+                first_weight = model.layers[1].mlp.gate_weight
+                weight_device = device(first_weight)
+                oneAPI.device!(weight_device)
+            end
+
             Model.reset_states!(model)
-            # Initialize KV Caches (pos tracked inside cache)
-            kv_caches = [Model.init_kv_cache(model.config)
-                for _ in 1:model.config.num_hidden_layers]
+            kv_caches = [Model.init_kv_cache(model.config) for _ in 1:model.config.num_hidden_layers]
 
-            # Prefill: pass pos=0, the KV caches will accumulate internally
+            # Prefill
             logits = Model.forward!(model, tokens, 0, kv_caches)
-
-            # Update curr_pos after prefill
             curr_pos = length(tokens)
 
-            # Explicitly collect only the last column of logits for sampling
+            # Sample from last position
             logits_vec = vec(collect(logits[:, end]))
-            last_token = mask_and_sample(
-                logits_vec, [tok.eos_id], Float16(temperature), Float16(top_p), top_k)
+            last_token = mask_and_sample(logits_vec, [tok.eos_id], Float16(temperature), Float16(top_p), top_k)
 
             token_str = Tokenizer.decode(tok, [last_token])
             put!(chan, token_str)
 
-            # Decode: each step passes current sequence position
+            # Decode loop
             for step in 1:(max_tokens-1)
                 if last_token == (stop_token === nothing ? tok.eos_id : stop_token)
                     break
@@ -217,59 +222,44 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
                 logits = Model.forward!(model, [last_token], curr_pos, kv_caches)
                 curr_pos += 1
 
-                # Explicitly collect the first column (seq=1)
                 logits_vec = vec(collect(logits[:, 1]))
-                last_token = mask_and_sample(
-                    logits_vec, [tok.eos_id], Float16(temperature), Float16(top_p), top_k)
+                last_token = mask_and_sample(logits_vec, [tok.eos_id], Float16(temperature), Float16(top_p), top_k)
 
                 token_str = Tokenizer.decode(tok, [last_token])
                 put!(chan, token_str)
 
-                # Force GC every few tokens to prevent memory buildup
                 if step % 4 == 0
                     GC.gc(false)
                 end
             end
 
-            # Synchronize after finishing the stream
+            oneAPI.synchronize()
 
         catch e
-            if e isa InterruptException
-                # Interrupt - just close the channel, don't rethrow
-            elseif e isa InvalidStateException
-                # Channel already closed - normal termination
-            else
+            if !(e isa InterruptException) && !(e isa InvalidStateException)
                 @error "ERROR during generation stream" exception = (e, catch_backtrace())
             end
         finally
-            # Ensure KV caches are freed and memory is released
             try
                 if !isempty(kv_caches)
                     Model.free_all_kv_caches!(kv_caches)
                 end
             catch
-                # Ignore cleanup errors
             end
-
-            # Force garbage collection to release VRAM
             try
-                GC.gc(true)  # Full GC to ensure VRAM cleanup
+                GC.gc(true)
             catch
-                # Ignore GC errors
             end
-
-            # Ensure channel is closed even on error
             try
                 close(chan)
             catch
-                # Channel may already be closed
             end
         end
     end
 end
 
 function generate(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::String;
-    max_tokens=64, temperature=Float16(0.7), top_p=Float16(0.8), top_k=20, stop_token=nothing)
+    max_tokens=100, temperature=Float16(0.7), top_p=Float16(0.8), top_k=20, stop_token=nothing)
 
     stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, top_k, stop_token)
     res = String[]
@@ -277,6 +267,16 @@ function generate(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::S
         push!(res, token_str)
     end
     return join(res)
+end
+
+# Stream directly to stdout for interactive use
+function stream_to_stdout(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::String;
+    max_tokens=100, temperature=Float16(0.7), top_p=Float16(0.8), top_k=20)
+    stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, top_k)
+    for token_str in stream
+        print(token_str)
+    end
+    println()
 end
 
 end # module

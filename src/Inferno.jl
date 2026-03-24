@@ -21,7 +21,7 @@ using .Loader
 using .Engine
 using .Server
 
-export load_model, start_server, non_nothing_fields
+export load_model, start_server, non_nothing_fields, stream_to_stdout
 
 """
     non_nothing_fields(obj) -> NamedTuple
@@ -96,6 +96,7 @@ function select_device!(devs, requested_device)
 end
 
 """
+    load_model(path; device=nothing, mmproj=nothing)
 
 Load a GGUF model file and return the constructed model + tokenizer.
 Optional `mmproj` path for multimodal projection weights (auto-discovered if not provided).
@@ -129,16 +130,16 @@ function find_related_file(model_path::String, pattern::String)
 end
 
 function load_model(path::String; device::Union{Int, Nothing}=nothing,
-
-                    mmproj::Union{String, Nothing}=nothing)
+    mmproj::Union{String, Nothing}=nothing)
     model = nothing
     tok = nothing
 
     devs = collect(oneAPI.devices())
+    selected_device_idx = 1
     if isempty(devs)
         @warn "No oneAPI devices found."
     else
-        select_device!(devs, device)
+        selected_device_idx = select_device!(devs, device)
     end
 
     @info "Loading GGUF file" path
@@ -156,40 +157,40 @@ function load_model(path::String; device::Union{Int, Nothing}=nothing,
         file = GGUF.read_gguf(path)
         @info "GGUF file loaded" metadata_keys=length(file.metadata) tensors=length(file.tensors)
 
-    arch_str = get(file.metadata, "general.architecture", "qwen2")
-    arch = Symbol(arch_str)
+        arch_str = get(file.metadata, "general.architecture", "qwen2")
+        arch = Symbol(arch_str)
 
-    config = Model.QwenConfig(
-        architecture=arch,
-        vocab_size=Int(get(file.metadata, "$(arch_str).vocab_size",
-            length(get(file.metadata, "tokenizer.ggml.tokens", [])))),
-        hidden_size=Int(get(file.metadata, "$(arch_str).embedding_length", 1024)),
-        intermediate_size=Int(get(file.metadata, "$(arch_str).feed_forward_length", 3584)),
-        num_hidden_layers=Int(get(file.metadata, "$(arch_str).block_count", 24)),
-        num_attention_heads=Int(get(file.metadata, "$(arch_str).attention.head_count", 8)),
-        num_key_value_heads=Int(get(file.metadata, "$(arch_str).attention.head_count_kv", 2)),
-        head_dim=Int(get(file.metadata, "$(arch_str).attention.key_length", 256)),
-        rms_norm_eps=Float16(get(file.metadata, "$(arch_str).attention.layer_norm_rms_epsilon", 1.0e-6)),
-        rope_theta=Float16(get(file.metadata, "$(arch_str).rope.freq_base", 10000000.0)),
-        max_position_embeddings=min(4096, Int(get(file.metadata, "$(arch_str).context_length", 32768))),
-        full_attention_interval=Int(get(file.metadata, "$(arch_str).full_attention_interval", 4)),
-        ssm_inner_size=Int(get(file.metadata, "$(arch_str).ssm.inner_size", 2048)),
-        ssm_state_size=Int(get(file.metadata, "$(arch_str).ssm.state_size", 128)),
-        ssm_group_count=Int(get(file.metadata, "$(arch_str).ssm.group_count", 16)),
-        ssm_time_step_rank=Int(get(file.metadata, "$(arch_str).ssm.time_step_rank", 16)),
-        ssm_conv_kernel=Int(get(file.metadata, "$(arch_str).ssm.conv_kernel", 4)),
+        config = Model.QwenConfig(
+            architecture=arch,
+            vocab_size=Int(get(file.metadata, "$(arch_str).vocab_size",
+                length(get(file.metadata, "tokenizer.ggml.tokens", [])))),
+            hidden_size=Int(get(file.metadata, "$(arch_str).embedding_length", 1024)),
+            intermediate_size=Int(get(file.metadata, "$(arch_str).feed_forward_length", 3584)),
+            num_hidden_layers=Int(get(file.metadata, "$(arch_str).block_count", 24)),
+            num_attention_heads=Int(get(file.metadata, "$(arch_str).attention.head_count", 8)),
+            num_key_value_heads=Int(get(file.metadata, "$(arch_str).attention.head_count_kv", 2)),
+            head_dim=Int(get(file.metadata, "$(arch_str).attention.key_length", 256)),
+            rms_norm_eps=Float16(get(file.metadata, "$(arch_str).attention.layer_norm_rms_epsilon", 1.0e-6)),
+            rope_theta=Float16(get(file.metadata, "$(arch_str).rope.freq_base", 10000000.0)),
+            max_position_embeddings=min(4096, Int(get(file.metadata, "$(arch_str).context_length", 32768))),
+            full_attention_interval=Int(get(file.metadata, "$(arch_str).full_attention_interval", 4)),
+            ssm_inner_size=Int(get(file.metadata, "$(arch_str).ssm.inner_size", 2048)),
+            ssm_state_size=Int(get(file.metadata, "$(arch_str).ssm.state_size", 128)),
+            ssm_group_count=Int(get(file.metadata, "$(arch_str).ssm.group_count", 16)),
+            ssm_time_step_rank=Int(get(file.metadata, "$(arch_str).ssm.time_step_rank", 16)),
+            ssm_conv_kernel=Int(get(file.metadata, "$(arch_str).ssm.conv_kernel", 4)),
 
-        # MoE
-        num_experts=Int(get(file.metadata, "$(arch_str).expert_count", 0)),
-        num_experts_per_tok=Int(get(file.metadata, "$(arch_str).expert_used_count", 0)),
+            # MoE
+            num_experts=Int(get(file.metadata, "$(arch_str).expert_count", 0)),
+            num_experts_per_tok=Int(get(file.metadata, "$(arch_str).expert_used_count", 0)),
 
-        # MLA
-        q_lora_rank=Int(get(file.metadata, "$(arch_str).attention.q_lora_rank", 0)),
-        kv_lora_rank=Int(get(file.metadata, "$(arch_str).attention.kv_lora_rank", 0)),
-        qk_rope_head_dim=Int(get(file.metadata, "$(arch_str).attention.qk_rope_head_dim", 0)),
-        v_head_dim=Int(get(file.metadata, "$(arch_str).attention.v_head_dim", 0)),
-    )
-    @info "Model config created" hidden=config.hidden_size layers=config.num_hidden_layers heads=config.num_attention_heads
+            # MLA
+            q_lora_rank=Int(get(file.metadata, "$(arch_str).attention.q_lora_rank", 0)),
+            kv_lora_rank=Int(get(file.metadata, "$(arch_str).attention.kv_lora_rank", 0)),
+            qk_rope_head_dim=Int(get(file.metadata, "$(arch_str).attention.qk_rope_head_dim", 0)),
+            v_head_dim=Int(get(file.metadata, "$(arch_str).attention.v_head_dim", 0)),
+        )
+        @info "Model config created" hidden=config.hidden_size layers=config.num_hidden_layers heads=config.num_attention_heads
 
         @info "Initializing GPU tables"
         Model.init_gpu_tables(QuantsData.IQ2XXS_GRID, QuantsData.KSIGNS_IQ2XS, QuantsData.KMASK_IQ2XS)
@@ -239,6 +240,31 @@ Load model and start the HTTP server.
 function main(model_path::String; port::Int=8080, device::Union{Int, Nothing}=nothing, auth_token::Union{String, Nothing}=nothing)
     model, tok = load_model(model_path; device=device)
     Server.start_server(port; model=model, tokenizer=tok, auth_token=auth_token)
+end
+
+"""
+    stream_to_stdout(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::AbstractString; 
+    max_tokens=100, temperature=0.7, top_p=0.8, top_k=20, io=stdout)
+
+Generate text from a prompt and stream tokens to stdout as they are generated.
+Returns the complete generated text as a string.
+"""
+function stream_to_stdout(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::AbstractString;
+    max_tokens=100, temperature=Float16(0.7), top_p=Float16(0.8), top_k=20, io::IO=stdout)
+    
+    stream = Engine.generate_stream(model, tok, prompt;
+        max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k)
+    
+    generated_text = IOBuffer()
+    for token in stream
+        print(io, token)
+        flush(io)
+        print(generated_text, token)
+    end
+    println(io)
+    flush(io)
+    
+    return String(take!(generated_text))
 end
 
 function __init__()

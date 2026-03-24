@@ -56,7 +56,7 @@ StructTypes.StructType(::Type{ChatCompletionResponse}) = StructTypes.Struct()
 
 const MODEL_REF = Ref{Union{QwenModel,Nothing}}(nothing)
 const TOK_REF = Ref{Union{BPETokenizer,Nothing}}(nothing)
-const AUTH_TOKEN_REF = Ref{String}("")
+const AUTH_TOKEN_REF = Ref{Union{String,Nothing}}(nothing)
 
 # ─── Handlers ────────────────────────────────────────────────────────────────
 
@@ -145,7 +145,7 @@ function handle_chat(stream::HTTP.Stream)
             handle_completion(stream, model, tok, prompt, max_tokens, temperature, top_p, top_k, body.model)
         end
     catch e
-        @error "Error in handle_chat" exception = (e, catch_backtrace())
+        @error "Error in handle_chat" exception=(e, catch_backtrace())
         try
             if !HTTP.iswritable(stream)
                 HTTP.setstatus(stream, 500)
@@ -180,7 +180,7 @@ function handle_completion(stream::HTTP.Stream, model, tok, prompt,
         HTTP.setheader(stream, "Content-Type" => "application/json")
         write(stream, JSON3.write(resp))
     catch e
-        @error "Error in handle_completion" exception = (e, catch_backtrace())
+        @error "Error in handle_completion" exception=(e, catch_backtrace())
         try
             if !HTTP.iswritable(stream)
                 HTTP.setstatus(stream, 500)
@@ -232,7 +232,7 @@ function handle_stream(stream::HTTP.Stream, model, tok, prompt,
         write(stream, "data: $(JSON3.write(done_chunk))\n\n")
         write(stream, "data: [DONE]\n\n")
     catch e
-        @error "Error in handle_stream" exception = (e, catch_backtrace())
+        @error "Error in handle_stream" exception=(e, catch_backtrace())
     end
 end
 
