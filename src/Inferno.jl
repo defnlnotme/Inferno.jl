@@ -243,35 +243,69 @@ function main(model_path::String; port::Int=8080, device::Union{Int, Nothing}=no
 end
 
 """
-    stream_to_stdout(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::AbstractString; 
-    max_tokens=100, temperature=0.7, top_p=0.8, top_k=20, presence_penalty=0.0, io=stdout)
+    to_float16(x) -> Float16
+
+Convert any real number to Float16. Handles Float32, Float64, and Int types.
+"""
+to_float16(x::Float16) = x
+to_float16(x::Float32) = Float16(x)
+to_float16(x::Float64) = Float16(x)
+to_float16(x::Integer) = Float16(x)
+to_float16(x::AbstractFloat) = Float16(x)
+
+"""
+    stream_to_stdout(model, tok, prompt; kwargs...)
 
 Generate text from a prompt and stream tokens to stdout as they are generated.
 Returns the complete generated text as a string.
+
+This is a convenience wrapper that automatically converts Float32/Float64/Int 
+parameters to Float16 for compatibility with the GPU inference engine.
 
 # Arguments
 - `model`: The loaded QwenModel
 - `tok`: The BPETokenizer
 - `prompt`: The input prompt string
 - `max_tokens`: Maximum number of tokens to generate (default: 100)
-- `temperature`: Sampling temperature (default: 0.7)
-- `top_p`: Nucleus sampling probability (default: 0.8)
+- `temperature`: Sampling temperature (default: 0.7) - accepts Float16/Float32/Float64
+- `top_p`: Nucleus sampling probability (default: 0.8) - accepts Float16/Float32/Float64
 - `top_k`: Top-k sampling parameter (default: 20)
-- `presence_penalty`: Penalty for repeated tokens - higher values discourage repetition (default: 0.0)
+- `presence_penalty`: Penalty for repeated tokens (default: 0.0) - accepts Float16/Float32/Float64
 - `io`: Output IO stream (default: stdout)
 
 # Presence Penalty
 The presence_penalty parameter helps reduce repetition by penalizing tokens that have 
 already appeared in the output. A value of 0.0 means no penalty, while higher values
 (e.g., 1.0-2.0) more strongly discourage repetition.
+
+# Examples
+```julia
+# Using Float64 (automatically converted)
+result = stream_to_stdout(model, tok, "Hello"; temperature=0.7)
+
+# Using Float32
+result = stream_to_stdout(model, tok, "Hello"; temperature=0.7f0)
+
+# Using Float16 directly
+result = stream_to_stdout(model, tok, "Hello"; temperature=Float16(0.7))
+```
 """
 function stream_to_stdout(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::AbstractString;
-    max_tokens::Int=100, temperature::Float16=Float16(0.7), top_p::Float16=Float16(0.8), 
-    top_k::Int=20, presence_penalty::Float16=Float16(0.0), io::IO=stdout)
+    max_tokens::Int=100,
+    temperature=0.7,
+    top_p=0.8,
+    top_k::Int=20,
+    presence_penalty=0.0,
+    io::IO=stdout)
+    
+    # Convert all float parameters to Float16
+    temp_f16 = to_float16(temperature)
+    top_p_f16 = to_float16(top_p)
+    penalty_f16 = to_float16(presence_penalty)
     
     stream = Engine.generate_stream(model, tok, prompt;
-        max_tokens=max_tokens, temperature=temperature, top_p=top_p, 
-        top_k=top_k, presence_penalty=presence_penalty)
+        max_tokens=max_tokens, temperature=temp_f16, top_p=top_p_f16, 
+        top_k=top_k, presence_penalty=penalty_f16)
     
     generated_text = IOBuffer()
     for token in stream
