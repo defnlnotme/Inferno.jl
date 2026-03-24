@@ -25,77 +25,77 @@ end
 
 # CPU sampling implementation (original code)
 function cpu_sample(logits::Vector{Float16}, temperature::Float16, top_p::Float16, top_k::Int=40)
-    # Sanitize logits - replace NaN and Inf with -Inf so they're never selected
-    @inbounds for i in eachindex(logits)
-        if !isfinite(logits[i])
-            logits[i] = -Float16(Inf)
-        end
-    end
+ # Sanitize logits - replace NaN and Inf with -Inf so they're never selected
+ @inbounds for i in eachindex(logits)
+ if !isfinite(logits[i])
+ logits[i] = -Float16(Inf)
+ end
+ end
 
-    if temperature == Float16(0.0)
-        return argmax(logits)
-    end
+ if temperature == Float16(0.0)
+ return argmax(logits)
+ end
 
-    # Top-k sampling
-    if top_k > 0 && top_k < length(logits)
-        # Get top-k indices
-        top_k_indices = partialsortperm(logits, 1:top_k, rev=true)
+ # Top-k sampling
+ if top_k > 0 && top_k < length(logits)
+ # Get top-k indices
+ top_k_indices = partialsortperm(logits, 1:top_k, rev=true)
 
-        # Create a mask for non-top-k elements
-        for i in eachindex(logits)
-            if i ∉ top_k_indices
-                logits[i] = -Float16(Inf)
-            end
-        end
-    end
+ # Create a mask for non-top-k elements
+ for i in eachindex(logits)
+ if i ∉ top_k_indices
+ logits[i] = -Float16(Inf)
+ end
+ end
+ end
 
-    # Temperature scaling + softmax in one pass (minimise allocations)
-    inv_temp = Float16(1.0) / temperature
-    mx = -Float16(Inf)
-    @inbounds for v in logits
-        scaled = v * inv_temp
-        mx = scaled > mx ? scaled : mx
-    end
-    probs = similar(logits)
-    s = Float16(0.0)
-    @inbounds for i in eachindex(logits)
-        e = exp(logits[i] * inv_temp - mx)
-        probs[i] = e
-        s += e
-    end
-    inv_s = Float16(1.0) / s
-    @inbounds probs .*= inv_s
+ # Temperature scaling + softmax in one pass using Float32 to prevent overflow
+ inv_temp = Float32(1.0) / Float32(temperature)
+ mx = -Float32(Inf)
+ @inbounds for v in logits
+ scaled = Float32(v) * inv_temp
+ mx = scaled > mx ? scaled : mx
+ end
+ probs = similar(logits)
+ s = Float32(0.0)
+ @inbounds for i in eachindex(logits)
+ e = exp(Float32(logits[i]) * inv_temp - mx)
+ probs[i] = Float16(e)
+ s += e
+ end
+ inv_s = Float32(1.0) / s
+ @inbounds probs .*= Float16(inv_s)
 
-    # Top-p (Nucleus) - partialsortperm avoids full O(N log N) sort over 150k vocab
-    if top_p < Float16(1.0)
-        n = length(probs)
-        k_max = min(n, 1024) # top-p usually keeps well under 1024 tokens
-        top_indices = partialsortperm(probs, 1:k_max, rev=true)
-        cum = Float16(0.0)
-        cutoff = k_max
-        for (rank, idx) in enumerate(top_indices)
-            cum += probs[idx]
-            if cum >= top_p
-                cutoff = rank
-                break
-            end
-        end
-        # Re-build probs with only the kept tokens (renormalized)
-        fill!(probs, Float16(0.0))
-        renorm = Float16(0.0)
-        @inbounds for rank in 1:cutoff
-            idx = top_indices[rank]
-            e = exp(logits[idx] * inv_temp - mx)
-            probs[idx] = e
-            renorm += e
-        end
-        inv_renorm = Float16(1.0) / renorm
-        @inbounds for rank in 1:cutoff
-            probs[top_indices[rank]] *= inv_renorm
-        end
-    end
+ # Top-p (Nucleus) - partialsortperm avoids full O(N log N) sort over 150k vocab
+ if top_p < Float16(1.0)
+ n = length(probs)
+ k_max = min(n, 1024) # top-p usually keeps well under 1024 tokens
+ top_indices = partialsortperm(probs, 1:k_max, rev=true)
+ cum = Float16(0.0)
+ cutoff = k_max
+ for (rank, idx) in enumerate(top_indices)
+ cum += probs[idx]
+ if cum >= top_p
+ cutoff = rank
+ break
+ end
+ end
+ # Re-build probs with only the kept tokens (renormalized)
+ fill!(probs, Float16(0.0))
+ renorm = Float32(0.0)
+ @inbounds for rank in 1:cutoff
+ idx = top_indices[rank]
+ e = exp(Float32(logits[idx]) * inv_temp - mx)
+ probs[idx] = Float16(e)
+ renorm += e
+ end
+ inv_renorm = Float32(1.0) / renorm
+ @inbounds for rank in 1:cutoff
+ probs[top_indices[rank]] *= Float16(inv_renorm)
+ end
+ end
 
-    return simple_sample(probs)
+ return simple_sample(probs)
 end
 
 # CPU sampling from already scaled logits
@@ -309,10 +309,23 @@ function stream_to_stdout(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, p
     max_tokens::Int=100, temperature::Float16=Float16(0.7), top_p::Float16=Float16(0.8), 
     top_k::Int=20, presence_penalty::Float16=Float16(0.0))
     stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, top_k, presence_penalty)
-    for token_str in stream
-        print(token_str)
+    try
+        for token_str in stream
+            print(token_str)
+        end
+        println()
+    catch e
+        if e isa InterruptException
+            # Signal the generator to stop
+            try
+                close(stream)
+            catch
+            end
+            println()
+        else
+            rethrow(e)
+        end
     end
-    println()
 end
 
 end # module

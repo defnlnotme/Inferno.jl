@@ -308,15 +308,29 @@ function stream_to_stdout(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, p
         top_k=top_k, presence_penalty=penalty_f16)
     
     generated_text = IOBuffer()
-    for token in stream
-        print(io, token)
+    try
+        for token in stream
+            print(io, token)
+            flush(io)
+            print(generated_text, token)
+        end
+        println(io)
         flush(io)
-        print(generated_text, token)
+        return String(take!(generated_text))
+    catch e
+        if e isa InterruptException
+            # Signal the generator to stop if possible
+            try
+                close(stream)
+            catch
+            end
+            println(io)
+            flush(io)
+            return String(take!(generated_text))
+        else
+            rethrow(e)
+        end
     end
-    println(io)
-    flush(io)
-    
-    return String(take!(generated_text))
 end
 
 function __init__()

@@ -138,37 +138,38 @@ end
 # --- GPU Softmax Kernel ---
 # Stable softmax on a 1D slice of length `len` stored in `scores[1:len, 1]`
 # Writes probabilities back into `probs[1:len, 1]`
+# Uses Float32 for exp() to prevent overflow
 function softmax_kernel!(probs, scores, len, scale)
-    mx = maximum(@view scores[1:len, 1]) * scale
-    s = eltype(probs)(0.0)
-    @inbounds for i in 1:len
-        v = exp(scores[i, 1] * scale - mx)
-        probs[i, 1] = v
-        s += v
-    end
-    inv_s = eltype(probs)(1.0) / s
-    @inbounds for i in 1:len
-        probs[i, 1] *= inv_s
-    end
-    return nothing
+ # Compute max in Float32 for stability
+ mx = Float32(maximum(@view scores[1:len, 1]) * scale)
+ s = Float32(0.0)
+ @inbounds for i in 1:len
+ v = exp(Float32(scores[i, 1] * scale) - mx)
+ probs[i, 1] = v
+ s += v
+ end
+ inv_s = Float32(1.0) / s
+ @inbounds for i in 1:len
+ probs[i, 1] *= inv_s
+ end
+ return nothing
 end
 
 function batched_softmax_kernel!(probs, scores, total_len, n_heads, scale)
-    T = eltype(probs)
-    for h in 1:n_heads
-        mx = maximum(@view scores[1:total_len, h]) * scale
-        s = T(0.0)
-        @inbounds for i in 1:total_len
-            v = exp(scores[i, h] * scale - mx)
-            probs[i, h] = v
-            s += v
-        end
-        inv_s = T(1.0) / s
-        @inbounds for i in 1:total_len
-            probs[i, h] *= inv_s
-        end
-    end
-    return nothing
+ for h in 1:n_heads
+ mx = Float32(maximum(@view scores[1:total_len, h]) * scale)
+ s = Float32(0.0)
+ @inbounds for i in 1:total_len
+ v = exp(Float32(scores[i, h] * scale) - mx)
+ probs[i, h] = v
+ s += v
+ end
+ inv_s = Float32(1.0) / s
+ @inbounds for i in 1:total_len
+ probs[i, h] *= inv_s
+ end
+ end
+ return nothing
 end
 
 # Numerically stable sigmoid using Float32 intermediate computation
@@ -237,14 +238,15 @@ end
 # --- Rotary Embedding (RoPE) ---
 # --- Rotary Embedding (RoPE) ---
 struct RotaryEmbedding
-    dim::Int
-    base::Float16
-    inv_freq::Vector{Float16}
+ dim::Int
+ base::Float32  # Use Float32 for base to prevent precision loss
+ inv_freq::Vector{Float32}  # Use Float32 for more precision
 end
 
-function RotaryEmbedding(dim::Int; base=Float16(10000000.0))
-    inv_freq = Float16(1.0) ./ (Float16(base) .^ (Float16.(range(0, stop=dim - 1, step=2)) ./ Float16(dim)))
-    return RotaryEmbedding(dim, Float16(base), inv_freq)
+function RotaryEmbedding(dim::Int; base=Float32(10000000.0))
+ # Compute inv_freq in Float32 for numerical stability
+ inv_freq = Float32(1.0) ./ (Float32(base) .^ (Float32.(range(0, stop=dim - 1, step=2)) ./ Float32(dim)))
+ return RotaryEmbedding(dim, Float32(base), inv_freq)
 end
 
 function rope_kernel!(x, inv_freq, pos, d, h, seq, d_rope)
@@ -261,8 +263,9 @@ function rope_kernel!(x, inv_freq, pos, d, h, seq, d_rope)
  idx1 = 2 * i - 1
  idx2 = 2 * i
 
- p = T(pos + t - 1)
- freq = T(inv_freq_cpu[i]) * p
+ # Use Float32 for position computation to prevent precision loss
+ p = Float32(pos + t - 1)
+ freq = inv_freq_cpu[i] * p  # inv_freq is Float32
  sin_val, cos_val = sincos(freq)
 
  x1 = x_cpu[idx1, head, t]
@@ -404,21 +407,21 @@ end
 
 # RoPE application function
 const ROPE_CACHE_SIZE = 4096
-const rope_sin_cache = zeros(Float16, ROPE_CACHE_SIZE ÷ 2)
-const rope_cos_cache = zeros(Float16, ROPE_CACHE_SIZE ÷ 2)
+const rope_sin_cache = zeros(Float32, ROPE_CACHE_SIZE ÷ 2)  # Use Float32 for precision
+const rope_cos_cache = zeros(Float32, ROPE_CACHE_SIZE ÷ 2)
 
 function init_rope_caches!(config::QwenConfig)
-    rope_dim = config.head_dim
-    rope_pairs = rope_dim ÷ 2
-    base = config.rope_theta
+ rope_dim = config.head_dim
+ rope_pairs = rope_dim ÷ 2
+ base = Float32(config.rope_theta)  # Use Float32
 
-    for p in 1:rope_pairs
-        freq = Float32(1.0) / (base^(Float32(2 * (p - 1)) / Float32(rope_dim)))
-        for pos in 1:ROPE_CACHE_SIZE
-            rope_sin_cache[(p-1)*ROPE_CACHE_SIZE+pos] = Float16(sin(pos * freq))
-            rope_cos_cache[(p-1)*ROPE_CACHE_SIZE+pos] = Float16(cos(pos * freq))
-        end
-    end
+ for p in 1:rope_pairs
+ freq = Float32(1.0) / (base^(Float32(2 * (p - 1)) / Float32(rope_dim)))
+ for pos in 1:ROPE_CACHE_SIZE
+ rope_sin_cache[(p-1)*ROPE_CACHE_SIZE+pos] = sin(Float32(pos) * freq)
+ rope_cos_cache[(p-1)*ROPE_CACHE_SIZE+pos] = cos(Float32(pos) * freq)
+ end
+ end
 end
 
 function apply_rope!(q::AbstractArray{Float16,2}, k::AbstractArray{Float16,2}, pos::Int, cache::KVCache)
@@ -727,9 +730,10 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
  # 5. KV Cache update
  K_cache, V_cache = update_kv_cache!(cache, k_rope, v_2d, pos)
 
-    # 6. Attention
-    total_len = cache.pos
-    scale = T(1.0) / sqrt(T(hd))
+ # 6. Attention
+ total_len = cache.pos
+ # Use Float32 for scale to prevent precision loss
+ scale = Float32(1.0) / sqrt(Float32(hd))
 
     if seq == 1
         # Decode path
@@ -756,44 +760,46 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
         combined = m.decode_combined
         result = mat_mul!(m.decode_wo_buf, m.wo, combined)
 
-    else
-        # Prefill path
-        q_final = reshape(q_gated, hd, m.n_heads, seq)
-        combined_all = zeros(T, hd * m.n_heads, seq)
+ else
+ # Prefill path
+ q_final = reshape(q_gated, hd, m.n_heads, seq)
+ combined_all = zeros(T, hd * m.n_heads, seq)
 
-        for h in 1:m.n_heads
-            kh = div(h - 1, gqa_ratio) + 1
-            for s in 1:seq
-                q_v = @view q_final[:, h, s]
-                K_v = @view K_cache[:, kh, 1:(pos+s)]
-                V_v = @view V_cache[:, kh, 1:(pos+s)]
+ for h in 1:m.n_heads
+ kh = div(h - 1, gqa_ratio) + 1
+ for s in 1:seq
+ q_v = @view q_final[:, h, s]
+ K_v = @view K_cache[:, kh, 1:(pos+s)]
+ V_v = @view V_cache[:, kh, 1:(pos+s)]
 
-                scores = zeros(T, pos + s)
-                for i in 1:(pos+s)
-                    dot = T(0.0)
-                    for d in 1:hd
-                        dot += K_v[d, i] * q_v[d]
-                    end
-                    scores[i] = dot * scale
-                end
+ # Use Float32 for attention scores to prevent overflow
+ scores = zeros(Float32, pos + s)
+ for i in 1:(pos+s)
+ dot = Float32(0.0)
+ for d in 1:hd
+ dot += Float32(K_v[d, i]) * Float32(q_v[d])
+ end
+ scores[i] = dot * scale
+ end
 
-                mx = maximum(scores)
-                sum_exp = T(0.0)
-                for i in 1:(pos+s)
-                    scores[i] = exp(scores[i] - mx)
-                    sum_exp += scores[i]
-                end
-                scores ./= sum_exp
+ # Stable softmax in Float32
+ mx = maximum(scores)
+ sum_exp = Float32(0.0)
+ for i in 1:(pos+s)
+ scores[i] = exp(scores[i] - mx)
+ sum_exp += scores[i]
+ end
+ scores ./= sum_exp
 
-                for d in 1:hd
-                    val = T(0.0)
-                    for i in 1:(pos+s)
-                        val += V_v[d, i] * scores[i]
-                    end
-                    combined_all[(h-1)*hd+d, s] = val
-                end
-            end
-        end
+ for d in 1:hd
+ val = T(0.0)
+ for i in 1:(pos+s)
+ val += V_v[d, i] * T(scores[i])
+ end
+ combined_all[(h-1)*hd+d, s] = val
+ end
+ end
+ end
  combined = oneArray(combined_all)
  result = mat_mul(m.wo, combined)
  end
@@ -850,47 +856,45 @@ end
 
 # --- Gated Delta Net (SSM Layer) ---
 # Reference: qwen35.cpp build_layer_attn_linear
-# CPU Float32 fallback for numerical stability
-const _SSM_CPU_FALLBACK_LAYERS = Ref{Vector{Int}}(Int[])
-_ssm_cpu_fallback_layers() = _SSM_CPU_FALLBACK_LAYERS[]
+# Uses Float32 for all internal computations for numerical stability
 
 struct GatedDeltaNet
-    index::Int  # Layer index for warning messages
+ index::Int # Layer index
 
-    # Weights
-    in_proj::Union{oneMatrix{Float16},QuantMatrix}     # wqkv: (hidden, 6144)
-    gate_proj::Union{oneMatrix{Float16},QuantMatrix}   # wqkv_gate: (hidden, d_inner=2048)
-    ssm_out::Union{oneMatrix{Float16},QuantMatrix}     # (d_inner, hidden)
-    ssm_conv1d_weight::oneMatrix{Float16}               # (conv_kernel, conv_channels)
-    ssm_conv1d_weight_cpu::Matrix{Float32}              # CPU copy for fast access
-    ssm_alpha_weight::oneMatrix{Float16}                # (hidden, num_v_heads)
-    ssm_beta_weight::oneMatrix{Float16}                 # (hidden, num_v_heads)
-    ssm_alpha_weight_cpu::Matrix{Float32}               # CPU copy
-    ssm_beta_weight_cpu::Matrix{Float32}                # CPU copy
-    ssm_a::oneVector{Float16}                           # (num_v_heads,)
-    ssm_a_cpu::Vector{Float32}                          # CPU copy
-    ssm_dt_bias::oneVector{Float16}                     # (num_v_heads,)
-    ssm_dt_bias_cpu::Vector{Float32}                    # CPU copy
-    ssm_norm::RMSNorm
+ # Weights
+ in_proj::Union{oneMatrix{Float16},QuantMatrix} # wqkv: (hidden, 6144)
+ gate_proj::Union{oneMatrix{Float16},QuantMatrix} # wqkv_gate: (hidden, d_inner=2048)
+ ssm_out::Union{oneMatrix{Float16},QuantMatrix} # (d_inner, hidden)
+ ssm_conv1d_weight::oneMatrix{Float16} # (conv_kernel, conv_channels)
+ ssm_conv1d_weight_cpu::Matrix{Float32} # CPU copy for fast access
+ ssm_alpha_weight::oneMatrix{Float16} # (hidden, num_v_heads)
+ ssm_beta_weight::oneMatrix{Float16} # (hidden, num_v_heads)
+ ssm_alpha_weight_cpu::Matrix{Float32} # CPU copy
+ ssm_beta_weight_cpu::Matrix{Float32} # CPU copy
+ ssm_a::oneVector{Float16} # (num_v_heads,)
+ ssm_a_cpu::Vector{Float32} # CPU copy
+ ssm_dt_bias::oneVector{Float16} # (num_v_heads,)
+ ssm_dt_bias_cpu::Vector{Float32} # CPU copy
+ ssm_norm::RMSNorm
 
-    # Dimensions
-    num_v_heads::Int    # = 16 (ssm_time_step_rank)
-    num_k_heads::Int    # = 16 (ssm_group_count)
-    head_k_dim::Int     # = 128 (ssm_state_size)
-    head_v_dim::Int     # = 128 (d_inner / num_v_heads)
-    d_inner::Int        # = 2048
-    conv_channels::Int  # = 3 * d_inner = 6144
-    conv_kernel::Int    # = 4
+ # Dimensions
+ num_v_heads::Int # = 16 (ssm_time_step_rank)
+ num_k_heads::Int # = 16 (ssm_group_count)
+ head_k_dim::Int # = 128 (ssm_state_size)
+ head_v_dim::Int # = 128 (d_inner / num_v_heads)
+ d_inner::Int # = 2048
+ conv_channels::Int # = 3 * d_inner = 6144
+ conv_kernel::Int # = 4
 
-    # CPU state buffers (Float32 for numerical stability)
-    conv_state::Matrix{Float32}       # (conv_channels, conv_kernel) - ring buffer
-    h::Array{Float32,3}              # (head_v_dim, head_k_dim, num_v_heads) - SSM state
+ # CPU state buffers (Float32 for numerical stability)
+ conv_state::Matrix{Float32} # (conv_channels, conv_kernel) - ring buffer
+ h::Array{Float32,3} # (head_v_dim, head_k_dim, num_v_heads) - SSM state
 
-    # Scratchpad buffers (2D column matrices for GPU matmul compatibility)
-    qkv_proj::oneMatrix{Float16} # (conv_channels, 1)
-    z_buf::oneMatrix{Float16} # (d_inner, 1)
-    x_conv::oneMatrix{Float16} # (conv_channels, 1)
-    y_all::oneMatrix{Float16} # (d_inner, 1)
+ # Scratchpad buffers (2D column matrices for GPU matmul compatibility)
+ qkv_proj::oneMatrix{Float16} # (conv_channels, 1)
+ z_buf::oneMatrix{Float16} # (d_inner, 1)
+ x_conv::oneMatrix{Float16} # (conv_channels, 1)
+ y_all::oneMatrix{Float16} # (d_inner, 1)
  branch_out::oneMatrix{Float16} # (d_inner, 1)
 
  # CPU scratchpads
@@ -1081,99 +1085,6 @@ function (m::GatedDeltaNet)(x::AbstractArray{Float16,2}, pos::Int, rope::RotaryE
  # 10. Output projection (ssm_out is (hidden, d_inner) after get_weight transpose)
  copyto!(m.branch_out, reshape(Float16.(m.y_all_cpu), :, 1))
  result = mat_mul(m.ssm_out, m.branch_out)
-
- # Synchronize GPU before checking stability
- oneAPI.synchronize()
-
- # 11. CPU Float32 fallback for numerical stability
- branch_out_cpu = Float32.(Array(result))
- branch_out_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
-
- # Only trigger fallback for NaN/Inf, not for high RMS
- if !all(isfinite, branch_out_cpu)
-        # Fallback to pure CPU Float32 computation
-        eps = Float32(m.ssm_norm.eps)
-
-        # Recompute on CPU with full Float32 precision
-        qkv_w = Float32.(Array(m.in_proj))
-        gate_w = Float32.(Array(m.gate_proj))
-        qkv_proj = qkv_w * m.x_norm_cpu32
-        z_buf_cpu = gate_w * m.x_norm_cpu32
-
-        # Update conv state
-        if m.conv_kernel > 1
-            m.conv_state[:, 1:(m.conv_kernel-1)] .= m.conv_state[:, 2:m.conv_kernel]
-        end
-        m.conv_state[:, m.conv_kernel] .= qkv_proj
-
-        # Convolution
-        x_conv_cpu = zeros(Float32, m.conv_channels)
-        for k in 1:m.conv_kernel
-            @inbounds for c in 1:m.conv_channels
-                x_conv_cpu[c] += m.conv_state[k, c] * m.ssm_conv1d_weight_cpu[k, c]
-            end
-        end
-        @. x_conv_cpu = x_conv_cpu * (Float32(1.0) / (Float32(1.0) + exp(-x_conv_cpu)))
-
-        # Split and process
-        q_all_cpu = reshape(x_conv_cpu[1:qk_size], m.head_k_dim, m.num_k_heads)
-        k_all_cpu = reshape(x_conv_cpu[qk_size+1:2*qk_size], m.head_k_dim, m.num_k_heads)
-        v_all_cpu = reshape(x_conv_cpu[2*qk_size+1:2*qk_size+m.d_inner], m.head_v_dim, m.num_k_heads)
-
-        y_all_fallback = zeros(Float32, m.d_inner)
-        for g in 1:m.num_k_heads
-            qg = view(q_all_cpu, :, g)
-            kg = view(k_all_cpu, :, g)
-            vg = view(v_all_cpu, :, g)
-
-            qn = sqrt(sum(v -> Float32(v)^2, qg) + eps)
-            kn = sqrt(sum(v -> Float32(v)^2, kg) + eps)
-            qn_buf = Float32.(qg) ./ qn
-            kn_buf = Float32.(kg) ./ kn
-
-            dg = Float32(exp(log(Float64(1.0) + exp(Float64(m.alpha_proj[g]) + Float64(m.ssm_dt_bias_cpu[g]))) * Float64(m.ssm_a_cpu[g])))
-            bg = Float32(1.0 / (1.0 + exp(-Float64(m.beta_proj[g]))))
-
-            state = view(m.h, :, :, g)
-            state .*= dg
-            sk = state * kn_buf
-            @inbounds for i in eachindex(sk)
-                sk[i] = bg * (Float32(vg[i]) - sk[i])
-            end
-            BLAS.ger!(Float32(1.0), sk, kn_buf, state)
-
-            yg = view(y_all_fallback, (g-1)*m.head_v_dim+1:g*m.head_v_dim)
-            tmp = state * qn_buf
-            @inbounds for i in eachindex(tmp)
-                yg[i] = tmp[i]
-            end
-        end
-
-        # SSM norm
-        y_reshaped = reshape(y_all_fallback, m.head_v_dim, m.num_k_heads)
-        ssm_norm_w = Float32.(Array(m.ssm_norm.weight))
-        for g in 1:m.num_k_heads
-            v = view(y_reshaped, :, g)
-            sc = Float32(1.0) / sqrt(sum(v -> Float32(v)^2, v) / m.head_v_dim + eps)
-            @inbounds for i in 1:m.head_v_dim
-                v[i] *= sc * ssm_norm_w[i]
-            end
-        end
-
- # Gate and output
- @. z_buf_cpu = z_buf_cpu * (Float32(1.0) / (Float32(1.0) + exp(-z_buf_cpu)))
- y_reshaped .*= reshape(z_buf_cpu, m.head_v_dim, m.num_k_heads)
- ssm_out_w = Float32.(Array(m.ssm_out))
- branch_out_cpu = ssm_out_w * vec(y_reshaped)
-
- # Create result array with correct size (hidden_size, 1)
- result = oneArray(reshape(Float16.(branch_out_cpu), :, 1))
-
- if m.index ∉ _ssm_cpu_fallback_layers()
- push!(_ssm_cpu_fallback_layers(), m.index)
- @warn "Falling back to CPU Float32 SSM for unstable layer" layer = m.index gpu_rms = branch_out_rms cpu_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
- end
- end
 
  return result
 end
