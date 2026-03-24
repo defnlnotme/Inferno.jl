@@ -171,33 +171,61 @@ function batched_softmax_kernel!(probs, scores, total_len, n_heads, scale)
     return nothing
 end
 
+# Numerically stable sigmoid using Float32 intermediate computation
+# Float16 exp() overflows/underflows for |x| > 6.5
 function sigmoid_kernel!(out, x, N)
-    for i in 1:N
-        out[i] = Float16(1.0) / (Float16(1.0) + exp(-x[i]))
-    end
-    return nothing
+ for i in 1:N
+ # Use Float32 for exp() to avoid overflow/underflow
+ x_f32 = Float32(x[i])
+ sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-x_f32))
+ out[i] = Float16(sigmoid_f32)
+ end
+ return nothing
 end
 
+# Numerically stable softplus using Float32 intermediate computation
 function softplus_kernel!(out, x, bias, N)
-    for i in 1:N
-        out[i] = log(Float16(1.0) + exp(x[i] + bias[i]))
-    end
-    return nothing
+ for i in 1:N
+ # Use Float32 for exp() to avoid overflow/underflow
+ x_f32 = Float32(x[i] + bias[i])
+ # Use softplus identity: log(1 + exp(x)) ≈ max(x, 0) + log(1 + exp(-|x|))
+ # This is numerically stable for all x
+ if x_f32 > 20.0f0
+ # For large x, log(1 + exp(x)) ≈ x
+ softplus_f32 = x_f32
+ elseif x_f32 < -20.0f0
+ # For large negative x, log(1 + exp(x)) ≈ 0
+ softplus_f32 = 0.0f0
+ else
+ softplus_f32 = log(1.0f0 + exp(x_f32))
+ end
+ out[i] = Float16(softplus_f32)
+ end
+ return nothing
 end
 
+# Numerically stable SiLU (Swish) using Float32 intermediate computation
+# SiLU(x) = x * sigmoid(x)
 function silu_kernel!(out, x, N)
-    for i in 1:N
-        out[i] = x[i] * (Float16(1.0) / (Float16(1.0) + exp(-x[i])))
-    end
-    return nothing
+ for i in 1:N
+ x_f32 = Float32(x[i])
+ sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-x_f32))
+ silu_f32 = x_f32 * sigmoid_f32
+ out[i] = Float16(silu_f32)
+ end
+ return nothing
 end
 
+# Numerically stable SiLU gating with Float32 intermediate computation
+# SiLU_gating(z, normed) = z * sigmoid(z) * normed
 function silu_gating_kernel!(out, z, normed, N)
-    for i in 1:N
-        val = z[i]
-        out[i] = val * (Float16(1.0) / (Float16(1.0) + exp(-val))) * normed[i]
-    end
-    return nothing
+ for i in 1:N
+ z_f32 = Float32(z[i])
+ sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-z_f32))
+ silu_f32 = z_f32 * sigmoid_f32 * Float32(normed[i])
+ out[i] = Float16(silu_f32)
+ end
+ return nothing
 end
 
 # --- SiLU ---
@@ -419,87 +447,47 @@ function apply_rope!(q::AbstractArray{Float16,2}, k::AbstractArray{Float16,2}, p
 end
 
 # --- MLP ---
-# CPU fallback for numerical stability
-const _MLP_CPU_WARNED_LAYERS = Ref{Vector{Int}}(Int[])
-_mlp_cpu_warned_layers() = _MLP_CPU_WARNED_LAYERS[]
-const _MLP_CPU_CACHE = Dict{Int,NamedTuple}()
-_mlp_cpu_cache() = _MLP_CPU_CACHE
 
 struct MLP
-    index::Int  # Layer index for warning messages
-    gate_weight::Union{oneMatrix{Float16},QuantMatrix}
-    up_weight::Union{oneMatrix{Float16},QuantMatrix}
-    down_weight::Union{oneMatrix{Float16},QuantMatrix}
-    # CPU copies for fallback
-    gate_weight_cpu::Matrix{Float32}
-    up_weight_cpu::Matrix{Float32}
-    down_weight_cpu::Matrix{Float32}
+ index::Int # Layer index
+ gate_weight::Union{oneMatrix{Float16},QuantMatrix}
+ up_weight::Union{oneMatrix{Float16},QuantMatrix}
+ down_weight::Union{oneMatrix{Float16},QuantMatrix}
 end
 
 function MLP(index::Int, gate_weight, up_weight, down_weight)
-    gate_weight_cpu = Array(Float32.(gate_weight))
-    up_weight_cpu = Array(Float32.(up_weight))
-    down_weight_cpu = Array(Float32.(down_weight))
-    return MLP(index, gate_weight, up_weight, down_weight, gate_weight_cpu, up_weight_cpu, down_weight_cpu)
+ return MLP(index, gate_weight, up_weight, down_weight)
 end
 
 function (m::MLP)(x::oneMatrix{Float16}, cache::KVCache)
- T = Float16
-
- # GPU path
+ # GPU path - use numerically stable SiLU with Float32 intermediate
  mul!(cache.mlp_gate, m.gate_weight, x)
  mul!(cache.mlp_up, m.up_weight, x)
- @. cache.mlp_gate = cache.mlp_gate * (T(1.0) / (T(1.0) + exp(-cache.mlp_gate)))
- cache.mlp_gate .*= cache.mlp_up
+ 
+ # Numerically stable SiLU: gate * sigmoid(gate)
+ # Use Float32 for exp() to avoid overflow/underflow
+ gate_cpu = Array(cache.mlp_gate)
+ up_cpu = Array(cache.mlp_up)
+ 
+ # Apply SiLU in Float32 for numerical stability
+ @. gate_cpu = gate_cpu * (Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_cpu))))
+ gate_cpu .*= up_cpu
+ 
+ # Copy back to GPU
+ copyto!(cache.mlp_gate, Float16.(gate_cpu))
  mul!(cache.branch_out, m.down_weight, cache.mlp_gate)
 
- result = cache.branch_out
-
- # Synchronize GPU before checking stability
- oneAPI.synchronize()
-
- # CPU Float32 fallback for numerical stability
- branch_out_cpu = Float32.(Array(result))
- branch_out_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
-
- # Only trigger fallback for NaN/Inf, not for high RMS
- # High RMS is normal for some layers in quantized models
- if !all(isfinite, branch_out_cpu)
- # Get or create CPU weights cache
- weights = get!(_mlp_cpu_cache(), m.index) do
- (
- gate=Float32.(Array(m.gate_weight)),
- up=Float32.(Array(m.up_weight)),
- down=Float32.(Array(m.down_weight)),
- )
- end
-
- x_norm_cpu = Float32.(Array(x))
- gate_cpu = weights.gate * x_norm_cpu
- up_cpu = weights.up * x_norm_cpu
- @. gate_cpu = gate_cpu * (Float32(1.0) / (Float32(1.0) + exp(-gate_cpu)))
- gate_cpu .*= up_cpu
- branch_out_cpu = weights.down * gate_cpu
-
- copyto!(cache.branch_out, reshape(Float16.(branch_out_cpu), :, 1))
- result = cache.branch_out # Update result to use CPU fallback
-
- if m.index ∉ _mlp_cpu_warned_layers()
- push!(_mlp_cpu_warned_layers(), m.index)
- @warn "Falling back to CPU Float32 MLP for unstable layer" layer = m.index gpu_rms = branch_out_rms cpu_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
- end
- end
-
- return result
+ return cache.branch_out
 end
 
 function (m::MLP)(x::oneMatrix{Float16})
-    # Fallback for backward compatibility (no cache available)
-    g = mat_mul(m.gate_weight, x)
-    u = mat_mul(m.up_weight, x)
-    @. g = g * (Float16(1.0) / (Float16(1.0) + exp(-g)))
-    g .*= u
-    return mat_mul(m.down_weight, g)
+ # Numerically stable SiLU using Float32 intermediate
+ g = Array(mat_mul(m.gate_weight, x))
+ u = Array(mat_mul(m.up_weight, x))
+ # SiLU: g * sigmoid(g) in Float32
+ @. g = g * (Float32(1.0) / (Float32(1.0) + exp(-Float32(g))))
+ g .*= u
+ return mat_mul(m.down_weight, oneArray(Float16.(g)))
 end
 
 function reset_states!(m::MLP)
@@ -508,151 +496,90 @@ function reset_states!(m::MLP)
 end
 
 # --- MoE (Mixture of Experts) ---
-# CPU fallback for numerical stability
-const _MOE_CPU_WARNED_LAYERS = Ref{Vector{Int}}(Int[])
-_moe_cpu_warned_layers() = _MOE_CPU_WARNED_LAYERS[]
-const _MOE_CPU_CACHE = Dict{Int,NamedTuple}()
-_moe_cpu_cache() = _MOE_CPU_CACHE
 
 struct MoE
-    index::Int  # Layer index for warning messages
-    gate::Union{oneMatrix{Float16},QuantMatrix}
-    experts_gate::Vector{Union{oneMatrix{Float16},QuantMatrix}}
-    experts_up::Vector{Union{oneMatrix{Float16},QuantMatrix}}
-    experts_down::Vector{Union{oneMatrix{Float16},QuantMatrix}}
-    num_experts::Int
-    num_experts_per_tok::Int
-    # CPU copies for fallback
-    gate_cpu::Matrix{Float32}
-    experts_gate_cpu::Vector{Matrix{Float32}}
-    experts_up_cpu::Vector{Matrix{Float32}}
-    experts_down_cpu::Vector{Matrix{Float32}}
+ index::Int # Layer index
+ gate::Union{oneMatrix{Float16},QuantMatrix}
+ experts_gate::Vector{Union{oneMatrix{Float16},QuantMatrix}}
+ experts_up::Vector{Union{oneMatrix{Float16},QuantMatrix}}
+ experts_down::Vector{Union{oneMatrix{Float16},QuantMatrix}}
+ num_experts::Int
+ num_experts_per_tok::Int
 end
 
 function MoE(index::Int, gate, experts_gate, experts_up, experts_down, num_experts, num_experts_per_tok)
-    gate_cpu = Array(Float32.(gate))
-    experts_gate_cpu = [Array(Float32.(w)) for w in experts_gate]
-    experts_up_cpu = [Array(Float32.(w)) for w in experts_up]
-    experts_down_cpu = [Array(Float32.(w)) for w in experts_down]
-    return MoE(index, gate, experts_gate, experts_up, experts_down, num_experts, num_experts_per_tok,
-        gate_cpu, experts_gate_cpu, experts_up_cpu, experts_down_cpu)
+ return MoE(index, gate, experts_gate, experts_up, experts_down, num_experts, num_experts_per_tok)
 end
 
 function (m::MoE)(x::oneMatrix{Float16}, cache::KVCache)
-    # x: (hidden_size, seq_len)
-    hidden_size, seq_len = size(x)
-    T = Float16
+ # x: (hidden_size, seq_len)
+ hidden_size, seq_len = size(x)
 
-    # GPU path
-    gate_logits = mat_mul(m.gate, x)
-    gate_logits_cpu = collect(gate_logits)
+ # GPU path
+ gate_logits = mat_mul(m.gate, x)
+ gate_logits_cpu = collect(gate_logits)
 
-    output = cache.branch_out
-    fill!(output, Float16(0.0))
+ output = cache.branch_out
+ fill!(output, Float16(0.0))
 
-    for t in 1:seq_len
-        logits = gate_logits_cpu[:, t]
-        exp_logits = exp.(logits .- maximum(logits))
-        probs = exp_logits ./ sum(exp_logits)
+ for t in 1:seq_len
+ logits = gate_logits_cpu[:, t]
+ exp_logits = exp.(logits .- maximum(logits))
+ probs = exp_logits ./ sum(exp_logits)
 
-        top_k_indices = sortperm(probs, rev=true)[1:m.num_experts_per_tok]
-        top_k_probs = probs[top_k_indices]
-        top_k_probs ./= sum(top_k_probs)
+ top_k_indices = sortperm(probs, rev=true)[1:m.num_experts_per_tok]
+ top_k_probs = probs[top_k_indices]
+ top_k_probs ./= sum(top_k_probs)
 
-        xt = @view x[:, t:t]
+ xt = @view x[:, t:t]
 
-        for (i, expert_idx) in enumerate(top_k_indices)
-            g = mat_mul(m.experts_gate[expert_idx], xt)
-            u = mat_mul(m.experts_up[expert_idx], xt)
-            @. g = g * (T(1.0) / (T(1.0) + exp(-g)))
-            g .*= u
-            res = mat_mul(m.experts_down[expert_idx], g)
+ for (i, expert_idx) in enumerate(top_k_indices)
+ g = Array(mat_mul(m.experts_gate[expert_idx], xt))
+ u = Array(mat_mul(m.experts_up[expert_idx], xt))
+ # Numerically stable SiLU in Float32
+ @. g = g * (Float32(1.0) / (Float32(1.0) + exp(-Float32(g))))
+ g .*= u
+ res = mat_mul(m.experts_down[expert_idx], oneArray(Float16.(g)))
 
-            prob = top_k_probs[i]
-            out_view = @view output[:, t:t]
-            @. out_view += prob * res
-        end
-    end
+ prob = top_k_probs[i]
+ out_view = @view output[:, t:t]
+ @. out_view += prob * res
+ end
+ end
 
-    result = copy(output)
-
-    # CPU Float32 fallback for numerical stability
-    result_cpu = Float32.(Array(result))
-    result_rms = sqrt(sum(abs2, result_cpu) / length(result_cpu))
-
-    if !all(isfinite, result_cpu) || result_rms > Float32(4.0)
-        # Get or create CPU weights cache
-        weights = get!(_moe_cpu_cache(), m.index) do
-            (
-                gate=Float32.(Array(m.gate)),
-                experts_gate=[Float32.(Array(w)) for w in m.experts_gate],
-                experts_up=[Float32.(Array(w)) for w in m.experts_up],
-                experts_down=[Float32.(Array(w)) for w in m.experts_down],
-            )
-        end
-
-        x_cpu = Float32.(Array(x))
-        output_cpu = zeros(Float32, hidden_size, seq_len)
-
-        for t in 1:seq_len
-            logits = weights.gate * x_cpu[:, t]
-            exp_logits = exp.(logits .- maximum(logits))
-            probs = exp_logits ./ sum(exp_logits)
-
-            top_k_indices = sortperm(probs, rev=true)[1:m.num_experts_per_tok]
-            top_k_probs = probs[top_k_indices]
-            top_k_probs ./= sum(top_k_probs)
-
-            for (i, expert_idx) in enumerate(top_k_indices)
-                g = weights.experts_gate[expert_idx] * x_cpu[:, t]
-                u = weights.experts_up[expert_idx] * x_cpu[:, t]
-                @. g = g * (Float32(1.0) / (Float32(1.0) + exp(-g)))
-                g .*= u
-                res = weights.experts_down[expert_idx] * g
-                output_cpu[:, t] .+= top_k_probs[i] * res
-            end
-        end
-
-        copyto!(output, Float16.(output_cpu))
-
- if m.index ∉ _moe_cpu_warned_layers()
- push!(_moe_cpu_warned_layers(), m.index)
-            @warn "Falling back to CPU Float32 MoE for unstable layer" layer = m.index gpu_rms = result_rms cpu_rms = sqrt(sum(abs2, output_cpu) / length(output_cpu))
-        end
-    end
-
-    return result
+ return output
 end
 
 function (m::MoE)(x::oneMatrix{Float16})
-    # Fallback for backward compatibility (no cache available)
-    hidden_size, seq_len = size(x)
-    gate_logits = mat_mul(m.gate, x)
-    gate_logits_cpu = collect(gate_logits)
-    output = oneArray(zeros(Float16, hidden_size, seq_len))
+ # Numerically stable MoE using Float32 intermediate for SiLU
+ hidden_size, seq_len = size(x)
+ gate_logits = mat_mul(m.gate, x)
+ gate_logits_cpu = collect(gate_logits)
+ output = oneArray(zeros(Float16, hidden_size, seq_len))
 
-    for t in 1:seq_len
-        logits = gate_logits_cpu[:, t]
-        exp_logits = exp.(logits .- maximum(logits))
-        probs = exp_logits ./ sum(exp_logits)
-        top_k_indices = sortperm(probs, rev=true)[1:m.num_experts_per_tok]
-        top_k_probs = probs[top_k_indices]
-        top_k_probs ./= sum(top_k_probs)
+ for t in 1:seq_len
+ logits = gate_logits_cpu[:, t]
+ exp_logits = exp.(logits .- maximum(logits))
+ probs = exp_logits ./ sum(exp_logits)
+ top_k_indices = sortperm(probs, rev=true)[1:m.num_experts_per_tok]
+ top_k_probs = probs[top_k_indices]
+ top_k_probs ./= sum(top_k_probs)
 
-        xt = @view x[:, t:t]
-        for (i, expert_idx) in enumerate(top_k_indices)
-            g = mat_mul(m.experts_gate[expert_idx], xt)
-            u = mat_mul(m.experts_up[expert_idx], xt)
-            @. g = g * (Float16(1.0) / (Float16(1.0) + exp(-g)))
-            g .*= u
-            res = mat_mul(m.experts_down[expert_idx], g)
-            prob = top_k_probs[i]
-            out_view = @view output[:, t:t]
-            @. out_view += prob * res
-        end
-    end
+ xt = @view x[:, t:t]
+ for (i, expert_idx) in enumerate(top_k_indices)
+ g = Array(mat_mul(m.experts_gate[expert_idx], xt))
+ u = Array(mat_mul(m.experts_up[expert_idx], xt))
+ # Numerically stable SiLU in Float32
+ @. g = g * (Float32(1.0) / (Float32(1.0) + exp(-Float32(g))))
+ g .*= u
+ res = mat_mul(m.experts_down[expert_idx], oneArray(Float16.(g)))
+ prob = top_k_probs[i]
+ out_view = @view output[:, t:t]
+ @. out_view += prob * res
+ end
+ end
 
-    return output
+ return output
 end
 
 function reset_states!(m::MoE)
@@ -662,75 +589,55 @@ end
 
 # --- Full Attention Layer ---
 # Supports Qwen (gated Q), Llama (standard), Phi3 (packed QKV)
-# CPU Float32 fallback for numerical stability
-const _ATTN_CPU_FALLBACK_LAYERS = Ref{Vector{Int}}(Int[])
-_attn_cpu_fallback_layers() = _ATTN_CPU_FALLBACK_LAYERS[]
 
 struct FullAttention
-    index::Int  # Layer index for warning messages
-    architecture::Symbol
-    wq::Union{oneMatrix{Float16},QuantMatrix,Nothing}
-    wk::Union{oneMatrix{Float16},QuantMatrix,Nothing}
-    wv::Union{oneMatrix{Float16},QuantMatrix,Nothing}
-    wqkv::Union{oneMatrix{Float16},QuantMatrix,Nothing} # For Phi3
-    wo::Union{oneMatrix{Float16},QuantMatrix}
-    q_norm::Union{RMSNorm,Nothing}
-    k_norm::Union{RMSNorm,Nothing}
-    n_heads::Int
-    n_kv::Int
-    head_dim::Int
+ index::Int # Layer index
+ architecture::Symbol
+ wq::Union{oneMatrix{Float16},QuantMatrix,Nothing}
+ wk::Union{oneMatrix{Float16},QuantMatrix,Nothing}
+ wv::Union{oneMatrix{Float16},QuantMatrix,Nothing}
+ wqkv::Union{oneMatrix{Float16},QuantMatrix,Nothing} # For Phi3
+ wo::Union{oneMatrix{Float16},QuantMatrix}
+ q_norm::Union{RMSNorm,Nothing}
+ k_norm::Union{RMSNorm,Nothing}
+ n_heads::Int
+ n_kv::Int
+ head_dim::Int
 
-    # CPU copies of weights for fallback
-    wq_cpu::Union{Matrix{Float32},Nothing}
-    wk_cpu::Union{Matrix{Float32},Nothing}
-    wv_cpu::Union{Matrix{Float32},Nothing}
-    wo_cpu::Matrix{Float32}
-    q_norm_w_cpu::Union{Vector{Float32},Nothing}
-    k_norm_w_cpu::Union{Vector{Float32},Nothing}
-
-    # Pre-allocated GPU buffers
-    decode_q_full::oneMatrix{Float16}
-    decode_k::oneMatrix{Float16}
-    decode_v::oneMatrix{Float16}
-    decode_combined::oneMatrix{Float16}
-    decode_scores::oneMatrix{Float16}
-    decode_pb::oneMatrix{Float16}
-    decode_out_h::oneMatrix{Float16}
-    decode_wo_buf::oneMatrix{Float16}
-    # GPU buffers for prefill (dynamically sized)
-    prefill_scores::oneMatrix{Float16}
-    prefill_pb::oneMatrix{Float16}
+ # Pre-allocated GPU buffers
+ decode_q_full::oneMatrix{Float16}
+ decode_k::oneMatrix{Float16}
+ decode_v::oneMatrix{Float16}
+ decode_combined::oneMatrix{Float16}
+ decode_scores::oneMatrix{Float16}
+ decode_pb::oneMatrix{Float16}
+ decode_out_h::oneMatrix{Float16}
+ decode_wo_buf::oneMatrix{Float16}
+ # GPU buffers for prefill (dynamically sized)
+ prefill_scores::oneMatrix{Float16}
+ prefill_pb::oneMatrix{Float16}
 end
 
 function FullAttention(index::Int, arch, wq, wk, wv, wqkv, wo, q_norm, k_norm, n_heads, n_kv, hd, config::QwenConfig)
-    q_size = (arch == :qwen || arch == :qwen2 || arch == :qwen2_5 || arch == :qwen35) ? hd * 2 * n_heads : hd * n_heads
-    decode_q_full = oneArray(zeros(Float16, q_size, 1))
-    decode_k = oneArray(zeros(Float16, hd * n_kv, 1))
-    decode_v = oneArray(zeros(Float16, hd * n_kv, 1))
-    decode_combined = oneArray(zeros(Float16, hd * n_heads, 1))
+ q_size = (arch == :qwen || arch == :qwen2 || arch == :qwen2_5 || arch == :qwen35) ? hd * 2 * n_heads : hd * n_heads
+ decode_q_full = oneArray(zeros(Float16, q_size, 1))
+ decode_k = oneArray(zeros(Float16, hd * n_kv, 1))
+ decode_v = oneArray(zeros(Float16, hd * n_kv, 1))
+ decode_combined = oneArray(zeros(Float16, hd * n_heads, 1))
 
-    # Fixed buffer sizes - sufficient for 4096 context
-    max_len = 4096
-    decode_scores = oneArray(zeros(Float16, max_len, 1))
-    decode_pb = oneArray(zeros(Float16, max_len, 1))
-    decode_out_h = oneArray(zeros(Float16, hd, 1))
-    wo_out_size = size(wo, 1)
-    decode_wo_buf = oneArray(zeros(Float16, wo_out_size, 1))
+ # Fixed buffer sizes - sufficient for 4096 context
+ max_len = 4096
+ decode_scores = oneArray(zeros(Float16, max_len, 1))
+ decode_pb = oneArray(zeros(Float16, max_len, 1))
+ decode_out_h = oneArray(zeros(Float16, hd, 1))
+ wo_out_size = size(wo, 1)
+ decode_wo_buf = oneArray(zeros(Float16, wo_out_size, 1))
 
-    # Prefill buffers - fixed size for 4096 context
-    prefill_scores = oneArray(zeros(Float16, max_len, n_heads))
-    prefill_pb = oneArray(zeros(Float16, max_len, n_heads))
-
-    # CPU weight copies for fallback
-    wq_cpu = wq !== nothing ? Array(Float32.(wq)) : nothing
-    wk_cpu = wk !== nothing ? Array(Float32.(wk)) : nothing
-    wv_cpu = wv !== nothing ? Array(Float32.(wv)) : nothing
-    wo_cpu = Array(Float32.(wo))
-    q_norm_w_cpu = q_norm !== nothing ? Array(Float32.(q_norm.weight)) : nothing
-    k_norm_w_cpu = k_norm !== nothing ? Array(Float32.(k_norm.weight)) : nothing
+ # Prefill buffers - fixed size for 4096 context
+ prefill_scores = oneArray(zeros(Float16, max_len, n_heads))
+ prefill_pb = oneArray(zeros(Float16, max_len, n_heads))
 
  return FullAttention(index, arch, wq, wk, wv, wqkv, wo, q_norm, k_norm, n_heads, n_kv, hd,
- wq_cpu, wk_cpu, wv_cpu, wo_cpu, q_norm_w_cpu, k_norm_w_cpu,
  decode_q_full, decode_k, decode_v, decode_combined, decode_scores, decode_pb, decode_out_h,
  decode_wo_buf, prefill_scores, prefill_pb)
 end
@@ -776,9 +683,11 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
         q_rope = rope(q_2d, pos)
         k_rope = rope(k_2d, pos)
 
-        # 4. Gating Q (fused in-place SiLU)
-        gate_silu = gate_raw .* (T(1.0) ./ (T(1.0) .+ exp.(-gate_raw)))
-        q_gated = q_rope .* gate_silu
+ # 4. Gating Q (numerically stable SiLU using Float32 intermediate)
+ gate_raw_cpu = Array(gate_raw)
+ @. gate_raw_cpu = gate_raw_cpu * (Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_raw_cpu))))
+ gate_silu = oneArray(Float16.(gate_raw_cpu))
+ q_gated = q_rope .* gate_silu
 
     elseif m.architecture == :phi3
         # Packed QKV
@@ -885,106 +794,11 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
                 end
             end
         end
-        combined = oneArray(combined_all)
-        result = mat_mul(m.wo, combined)
-    end
+ combined = oneArray(combined_all)
+ result = mat_mul(m.wo, combined)
+ end
 
- # 7. CPU Float32 fallback for numerical stability
- # Synchronize GPU before checking stability
- oneAPI.synchronize()
-
- branch_out_cpu = Float32.(Array(result))
- branch_out_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
-
- # Only trigger fallback for NaN/Inf, not for high RMS
- if !all(isfinite, branch_out_cpu)
- # Fallback to pure CPU Float32 computation
-        eps = Float32(m.q_norm.eps)
-        x_norm_cpu = Float32.(Array(x))
-
-        # CPU projections
-        q_all_cpu = m.wq_cpu * x_norm_cpu
-        k_cpu = m.wk_cpu * x_norm_cpu
-        v_cpu = m.wv_cpu * x_norm_cpu
-
-        q_size = n_heads_q * hd
-        q_cpu = view(q_all_cpu, 1:q_size)
-        gate_cpu = view(q_all_cpu, q_size+1:2*q_size)
-        q_heads = reshape(q_cpu, hd, n_heads_q)
-        k_heads = reshape(k_cpu, hd, n_heads_kv)
-        v_heads = reshape(v_cpu, hd, n_heads_kv)
-
-        # CPU Q/K norm
-        for h in 1:n_heads_q
-            v = view(q_heads, :, h)
-            sc = Float32(1.0) / sqrt(sum(v -> Float32(v)^2, v) / hd + eps)
-            @inbounds for i in 1:hd
-                v[i] *= sc * m.q_norm_w_cpu[i]
-            end
-        end
-        for h in 1:n_heads_kv
-            v = view(k_heads, :, h)
-            sc = Float32(1.0) / sqrt(sum(v -> Float32(v)^2, v) / hd + eps)
-            @inbounds for i in 1:hd
-                v[i] *= sc * m.k_norm_w_cpu[i]
-            end
-        end
-
-        # CPU SiLU gate * Q
-        gate_reshaped = reshape(gate_cpu, hd, n_heads_q)
-        @. gate_reshaped = gate_reshaped * (Float32(1.0) / (Float32(1.0) + exp(-gate_reshaped)))
-        q_heads .*= gate_reshaped
-
-        # CPU RoPE (simplified - uses global rope caches)
-        rope_pairs = hd ÷ 2
-        for h in 1:n_heads_q
-            for p in 1:rope_pairs
-                i0, i1 = 2p - 1, 2p
-                s = Float64(rope.sin_cache[p, pos])
-                c = Float64(rope.cos_cache[p, pos])
-                q0, q1 = Float64(q_heads[i0, h]), Float64(q_heads[i1, h])
-                q_heads[i0, h] = Float32(q0 * c - q1 * s)
-                q_heads[i1, h] = Float32(q0 * s + q1 * c)
-            end
-        end
-        for h in 1:n_heads_kv
-            for p in 1:rope_pairs
-                i0, i1 = 2p - 1, 2p
-                s = Float64(rope.sin_cache[p, pos])
-                c = Float64(rope.cos_cache[p, pos])
-                k0, k1 = Float64(k_heads[i0, h]), Float64(k_heads[i1, h])
-                k_heads[i0, h] = Float32(k0 * c - k1 * s)
-                k_heads[i1, h] = Float32(k0 * s + k1 * c)
-            end
-        end
-
-        # CPU attention with GQA
-        attn_out_cpu = zeros(Float32, hd, n_heads_q)
-        scale_cpu = Float32(1.0 / sqrt(hd))
-        for h in 1:n_heads_q
-            kv_h = div(h - 1, gqa_ratio) + 1
-            K_past = Float64.(Array(K_cache[:, kv_h, 1:pos]))
-            V_past = Float64.(Array(V_cache[:, kv_h, 1:pos]))
-            q_h = Float64.(q_heads[:, h])
-
-            scores = K_past' * q_h
-            scores .*= Float64(scale_cpu)
-            scores .-= maximum(scores)
-            scores = exp.(scores)
-            scores ./= sum(scores)
-            attn_out_cpu[:, h] = Float32.(V_past * scores)
-        end
-
-        branch_out_cpu = m.wo_cpu * vec(attn_out_cpu)
-        copyto!(m.decode_wo_buf, Float16.(branch_out_cpu))
-
-        if m.index ∉ _attn_cpu_fallback_layers()
-            push!(_attn_cpu_fallback_layers(), m.index)
-            @warn "Falling back to CPU Float32 attention for unstable layer" layer = m.index gpu_rms = branch_out_rms cpu_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
-        end
-    end
-
-    return result
+ return result
 end
 
 # --- MLAttention (Multi-Latent Attention for DeepSeek V2/V3) ---
