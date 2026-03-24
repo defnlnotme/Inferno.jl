@@ -23,107 +23,47 @@ function sample(logits::Vector{Float16}, temperature::Float16, top_p::Float16, t
     return cpu_sample(logits, temperature, top_p, top_k)
 end
 
-# CPU sampling implementation (original code)
+# CPU sampling implementation with Float32 stability
 function cpu_sample(logits::Vector{Float16}, temperature::Float16, top_p::Float16, top_k::Int=40)
- # Sanitize logits - replace NaN and Inf with -Inf so they're never selected
- @inbounds for i in eachindex(logits)
- if !isfinite(logits[i])
- logits[i] = -Float16(Inf)
- end
- end
-
- if temperature == Float16(0.0)
- return argmax(logits)
- end
-
- # Top-k sampling
- if top_k > 0 && top_k < length(logits)
- # Get top-k indices
- top_k_indices = partialsortperm(logits, 1:top_k, rev=true)
-
- # Create a mask for non-top-k elements
- for i in eachindex(logits)
- if i ∉ top_k_indices
- logits[i] = -Float16(Inf)
- end
- end
- end
-
- # Temperature scaling + softmax in one pass using Float32 to prevent overflow
- inv_temp = Float32(1.0) / Float32(temperature)
- mx = -Float32(Inf)
- @inbounds for v in logits
- scaled = Float32(v) * inv_temp
- mx = scaled > mx ? scaled : mx
- end
- probs = similar(logits)
- s = Float32(0.0)
- @inbounds for i in eachindex(logits)
- e = exp(Float32(logits[i]) * inv_temp - mx)
- probs[i] = Float16(e)
- s += e
- end
- inv_s = Float32(1.0) / s
- @inbounds probs .*= Float16(inv_s)
-
- # Top-p (Nucleus) - partialsortperm avoids full O(N log N) sort over 150k vocab
- if top_p < Float16(1.0)
- n = length(probs)
- k_max = min(n, 1024) # top-p usually keeps well under 1024 tokens
- top_indices = partialsortperm(probs, 1:k_max, rev=true)
- cum = Float16(0.0)
- cutoff = k_max
- for (rank, idx) in enumerate(top_indices)
- cum += probs[idx]
- if cum >= top_p
- cutoff = rank
- break
- end
- end
- # Re-build probs with only the kept tokens (renormalized)
- fill!(probs, Float16(0.0))
- renorm = Float32(0.0)
- @inbounds for rank in 1:cutoff
- idx = top_indices[rank]
- e = exp(Float32(logits[idx]) * inv_temp - mx)
- probs[idx] = Float16(e)
- renorm += e
- end
- inv_renorm = Float32(1.0) / renorm
- @inbounds for rank in 1:cutoff
- probs[top_indices[rank]] *= Float16(inv_renorm)
- end
- end
-
- return simple_sample(probs)
-end
-
-# CPU sampling from already scaled logits
-function cpu_sample_from_scaled(scaled_logits::Vector{Float16}, temperature::Float16, top_p::Float16, top_k::Int=40)
-    mx = maximum(scaled_logits)
-    exp_vals = exp.(scaled_logits .- mx)
-    probs = exp_vals ./ sum(exp_vals)
-
-    # Top-k sampling
-    if top_k > 0 && top_k < length(scaled_logits)
-        # Get top-k indices based on probabilities
-        top_k_indices = partialsortperm(probs, 1:min(top_k, length(probs)), rev=true)
-
-        # Zero out non-top-k probabilities
-        for i in eachindex(probs)
-            if i ∉ top_k_indices
-                probs[i] = Float16(0.0)
-            end
-        end
-
-        # Renormalize
-        total_prob = sum(probs)
-        if total_prob > Float16(0.0)
-            probs ./= total_prob
+    # Sanitize logits - replace NaN and Inf with -Inf so they're never selected
+    @inbounds for i in eachindex(logits)
+        if !isfinite(logits[i])
+            logits[i] = -Float16(Inf)
         end
     end
 
-    # Top-p sampling
+    if temperature == Float16(0.0)
+        return argmax(logits)
+    end
+
+    # Top-k sampling
+    if top_k > 0 && top_k < length(logits)
+        top_k_indices = partialsortperm(logits, 1:top_k, rev=true)
+        for i in eachindex(logits)
+            if i ∉ top_k_indices
+                logits[i] = -Float16(Inf)
+            end
+        end
+    end
+
+    # Temperature scaling + softmax using Float32 to prevent overflow
+    inv_temp = Float32(1.0) / Float32(temperature)
+    mx = -Float32(Inf)
+    @inbounds for v in logits
+        scaled = Float32(v) * inv_temp
+        mx = scaled > mx ? scaled : mx
+    end
+    probs = similar(logits)
+    s = Float32(0.0)
+    @inbounds for i in eachindex(logits)
+        e = exp(Float32(logits[i]) * inv_temp - mx)
+        probs[i] = Float16(e)
+        s += e
+    end
+    inv_s = Float32(1.0) / s
+    @inbounds probs .*= Float16(inv_s)
+
+    # Top-p (Nucleus) sampling
     if top_p < Float16(1.0)
         n = length(probs)
         k_max = min(n, 1024)
@@ -137,12 +77,57 @@ function cpu_sample_from_scaled(scaled_logits::Vector{Float16}, temperature::Flo
                 break
             end
         end
+        fill!(probs, Float16(0.0))
+        renorm = Float32(0.0)
+        @inbounds for rank in 1:cutoff
+            idx = top_indices[rank]
+            e = exp(Float32(logits[idx]) * inv_temp - mx)
+            probs[idx] = Float16(e)
+            renorm += e
+        end
+        inv_renorm = Float32(1.0) / renorm
+        @inbounds for rank in 1:cutoff
+            probs[top_indices[rank]] *= Float16(inv_renorm)
+        end
+    end
 
-        # Rebuild probs with top-p tokens
+    return simple_sample(probs)
+end
+
+# CPU sampling from already scaled logits
+function cpu_sample_from_scaled(scaled_logits::Vector{Float16}, temperature::Float16, top_p::Float16, top_k::Int=40)
+    mx = Float32(maximum(scaled_logits))
+    exp_vals = exp.(Float32.(scaled_logits) .- mx)
+    probs = Float16.(exp_vals ./ sum(exp_vals))
+
+    if top_k > 0 && top_k < length(scaled_logits)
+        top_k_indices = partialsortperm(probs, 1:min(top_k, length(probs)), rev=true)
+        for i in eachindex(probs)
+            if i ∉ top_k_indices
+                probs[i] = Float16(0.0)
+            end
+        end
+        total_prob = sum(probs)
+        if total_prob > Float16(0.0)
+            probs ./= total_prob
+        end
+    end
+
+    if top_p < Float16(1.0)
+        k_max = min(length(probs), 1024)
+        top_indices = partialsortperm(probs, 1:k_max, rev=true)
+        cum = Float16(0.0)
+        cutoff = k_max
+        for (rank, idx) in enumerate(top_indices)
+            cum += probs[idx]
+            if cum >= top_p
+                cutoff = rank
+                break
+            end
+        end
         fill!(probs, Float16(0.0))
         for rank in 1:cutoff
-            idx = top_indices[rank]
-            probs[idx] = exp_vals[idx]
+            probs[top_indices[rank]] = exp_vals[top_indices[rank]]
         end
         probs ./= sum(probs)
     end
@@ -150,14 +135,10 @@ function cpu_sample_from_scaled(scaled_logits::Vector{Float16}, temperature::Flo
     return simple_sample(probs)
 end
 
-# mask_and_sample: wrapper over `sample` which will avoid returning PAD-like tokens
-# when streaming. We defensively re-sample a few times while masking offending ids.
-# This is intentionally conservative (max_attempts) to avoid infinite loops.
+# mask_and_sample: avoids returning PAD-like tokens when streaming
 function mask_and_sample(logits::AbstractVector{Float16}, pad_ids::Vector{Int}, temperature::Float16, top_p::Float16, top_k::Int=40; max_attempts::Int=5)
-    # Reuse the vector in-place if already CPU, otherwise collect once
     logits_copy = logits isa Vector{Float16} ? copy(logits) : Vector{Float16}(logits)
 
-    # Pre-mask known PAD-like token ids
     if !isempty(pad_ids)
         @inbounds for pid in pad_ids
             if 1 <= pid <= length(logits_copy)
@@ -179,25 +160,50 @@ function mask_and_sample(logits::AbstractVector{Float16}, pad_ids::Vector{Int}, 
 end
 
 # Apply presence penalty to logits based on token counts
-# Presence penalty reduces the probability of tokens that have already appeared,
-# encouraging the model to generate more diverse content.
 function apply_presence_penalty!(logits::AbstractVector{Float16}, token_counts::Dict{Int,Int}, penalty::Float16)
     if penalty == Float16(0.0)
         return logits
     end
     for (tokid, cnt) in token_counts
         if 1 <= tokid <= length(logits)
-            # Penalty is proportional to token count
-            # Each occurrence adds penalty, discouraging repetition
             logits[tokid] -= Float16(cnt) * penalty
         end
     end
     return logits
 end
 
+# Apply repetition penalty (different from presence - applies to all occurrences)
+function apply_repetition_penalty!(logits::AbstractVector{Float16}, token_counts::Dict{Int,Int}, penalty::Float16)
+    if penalty == Float16(1.0)
+        return logits
+    end
+    for (tokid, cnt) in token_counts
+        if 1 <= tokid <= length(logits)
+            # Repetition penalty: divide logits for tokens that have appeared
+            if logits[tokid] > Float16(0.0)
+                logits[tokid] = logits[tokid] / penalty
+            else
+                logits[tokid] = logits[tokid] * penalty
+            end
+        end
+    end
+    return logits
+end
+
+# Qwen2.5/Qwen3.5 recommended defaults (from generation_config.json):
+# - temperature: 0.0 (use > 0 for sampling)
+# - top_p: 0.95
+# - top_k: 0 (disabled, use all tokens in top-p)
+# - repetition_penalty: 1.0 (use 1.1-1.2 for long texts)
+
 function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::String;
-    max_tokens::Int=100, temperature::Float16=Float16(0.7), top_p::Float16=Float16(0.8), 
-    top_k::Int=20, presence_penalty::Float16=Float16(0.0), stop_token::Union{Int,Nothing}=nothing)
+    max_tokens::Int=512,
+    temperature::Float16=Float16(0.7),
+    top_p::Float16=Float16(0.95),
+    top_k::Int=0,
+    presence_penalty::Float16=Float16(0.0),
+    repetition_penalty::Float16=Float16(1.0),
+    stop_token::Union{Int,Nothing}=nothing)
 
     tokens = Tokenizer.encode(tok, prompt)
     if isempty(tokens)
@@ -206,7 +212,6 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
         end
     end
 
-    # Track token occurrences for presence penalty
     token_counts = Dict{Int,Int}()
     for t in tokens
         token_counts[t] = get(token_counts, t, 0) + 1
@@ -215,7 +220,6 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
     kv_caches = Vector{Model.KVCache}()
     return Channel{String}(32) do chan
         try
-            # Ensure we're on the correct GPU device
             devs = collect(oneAPI.devices())
             if !isempty(devs)
                 first_weight = model.layers[1].mlp.gate_weight
@@ -226,23 +230,19 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
             Model.reset_states!(model)
             kv_caches = [Model.init_kv_cache(model.config) for _ in 1:model.config.num_hidden_layers]
 
-            # Prefill
             logits = Model.forward!(model, tokens, 0, kv_caches)
             curr_pos = length(tokens)
 
-            # Sample from last position
             logits_vec = vec(collect(logits[:, end]))
-            # Apply presence penalty to prompt tokens
             apply_presence_penalty!(logits_vec, token_counts, presence_penalty)
+            apply_repetition_penalty!(logits_vec, token_counts, repetition_penalty)
             last_token = mask_and_sample(logits_vec, [tok.eos_id], temperature, top_p, top_k)
 
             token_str = Tokenizer.decode(tok, [last_token])
             put!(chan, token_str)
 
-            # Track generated token for presence penalty
             token_counts[last_token] = get(token_counts, last_token, 0) + 1
 
-            # Decode loop
             for step in 1:(max_tokens-1)
                 if last_token == (stop_token === nothing ? tok.eos_id : stop_token)
                     break
@@ -252,14 +252,13 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
                 curr_pos += 1
 
                 logits_vec = vec(collect(logits[:, 1]))
-                # Apply presence penalty to all seen tokens (prompt + generated)
                 apply_presence_penalty!(logits_vec, token_counts, presence_penalty)
+                apply_repetition_penalty!(logits_vec, token_counts, repetition_penalty)
                 last_token = mask_and_sample(logits_vec, [tok.eos_id], temperature, top_p, top_k)
 
                 token_str = Tokenizer.decode(tok, [last_token])
                 put!(chan, token_str)
 
-                # Track generated token for presence penalty
                 token_counts[last_token] = get(token_counts, last_token, 0) + 1
 
                 if step % 4 == 0
@@ -293,10 +292,15 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
 end
 
 function generate(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::String;
-    max_tokens::Int=100, temperature::Float16=Float16(0.7), top_p::Float16=Float16(0.8), 
-    top_k::Int=20, presence_penalty::Float16=Float16(0.0), stop_token::Union{Int,Nothing}=nothing)
+    max_tokens::Int=512,
+    temperature::Float16=Float16(0.7),
+    top_p::Float16=Float16(0.95),
+    top_k::Int=0,
+    presence_penalty::Float16=Float16(0.0),
+    repetition_penalty::Float16=Float16(1.0),
+    stop_token::Union{Int,Nothing}=nothing)
 
-    stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, top_k, presence_penalty, stop_token)
+    stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, top_k, presence_penalty, repetition_penalty, stop_token)
     res = String[]
     for token_str in stream
         push!(res, token_str)
@@ -304,28 +308,19 @@ function generate(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::S
     return join(res)
 end
 
-# Stream directly to stdout for interactive use
 function stream_to_stdout(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::String;
-    max_tokens::Int=100, temperature::Float16=Float16(0.7), top_p::Float16=Float16(0.8), 
-    top_k::Int=20, presence_penalty::Float16=Float16(0.0))
-    stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, top_k, presence_penalty)
-    try
-        for token_str in stream
-            print(token_str)
-        end
-        println()
-    catch e
-        if e isa InterruptException
-            # Signal the generator to stop
-            try
-                close(stream)
-            catch
-            end
-            println()
-        else
-            rethrow(e)
-        end
+    max_tokens::Int=512,
+    temperature::Float16=Float16(0.7),
+    top_p::Float16=Float16(0.95),
+    top_k::Int=0,
+    presence_penalty::Float16=Float16(0.0),
+    repetition_penalty::Float16=Float16(1.0))
+
+    stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, top_k, presence_penalty, repetition_penalty)
+    for token_str in stream
+        print(token_str)
     end
+    println()
 end
 
 end # module
