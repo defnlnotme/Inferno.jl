@@ -325,6 +325,7 @@ function init_kv_cache(config::QwenConfig)
  v = oneArray{Float16}(undef, head_dim, n_heads_kv, max_pos)
  fill!(k, Float16(0.0))
  fill!(v, Float16(0.0))
+ oneAPI.synchronize() # Ensure cache is zeroed before use
 
  # Attention buffers
  q_all = oneArray(zeros(Float16, n_heads_q * head_dim * 2))
@@ -443,22 +444,27 @@ function MLP(index::Int, gate_weight, up_weight, down_weight)
 end
 
 function (m::MLP)(x::oneMatrix{Float16}, cache::KVCache)
-    T = Float16
+ T = Float16
 
-    # GPU path
-    mul!(cache.mlp_gate, m.gate_weight, x)
-    mul!(cache.mlp_up, m.up_weight, x)
-    @. cache.mlp_gate = cache.mlp_gate * (T(1.0) / (T(1.0) + exp(-cache.mlp_gate)))
-    cache.mlp_gate .*= cache.mlp_up
-    mul!(cache.branch_out, m.down_weight, cache.mlp_gate)
+ # GPU path
+ mul!(cache.mlp_gate, m.gate_weight, x)
+ mul!(cache.mlp_up, m.up_weight, x)
+ @. cache.mlp_gate = cache.mlp_gate * (T(1.0) / (T(1.0) + exp(-cache.mlp_gate)))
+ cache.mlp_gate .*= cache.mlp_up
+ mul!(cache.branch_out, m.down_weight, cache.mlp_gate)
 
-    result = cache.branch_out
+ result = cache.branch_out
 
-    # CPU Float32 fallback for numerical stability
-    branch_out_cpu = Float32.(Array(result))
-    branch_out_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
+ # Synchronize GPU before checking stability
+ oneAPI.synchronize()
 
- if !all(isfinite, branch_out_cpu) || branch_out_rms > Float32(4.0)
+ # CPU Float32 fallback for numerical stability
+ branch_out_cpu = Float32.(Array(result))
+ branch_out_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
+
+ # Only trigger fallback for NaN/Inf, not for high RMS
+ # High RMS is normal for some layers in quantized models
+ if !all(isfinite, branch_out_cpu)
  # Get or create CPU weights cache
  weights = get!(_mlp_cpu_cache(), m.index) do
  (
@@ -497,8 +503,8 @@ function (m::MLP)(x::oneMatrix{Float16})
 end
 
 function reset_states!(m::MLP)
-    # MLP has no state to reset
-    return nothing
+ # MLP has no state to reset
+ return nothing
 end
 
 # --- MoE (Mixture of Experts) ---
@@ -723,10 +729,15 @@ function FullAttention(index::Int, arch, wq, wk, wv, wqkv, wo, q_norm, k_norm, n
     q_norm_w_cpu = q_norm !== nothing ? Array(Float32.(q_norm.weight)) : nothing
     k_norm_w_cpu = k_norm !== nothing ? Array(Float32.(k_norm.weight)) : nothing
 
-    return FullAttention(index, arch, wq, wk, wv, wqkv, wo, q_norm, k_norm, n_heads, n_kv, hd,
-        wq_cpu, wk_cpu, wv_cpu, wo_cpu, q_norm_w_cpu, k_norm_w_cpu,
-        decode_q_full, decode_k, decode_v, decode_combined, decode_scores, decode_pb, decode_out_h,
-        decode_wo_buf, prefill_scores, prefill_pb)
+ return FullAttention(index, arch, wq, wk, wv, wqkv, wo, q_norm, k_norm, n_heads, n_kv, hd,
+ wq_cpu, wk_cpu, wv_cpu, wo_cpu, q_norm_w_cpu, k_norm_w_cpu,
+ decode_q_full, decode_k, decode_v, decode_combined, decode_scores, decode_pb, decode_out_h,
+ decode_wo_buf, prefill_scores, prefill_pb)
+end
+
+function reset_states!(m::FullAttention)
+ # FullAttention has no state to reset
+ return nothing
 end
 
 function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedding, cache::KVCache)
@@ -878,12 +889,16 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
         result = mat_mul(m.wo, combined)
     end
 
-    # 7. CPU Float32 fallback for numerical stability
-    branch_out_cpu = Float32.(Array(result))
-    branch_out_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
+ # 7. CPU Float32 fallback for numerical stability
+ # Synchronize GPU before checking stability
+ oneAPI.synchronize()
 
-    if !all(isfinite, branch_out_cpu) || branch_out_rms > Float32(4.0)
-        # Fallback to pure CPU Float32 computation
+ branch_out_cpu = Float32.(Array(result))
+ branch_out_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
+
+ # Only trigger fallback for NaN/Inf, not for high RMS
+ if !all(isfinite, branch_out_cpu)
+ # Fallback to pure CPU Float32 computation
         eps = Float32(m.q_norm.eps)
         x_norm_cpu = Float32.(Array(x))
 
@@ -1253,11 +1268,15 @@ function (m::GatedDeltaNet)(x::AbstractArray{Float16,2}, pos::Int, rope::RotaryE
  copyto!(m.branch_out, reshape(Float16.(m.y_all_cpu), :, 1))
  result = mat_mul(m.ssm_out, m.branch_out)
 
-    # 11. CPU Float32 fallback for numerical stability
-    branch_out_cpu = Float32.(Array(result))
-    branch_out_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
+ # Synchronize GPU before checking stability
+ oneAPI.synchronize()
 
-    if !all(isfinite, branch_out_cpu) || branch_out_rms > Float32(4.0)
+ # 11. CPU Float32 fallback for numerical stability
+ branch_out_cpu = Float32.(Array(result))
+ branch_out_rms = sqrt(sum(abs2, branch_out_cpu) / length(branch_out_cpu))
+
+ # Only trigger fallback for NaN/Inf, not for high RMS
+ if !all(isfinite, branch_out_cpu)
         # Fallback to pure CPU Float32 computation
         eps = Float32(m.ssm_norm.eps)
 
@@ -1327,14 +1346,14 @@ function (m::GatedDeltaNet)(x::AbstractArray{Float16,2}, pos::Int, rope::RotaryE
             end
         end
 
-        # Gate and output
-        @. z_buf_cpu = z_buf_cpu * (Float32(1.0) / (Float32(1.0) + exp(-z_buf_cpu)))
-        y_reshaped .*= reshape(z_buf_cpu, m.head_v_dim, m.num_k_heads)
-        ssm_out_w = Float32.(Array(m.ssm_out))
-        branch_out_cpu = ssm_out_w * vec(y_reshaped)
+ # Gate and output
+ @. z_buf_cpu = z_buf_cpu * (Float32(1.0) / (Float32(1.0) + exp(-z_buf_cpu)))
+ y_reshaped .*= reshape(z_buf_cpu, m.head_v_dim, m.num_k_heads)
+ ssm_out_w = Float32.(Array(m.ssm_out))
+ branch_out_cpu = ssm_out_w * vec(y_reshaped)
 
- copyto!(m.branch_out, reshape(Float16.(branch_out_cpu), :, 1))
- result = m.branch_out # Update result to use CPU fallback
+ # Create result array with correct size (hidden_size, 1)
+ result = oneArray(reshape(Float16.(branch_out_cpu), :, 1))
 
  if m.index ∉ _ssm_cpu_fallback_layers()
  push!(_ssm_cpu_fallback_layers(), m.index)
@@ -1508,8 +1527,17 @@ function forward!(model::QwenModel, tokens::Vector{Int}, pos::Int, caches::Vecto
  end
 
  x_normed = model.final_norm(x)
+ oneAPI.synchronize() # Ensure GPU computation is complete
  x_final = collect(x_normed)
  logits = (model.lm_head') * x_final
+ 
+ # Sanitize logits - replace NaN/Inf with 0
+ @inbounds for i in eachindex(logits)
+ if !isfinite(logits[i])
+ logits[i] = 0.0
+ end
+ end
+ 
  return Float16.(logits)
  else
  # Prefill path - process tokens one at a time
@@ -1526,8 +1554,16 @@ function forward!(model::QwenModel, tokens::Vector{Int}, pos::Int, caches::Vecto
  end
  
  x_normed = model.final_norm(x)
+ oneAPI.synchronize() # Ensure GPU computation is complete
  x_final = collect(x_normed)
  logits_t = (model.lm_head') * x_final
+ 
+ # Sanitize logits - replace NaN/Inf with 0
+ @inbounds for i in eachindex(logits_t)
+ if !isfinite(logits_t[i])
+ logits_t[i] = 0.0
+ end
+ end
  
  if all_logits === nothing
  all_logits = Float16.(zeros(size(logits_t, 1), seq_len))

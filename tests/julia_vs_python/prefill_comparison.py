@@ -57,7 +57,7 @@ def get_prefill_hidden_states(
 
     # Tokenize
     inputs = tokenizer.encode(rendered, return_tensors="pt").to(model.device)
-    token_ids = inputs.tolist()[0]
+    token_ids = inputs[0].tolist()
     print(f"Token IDs: {token_ids}", file=sys.stderr)
     print(f"Number of tokens: {len(token_ids)}", file=sys.stderr)
 
@@ -78,13 +78,13 @@ def main():
             "Usage: python prefill_comparison.py <model_path> <prompt> [use_chat_template] [system_prompt]",
             file=sys.stderr,
         )
-        print("  model_path: Path to model or HuggingFace model name", file=sys.stderr)
+        print(" model_path: Path to model or HuggingFace model name", file=sys.stderr)
         print(
-            "  prompt: Input prompt (use quotes for multi-word prompts)",
+            " prompt: Input prompt (use quotes for multi-word prompts)",
             file=sys.stderr,
         )
-        print("  use_chat_template: true/false (default: true)", file=sys.stderr)
-        print("  system_prompt: Optional system prompt", file=sys.stderr)
+        print(" use_chat_template: true/false (default: true)", file=sys.stderr)
+        print(" system_prompt: Optional system prompt", file=sys.stderr)
         sys.exit(1)
 
     model_path = sys.argv[1]

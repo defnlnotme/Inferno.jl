@@ -2,6 +2,35 @@
 
 This directory contains the complete test suite for the Inferno project.
 
+## Quick Start
+
+```bash
+cd tests
+
+# Run all tests
+./run.sh
+
+# Run only unit tests (fast, no model required)
+./run.sh unit
+
+# Run integration tests
+./run.sh integration
+
+# Run with coverage tracking
+./run.sh coverage
+```
+
+## Test Organization
+
+Tests are organized by their dependencies:
+
+| Marker | Description | Dependencies |
+|--------|-------------|--------------|
+| `[UNIT]` | Fast, isolated tests | None (no model/GPU) |
+| `[MODEL]` | Model-dependent tests | GGUF model file |
+| `[GPU]` | GPU-dependent tests | oneAPI + Intel GPU |
+| `[INTEGRATION]` | Full system tests | HTTP server, model |
+
 ## Directory Structure
 
 ```
@@ -10,8 +39,13 @@ tests/
 ├── runtests.jl         # Main test runner (use `julia --project=. runtests.jl`)
 ├── Project.toml        # Test dependencies
 │
-├── unit/               # Unit tests for individual components
-│   └── core_components.jl
+├── unit/ # Unit tests for individual components
+│ ├── core_components.jl # Core component tests (legacy)
+│ ├── test_engine.jl # [UNIT] Engine sampling tests
+│ ├── test_tokenizer.jl # [UNIT] Tokenizer edge cases
+│ ├── test_gguf.jl # [UNIT] GGUF parsing tests
+│ ├── test_inferno_utils.jl # [UNIT] Utility function tests
+│ └── test_server_auth.jl # [INTEGRATION] Server auth tests
 │
 ├── integration/        # Integration tests (multi-component, server, etc.)
 │   └── test_server.jl

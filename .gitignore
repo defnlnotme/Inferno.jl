@@ -15,3 +15,4 @@ examples/reference_outputs
 examples/checks/reference_outputs
 examples/checks/dequant_ref
 **/__pycache__/**
+vendor/
