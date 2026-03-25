@@ -3,6 +3,41 @@
 ## Goal
 Compare the float types used in every part of the Qwen3.5 inference process between our Inferno.jl implementation and llama.cpp, ensuring numerical compatibility and correctness.
 
+## CRITICAL FINDING: Qwen uses BFloat16, not Float16!
+
+**Qwen's native dtype**: **bfloat16 (BF16)** - NOT float16 (FP16)
+
+### Key Differences Between BF16 and FP16
+
+| Property | Float16 (FP16) | BFloat16 (BF16) |
+|----------|----------------|-----------------|
+| **Exponent bits** | 5 bits | 8 bits (same as FP32) |
+| **Mantissa bits** | 10 bits | 7 bits |
+| **Dynamic range** | Limited (±65504 max) | Same as FP32 |
+| **Precision** | Higher precision | Lower precision |
+| **Overflow risk** | High (exp overflow > 6.5) | None (same range as FP32) |
+| **Underflow risk** | High | Low |
+
+### Why This Matters
+
+1. **Float16 exp() overflow**: `exp(6.5)` = 665, but FP16 max is 65504 → **overflow**
+2. **BFloat16 exp()**: Same range as FP32, no overflow for normal values
+3. **llama.cpp**: Converts BF16 → FP32 for computation (no precision loss)
+4. **Our implementation**: Uses FP16 → needs Float32 intermediate for exp()
+
+### llama.cpp BF16 Handling
+
+```cpp
+// ggml-impl.h:588-594 - BF16 to FP32 is just bit shift
+static inline float ggml_compute_bf16_to_fp32(ggml_bf16_t h) {
+    union { float f; uint32_t i; } u;
+    u.i = (uint32_t)h.bits << 16;  // Zero-extend mantissa
+    return u.f;
+}
+```
+
+**Key insight**: BF16 → FP32 conversion is **free** (just pad zeros), no precision loss.
+
 ## Current Context
 
 ### Inferno.jl Implementation
@@ -208,3 +243,46 @@ Add documentation explaining:
 - Sampling probability accumulation should use Float32
 
 **Recommendation**: Our Float16 storage with Float32 compute approach is numerically sound and matches llama.cpp's philosophy of "compute in Float32, store in Float16".
+
+## Recommendation: Consider BFloat16 Support
+
+### Option 1: Keep Float16 (Current)
+- ✅ Works with our Float32 intermediate computation
+- ✅ Broader hardware support (Intel oneAPI, older GPUs)
+- ❌ Requires careful exp() handling to avoid overflow
+- ❌ Different from Qwen's native BF16
+
+### Option 2: Switch to BFloat16 (Recommended for Qwen)
+- ✅ Matches Qwen's native dtype
+- ✅ No exp() overflow risk (same range as FP32)
+- ✅ Simpler kernel code (no Float32 intermediate needed for exp)
+- ❌ Less hardware support (needs AVX512_BF16 or newer)
+- ❌ Lower precision than FP16 (7 vs 10 mantissa bits)
+
+### Implementation Path for BFloat16
+
+1. **Julia BFloat16 support**: Use `BFloat16s.jl` package
+2. **Storage**: Change `oneMatrix{Float16}` to `oneMatrix{BFloat16}`
+3. **Computation**: Still use Float32 for accumulation (BF16 has 7-bit mantissa)
+4. **Kernels**: Simplify - no need for Float32 intermediate in exp()
+
+```julia
+# Simple BF16 → FP32 conversion (just bit shift)
+function bf16_to_f32(x::BFloat16)
+    return Float32(x)  # Julia handles this
+end
+
+# SiLU with BF16 (simpler than FP16)
+function silu_bf16(x::BFloat16)
+    # BF16 has same range as FP32, so exp() won't overflow
+    return x * (1.0f0 / (1.0f0 + exp(-Float32(x))))
+end
+```
+
+### For Now: Our FP16 + Float32 Intermediate is Correct
+
+Our current approach of using Float32 for all exp() operations is **numerically correct** and matches llama.cpp's approach. The only difference is:
+- **llama.cpp**: BF16 storage → FP32 compute (no overflow risk)
+- **Inferno**: FP16 storage → FP32 compute (careful overflow handling)
+
+Both produce correct results. The FP16 approach just requires more careful kernel implementation.
