@@ -185,7 +185,7 @@ uuid = "e33a78d0-f292-5ffc-b300-72abe9b543c8"
 version = "2.13.0+0"
 
 [[deps.Inferno]]
-deps = ["ArgParse", "HTTP", "JSON", "JSON3", "Libdl", "LinearAlgebra", "Mmap", "OrderedCollections", "Random", "Sockets", "Statistics", "StructTypes", "Tar", "oneAPI"]
+deps = ["ArgParse", "HTTP", "JSON", "JSON3", "Libdl", "LinearAlgebra", "Mmap", "OrderedCollections", "Random", "Sockets", "Statistics", "StructTypes", "Tar", "Unicode", "oneAPI"]
 path = "."
 uuid = "4e1e2c4b-a6e7-48e4-a8cc-a3a3a2d64561"
 version = "0.1.0"

@@ -244,45 +244,64 @@ Add documentation explaining:
 
 **Recommendation**: Our Float16 storage with Float32 compute approach is numerically sound and matches llama.cpp's philosophy of "compute in Float32, store in Float16".
 
-## Recommendation: Consider BFloat16 Support
+## Recommendation: Cannot Switch to BFloat16 (GPU Limitation)
 
-### Option 1: Keep Float16 (Current)
-- ✅ Works with our Float32 intermediate computation
-- ✅ Broader hardware support (Intel oneAPI, older GPUs)
-- ❌ Requires careful exp() handling to avoid overflow
-- ❌ Different from Qwen's native BF16
+### CRITICAL BLOCKER: oneAPI/SPIR-V Does Not Support BFloat16
 
-### Option 2: Switch to BFloat16 (Recommended for Qwen)
-- ✅ Matches Qwen's native dtype
-- ✅ No exp() overflow risk (same range as FP32)
-- ✅ Simpler kernel code (no Float32 intermediate needed for exp)
-- ❌ Less hardware support (needs AVX512_BF16 or newer)
-- ❌ Lower precision than FP16 (7 vs 10 mantissa bits)
+**Error encountered:**
+```
+RequiresExtension: Feature requires the following SPIR-V extension:
+ SPV_KHR_bfloat16
+NOTE: LLVM module contains bfloat type, translation of which requires this extension
+ERROR: Failed to translate LLVM code to SPIR-V.
+```
 
-### Implementation Path for BFloat16
+**Technical Details:**
+- Intel Arc GPUs require SPV_KHR_bfloat16 extension for BF16
+- This extension is not available in current oneAPI/SPIR-V implementations
+- BFloat16s.jl package works on CPU but fails on GPU compilation
 
-1. **Julia BFloat16 support**: Use `BFloat16s.jl` package
-2. **Storage**: Change `oneMatrix{Float16}` to `oneMatrix{BFloat16}`
-3. **Computation**: Still use Float32 for accumulation (BF16 has 7-bit mantissa)
-4. **Kernels**: Simplify - no need for Float32 intermediate in exp()
-
+**Verified:**
 ```julia
-# Simple BF16 → FP32 conversion (just bit shift)
-function bf16_to_f32(x::BFloat16)
-    return Float32(x)  # Julia handles this
-end
+# CPU works fine
+julia> BFloat16(1.0)
+BFloat16(1.0)
 
-# SiLU with BF16 (simpler than FP16)
+# GPU fails with SPV_KHR_bfloat16 extension error
+julia> oneAPI.ones(BFloat16, 10)
+ERROR: Failed to translate LLVM code to SPIR-V.
+```
+
+### Current Hardware Support
+
+| Platform | BFloat16 Native | Status |
+|----------|-----------------|--------|
+| NVIDIA RTX 30/40 series | ✅ Yes (Tensor Cores) | Supported in CUDA |
+| Intel Arc (oneAPI) | ❌ No | Requires SPV_KHR_bfloat16 |
+| AMD RDNA3+ | ✅ Yes | Supported in ROCm |
+
+### Conclusion: Must Keep Float16
+
+**Our current approach is correct:**
+- Store as Float16 (supported on Intel Arc)
+- Compute with Float32 intermediate (prevents overflow)
+- This matches llama.cpp's numerical approach
+
+**Cannot switch to BF16 because:**
+1. oneAPI doesn't support SPV_KHR_bfloat16 extension
+2. Intel Arc GPUs don't have native BF16 instructions
+3. Would require fallback to CPU (defeats purpose of GPU acceleration)
+
+### Future Consideration
+
+If oneAPI adds BF16 support in the future:
+```julia
+# Would simplify our kernels
 function silu_bf16(x::BFloat16)
-    # BF16 has same range as FP32, so exp() won't overflow
+    # BF16 has same range as FP32, no overflow risk
+    # But we can't use this until oneAPI supports it
     return x * (1.0f0 / (1.0f0 + exp(-Float32(x))))
 end
 ```
 
-### For Now: Our FP16 + Float32 Intermediate is Correct
-
-Our current approach of using Float32 for all exp() operations is **numerically correct** and matches llama.cpp's approach. The only difference is:
-- **llama.cpp**: BF16 storage → FP32 compute (no overflow risk)
-- **Inferno**: FP16 storage → FP32 compute (careful overflow handling)
-
-Both produce correct results. The FP16 approach just requires more careful kernel implementation.
+For now, our Float16 + Float32 intermediate approach is the **only viable option** for Intel Arc GPUs.
