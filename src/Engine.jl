@@ -7,11 +7,13 @@ using Random
 
 export generate, generate_stream, sample, stream_to_stdout
 
+# Simple sampling with Float32 accumulation for numerical stability
+# Matches llama.cpp's approach (cross-entropy-loss.cu:29-33)
 function simple_sample(probs::Vector{Float16})
-    r = rand()
-    cum = Float16(0.0)
+    r = rand(Float32)
+    cum = Float32(0.0)
     for (i, p) in enumerate(probs)
-        cum += p
+        cum += Float32(p)
         if r <= cum
             return i
         end
