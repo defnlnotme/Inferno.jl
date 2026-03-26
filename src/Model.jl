@@ -933,7 +933,7 @@ function GatedDeltaNet(index::Int, in_proj, gate_proj, ssm_out, ssm_conv1d, ssm_
 
     # State buffers
  conv_state = zeros(Float32, conv_channels, conv_kernel)
- h = zeros(Float32, head_v_dim, head_v_dim, num_v_heads)
+ h = zeros(Float32, head_v_dim, head_k_dim, num_v_heads)
 
     # GPU scratchpads (2D column matrices for GPU matmul compatibility)
     qkv_proj = oneArray(zeros(Float16, conv_channels, 1))
@@ -970,10 +970,13 @@ function reset_states!(m::GatedDeltaNet)
 end
 
 function (m::GatedDeltaNet)(x::AbstractArray{Float16,2}, pos::Int, rope::RotaryEmbedding, cache)
-    hidden = size(x, 1)
-    T = Float16
+ hidden = size(x, 1)
+ T = Float16
 
  # 1. Input projections (weights are already transposed by get_weight)
+ # Explicitly zero output buffers before use for numerical safety
+ fill!(m.qkv_proj, Float16(0.0))
+ fill!(m.z_buf, Float16(0.0))
  mat_mul!(m.qkv_proj, m.in_proj, x)
  mat_mul!(m.z_buf, m.gate_proj, x)
 
@@ -1043,9 +1046,18 @@ function (m::GatedDeltaNet)(x::AbstractArray{Float16,2}, pos::Int, rope::RotaryE
  # gate = exp(softplus(alpha + dt_bias) * a)
  # beta = sigmoid(beta)
  alpha_val = Float64(m.alpha_proj[h]) + Float64(m.ssm_dt_bias_cpu[h])
+ # Numerical stability: clamp alpha_val to prevent overflow
+ alpha_val = clamp(alpha_val, -20.0, 20.0)
  softplus_alpha = log(Float64(1.0) + exp(alpha_val)) # softplus
+ # Clamp softplus_alpha to prevent decay explosion/underflow
+ softplus_alpha = clamp(softplus_alpha, -10.0, 10.0)
  decay = Float32(exp(softplus_alpha * Float64(m.ssm_a_cpu[h])))
- beta = Float32(1.0 / (Float64(1.0) + exp(-Float64(m.beta_proj[h])))) # sigmoid
+ # Clamp decay to [0, 1] since it's a decay factor
+ decay = clamp(decay, Float32(0.0), Float32(1.0))
+ beta_val = Float64(m.beta_proj[h])
+ # Clamp beta_val for numerical stability
+ beta_val = clamp(beta_val, -20.0, 20.0)
+ beta = Float32(1.0 / (Float64(1.0) + exp(-beta_val))) # sigmoid
  
  # Get state for this head: (head_v_dim, head_v_dim)
  state = view(m.h, :, :, h)
@@ -1083,6 +1095,7 @@ function (m::GatedDeltaNet)(x::AbstractArray{Float16,2}, pos::Int, rope::RotaryE
  end
 
  # 10. Output projection (ssm_out is (hidden, d_inner) after get_weight transpose)
+ fill!(m.branch_out, Float16(0.0))
  copyto!(m.branch_out, reshape(Float16.(m.y_all_cpu), :, 1))
  result = mat_mul(m.ssm_out, m.branch_out)
 
