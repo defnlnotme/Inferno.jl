@@ -359,24 +359,36 @@ function init_kv_cache(config::QwenConfig)
  oneAPI.synchronize() # Ensure cache is zeroed before use
 
  # Attention buffers
- q_all = oneArray(zeros(Float16, n_heads_q * head_dim * 2))
- k_buf = oneArray(zeros(Float16, n_heads_kv * head_dim))
- v_buf = oneArray(zeros(Float16, n_heads_kv * head_dim))
- scores = oneArray(zeros(Float16, max_pos))
- attn_out_buf = oneArray(zeros(Float16, n_heads_q * head_dim))
+ q_all = oneArray{Float16}(undef, n_heads_q * head_dim * 2)
+ k_buf = oneArray{Float16}(undef, n_heads_kv * head_dim)
+ v_buf = oneArray{Float16}(undef, n_heads_kv * head_dim)
+ scores = oneArray{Float16}(undef, max_pos)
+ attn_out_buf = oneArray{Float16}(undef, n_heads_q * head_dim)
+ fill!(q_all, 0.0f0)
+ fill!(k_buf, 0.0f0)
+ fill!(v_buf, 0.0f0)
+ fill!(scores, 0.0f0)
+ fill!(attn_out_buf, 0.0f0)
 
  # MLP buffers (2D column matrices for GPU matmul)
- mlp_gate = oneArray(zeros(Float16, intermediate_size, 1))
- mlp_up = oneArray(zeros(Float16, intermediate_size, 1))
- branch_out = oneArray(zeros(Float16, hidden_size, 1))
+ mlp_gate = oneArray{Float16}(undef, intermediate_size, 1)
+ mlp_up = oneArray{Float16}(undef, intermediate_size, 1)
+ branch_out = oneArray{Float16}(undef, hidden_size, 1)
+ fill!(mlp_gate, 0.0f0)
+ fill!(mlp_up, 0.0f0)
+ fill!(branch_out, 0.0f0)
 
  # RoPE buffers
- rope_q_tmp = oneArray(zeros(Float16, rope_pairs * n_heads_q))
- rope_k_tmp = oneArray(zeros(Float16, rope_pairs * n_heads_kv))
+ rope_q_tmp = oneArray{Float16}(undef, rope_pairs * n_heads_q)
+ rope_k_tmp = oneArray{Float16}(undef, rope_pairs * n_heads_kv)
+ fill!(rope_q_tmp, 0.0f0)
+ fill!(rope_k_tmp, 0.0f0)
 
  # Normalization buffers
- norm1_buf = oneArray(zeros(Float16, hidden_size))
- norm2_buf = oneArray(zeros(Float16, hidden_size))
+ norm1_buf = oneArray{Float16}(undef, hidden_size)
+ norm2_buf = oneArray{Float16}(undef, hidden_size)
+ fill!(norm1_buf, 0.0f0)
+ fill!(norm2_buf, 0.0f0)
 
  return KVCache(k, v, 0, q_all, k_buf, v_buf, scores, attn_out_buf,
  mlp_gate, mlp_up, branch_out,
@@ -558,7 +570,8 @@ function (m::MoE)(x::oneMatrix{Float16})
  hidden_size, seq_len = size(x)
  gate_logits = mat_mul(m.gate, x)
  gate_logits_cpu = collect(gate_logits)
- output = oneArray(zeros(Float16, hidden_size, seq_len))
+ output = oneArray{Float16}(undef, hidden_size, seq_len)
+ fill!(output, 0.0f0)
 
  for t in 1:seq_len
  logits = gate_logits_cpu[:, t]
@@ -623,22 +636,32 @@ end
 
 function FullAttention(index::Int, arch, wq, wk, wv, wqkv, wo, q_norm, k_norm, n_heads, n_kv, hd, config::QwenConfig)
  q_size = (arch == :qwen || arch == :qwen2 || arch == :qwen2_5 || arch == :qwen35) ? hd * 2 * n_heads : hd * n_heads
- decode_q_full = oneArray(zeros(Float16, q_size, 1))
- decode_k = oneArray(zeros(Float16, hd * n_kv, 1))
- decode_v = oneArray(zeros(Float16, hd * n_kv, 1))
- decode_combined = oneArray(zeros(Float16, hd * n_heads, 1))
+ decode_q_full = oneArray{Float16}(undef, q_size, 1)
+ decode_k = oneArray{Float16}(undef, hd * n_kv, 1)
+ decode_v = oneArray{Float16}(undef, hd * n_kv, 1)
+ decode_combined = oneArray{Float16}(undef, hd * n_heads, 1)
+ fill!(decode_q_full, 0.0f0)
+ fill!(decode_k, 0.0f0)
+ fill!(decode_v, 0.0f0)
+ fill!(decode_combined, 0.0f0)
 
  # Fixed buffer sizes - sufficient for 4096 context
  max_len = 4096
- decode_scores = oneArray(zeros(Float16, max_len, 1))
- decode_pb = oneArray(zeros(Float16, max_len, 1))
- decode_out_h = oneArray(zeros(Float16, hd, 1))
+ decode_scores = oneArray{Float16}(undef, max_len, 1)
+ decode_pb = oneArray{Float16}(undef, max_len, 1)
+ decode_out_h = oneArray{Float16}(undef, hd, 1)
  wo_out_size = size(wo, 1)
- decode_wo_buf = oneArray(zeros(Float16, wo_out_size, 1))
+ decode_wo_buf = oneArray{Float16}(undef, wo_out_size, 1)
+ fill!(decode_scores, 0.0f0)
+ fill!(decode_pb, 0.0f0)
+ fill!(decode_out_h, 0.0f0)
+ fill!(decode_wo_buf, 0.0f0)
 
  # Prefill buffers - fixed size for 4096 context
- prefill_scores = oneArray(zeros(Float16, max_len, n_heads))
- prefill_pb = oneArray(zeros(Float16, max_len, n_heads))
+ prefill_scores = oneArray{Float16}(undef, max_len, n_heads)
+ prefill_pb = oneArray{Float16}(undef, max_len, n_heads)
+ fill!(prefill_scores, 0.0f0)
+ fill!(prefill_pb, 0.0f0)
 
  return FullAttention(index, arch, wq, wk, wv, wqkv, wo, q_norm, k_norm, n_heads, n_kv, hd,
  decode_q_full, decode_k, decode_v, decode_combined, decode_scores, decode_pb, decode_out_h,
@@ -851,7 +874,9 @@ function (m::MLAttention)(x::oneMatrix{Float16}, pos::Int, rope::RotaryEmbedding
     # We still need a proper MLA implementation.
     # For now, just a slightly better skeleton that uses some inputs.
     # Return zero for now as the full implementation is out of scope for a quick fix.
-    return oneArray(zeros(Float16, size(x, 1), seq))
+    out = oneArray{Float16}(undef, size(x, 1), seq)
+    fill!(out, 0.0f0)
+    return out
 end
 
 # --- Gated Delta Net (SSM Layer) ---
@@ -936,11 +961,16 @@ function GatedDeltaNet(index::Int, in_proj, gate_proj, ssm_out, ssm_conv1d, ssm_
  h = zeros(Float32, head_v_dim, head_v_dim, num_v_heads)
 
     # GPU scratchpads (2D column matrices for GPU matmul compatibility)
-    qkv_proj = oneArray(zeros(Float16, conv_channels, 1))
-    z_buf = oneArray(zeros(Float16, d_inner, 1))
-    x_conv = oneArray(zeros(Float16, conv_channels, 1))
-    y_all = oneArray(zeros(Float16, d_inner, 1))
-    branch_out = oneArray(zeros(Float16, d_inner, 1))
+    qkv_proj = oneArray{Float16}(undef, conv_channels, 1)
+    z_buf = oneArray{Float16}(undef, d_inner, 1)
+    x_conv = oneArray{Float16}(undef, conv_channels, 1)
+    y_all = oneArray{Float16}(undef, d_inner, 1)
+    branch_out = oneArray{Float16}(undef, d_inner, 1)
+    fill!(qkv_proj, 0.0f0)
+    fill!(z_buf, 0.0f0)
+    fill!(x_conv, 0.0f0)
+    fill!(y_all, 0.0f0)
+    fill!(branch_out, 0.0f0)
 
  # CPU scratchpads
  x_norm_cpu = zeros(Float16, config.hidden_size)
