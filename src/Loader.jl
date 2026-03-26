@@ -226,11 +226,11 @@ function extract_sorted_blocks(file_tensors::Dict{String,GGUF.TensorInfo})
 end
 
 function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig;
-    mmproj::Union{GGUF.GGUFFile,Nothing}=nothing)
-    arch = config.architecture
-    embed_raw = extract_tensor(file, "token_embd.weight")
-    # Ensure embedding is Float16 for consistency with model weights
-    embed = embed_raw isa Model.IQ2XXSMatrix ? embed_raw : Float16.(embed_raw)
+ mmproj::Union{GGUF.GGUFFile,Nothing}=nothing)
+ arch = config.architecture
+ embed_raw = extract_tensor(file, "token_embd.weight")
+ # Embedding must be on GPU for inference - use Float16 for memory efficiency
+ embed = embed_raw isa Model.IQ2XXSMatrix ? embed_raw : oneArray(Float16.(embed_raw))
     T_model = eltype(embed) # Use native type of embedding as model baseline
 
     layers = Model.DecoderLayer[]

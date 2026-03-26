@@ -1110,13 +1110,13 @@ end
 
 # --- Model ---
 struct QwenModel
-    config::QwenConfig
-    embed::Matrix{Float16} # CPU-based (kept for compatibility)
-    layers::Vector{DecoderLayer}
-    final_norm::RMSNorm
-    lm_head::Matrix{Float16} # CPU-based (kept for compatibility)
-    rope::RotaryEmbedding
-    mmproj::Union{Dict{String,Any},Nothing}
+ config::QwenConfig
+ embed::Union{oneMatrix{Float16},Matrix{Float16}} # GPU or CPU embedding
+ layers::Vector{DecoderLayer}
+ final_norm::RMSNorm
+ lm_head::Union{oneMatrix{Float16},Matrix{Float16}} # GPU or CPU lm_head
+ rope::RotaryEmbedding
+ mmproj::Union{Dict{String,Any},Nothing}
 end
 
 # Free all GPU memory associated with a QwenModel (weights, norms, etc.)
