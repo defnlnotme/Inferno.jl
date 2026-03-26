@@ -260,7 +260,7 @@ Add documentation explaining:
 extensions = String[
  "SPV_EXT_relaxed_printf_string_address_space",
  "SPV_EXT_shader_atomic_float_add",
- "SPV_KHR_bfloat16"  # <-- Added this
+ "SPV_KHR_bfloat16" # <-- Added this
 ]
 
 # Result: Compilation asks for SPV_INTEL_bfloat16_arithmetic
@@ -302,6 +302,104 @@ LLVM IR → SPIR-V translator → GPU execution
 | AMD RDNA3+ | ✅ Native | ROCm supports | ✅ Yes |
 
 **Conclusion**: This is **NOT** a oneAPI.jl limitation - it's an **Intel Arc GPU hardware/driver limitation**.
+
+## OpenVINO Approach: How Intel Actually Handles This
+
+### Key Insight: OpenVINO Uses oneDNN (CPU), Not GPU
+
+OpenVINO's quantized inference works differently:
+
+**1. Quantized Types Supported:**
+```cpp
+// OpenVINO element types (element_type.hpp)
+enum class Type_t {
+ i4, i8,     // Integer quantized
+ u4, u8,     // Unsigned quantized
+ bf16, f16,  // Half precision
+ f32,        // Full precision
+ nf4,        // Normalized float 4
+ f8e4m3, f8e5m2,  // FP8 types
+};
+```
+
+**2. Computation Approach:**
+
+oneDNN (the backend for OpenVINO CPU inference) uses:
+- **INT8/INT4 weights**: Dequantized to **FP32** for computation
+- **BF16 weights**: Native BF16 operations on supported CPUs (AVX512_BF16)
+- **Hybrid approach**: Quantize weights, compute in FP32, store in FP16/BF16
+
+**3. BF16 on Intel CPUs:**
+```cpp
+// oneDNN bfloat16.cpp - CPU conversion
+void cvt_bfloat16_to_float(float *out, const bfloat16_t *inp, size_t nelems) {
+#if DNNL_X64
+ if (mayiuse(cpu_isa_t::avx512_core) || mayiuse(avx2_vnni_2)) {
+ // Use AVX512 BF16 instructions if available
+ static const cpu::x64::jit_cvt_xf16_to_ps_t kernel(data_type::bf16, false);
+ return kernel(out, inp, nelems);
+ }
+#endif
+ // Fallback: Scalar conversion
+ PRAGMA_OMP_SIMD()
+ for (size_t i = 0; i < nelems; ++i)
+ out[i] = inp[i]; // BF16 → FP32 is just bit extension
+}
+```
+
+**4. INT8 MatMul:**
+```cpp
+// oneDNN gemm_driver.cpp
+constexpr bool is_int8 = utils::one_of(
+ data_traits_t<a_type>::data_type, data_type::s8, data_type::u8);
+bool is_int8_amx = is_int8 && mayiuse(avx512_core_amx);
+// INT8 GEMM accumulates to INT32, then converts to FP32
+```
+
+### Why This Works for OpenVINO but Not Us
+
+| Aspect | OpenVINO/oneDNN | Our GPU Approach |
+|--------|-----------------|------------------|
+| **Backend** | CPU (AVX512/AMX) | GPU (Intel Arc) |
+| **INT8/INT4** | Dequant to FP32 on-the-fly | Not implemented |
+| **BF16** | Native AVX512_BF16 instructions | SPIR-V extension missing |
+| **Accumulation** | INT32 for quantized, FP32 for BF16 | FP32 intermediate |
+| **Hardware** | Xeon/Core with AVX512 | Intel Arc GPU |
+
+### The Real Solution: Quantized Inference
+
+**What OpenVINO actually does:**
+1. **INT4/INT8 weights**: Stored in 4/8 bits
+2. **Dequantization**: On-the-fly to FP32 during GEMM
+3. **Accumulation**: INT32 for quantized, FP32 for BF16
+4. **Activation storage**: FP16 or BF16
+
+**For our GPU implementation, we should:**
+1. **Keep FP16 storage** (matching Qwen's weight loading)
+2. **Add INT8/INT4 quantization support** (future work)
+3. **Use FP32 intermediate** (as we do now)
+4. **Consider block quantization** (like llama.cpp's k-quants)
+
+### Future Path: Add Quantization Support
+
+If we want to match OpenVINO's efficiency:
+
+```julia
+# Potential future implementation
+struct QuantMatrix
+ weight::Vector{UInt8} # INT8/INT4 packed weights
+ scale::Vector{Float16} # Per-channel scales
+ zeropoint::Vector{Int8} # Per-channel zero points
+ shape::Tuple{Int, Int}
+ 
+ # Dequantize on-the-fly during matmul
+ function matmul(q::QuantMatrix, x::oneMatrix{Float16})
+ # Dequantize to FP32, compute, store as FP16
+ weight_f32 = dequantize(q.weight, q.scale, q.zeropoint)
+ return oneMatrix{Float16}(weight_f32 * x)
+ end
+end
+```
 
 ### Future Consideration
 
