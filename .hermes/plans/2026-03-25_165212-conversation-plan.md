@@ -244,53 +244,64 @@ Add documentation explaining:
 
 **Recommendation**: Our Float16 storage with Float32 compute approach is numerically sound and matches llama.cpp's philosophy of "compute in Float32, store in Float16".
 
-## Recommendation: Cannot Switch to BFloat16 (GPU Limitation)
+## Recommendation: Cannot Switch to BFloat16 (SPIR-V Extension Issue)
 
-### CRITICAL BLOCKER: oneAPI/SPIR-V Does Not Support BFloat16
+### CRITICAL BLOCKER: BFloat16 Requires Unsupported Extensions
 
-**Error encountered:**
+**Error Chain:**
+1. First error: `SPV_KHR_bfloat16` required for bfloat type
+2. Second error: `SPV_INTEL_bfloat16_arithmetic` required for arithmetic operations  
+3. Third error: `Invalid SPIR-V module: input SPIR-V module uses unknown extension 'SPV_INTEL_bfloat16_arithmetic'`
+
+**Technical Investigation:**
+
+```julia
+# Attempted: Add SPV_KHR_bfloat16 extension
+extensions = String[
+ "SPV_EXT_relaxed_printf_string_address_space",
+ "SPV_EXT_shader_atomic_float_add",
+ "SPV_KHR_bfloat16"  # <-- Added this
+]
+
+# Result: Compilation asks for SPV_INTEL_bfloat16_arithmetic
+# Then: Runtime rejects SPV_INTEL_bfloat16_arithmetic as "unknown extension"
 ```
-RequiresExtension: Feature requires the following SPIR-V extension:
- SPV_KHR_bfloat16
-NOTE: LLVM module contains bfloat type, translation of which requires this extension
-ERROR: Failed to translate LLVM code to SPIR-V.
-```
 
-**Technical Details:**
-- Intel Arc GPUs require SPV_KHR_bfloat16 extension for BF16
-- This extension is not available in current oneAPI/SPIR-V implementations
-- BFloat16s.jl package works on CPU but fails on GPU compilation
+**Root Cause:**
+- LLVM/SPIR-V translator generates BF16 arithmetic operations
+- These require `SPV_INTEL_bfloat16_arithmetic` extension
+- Intel Arc GPU runtime does NOT support this extension
+- The extension exists in SPIR-V spec but not in Intel's implementation
 
 **Verified:**
 ```julia
-# CPU works fine
-julia> BFloat16(1.0)
-BFloat16(1.0)
+# oneAPI.jl compilation pipeline:
+LLVM IR → SPIR-V translator → GPU execution
 
-# GPU fails with SPV_KHR_bfloat16 extension error
-julia> oneAPI.ones(BFloat16, 10)
-ERROR: Failed to translate LLVM code to SPIR-V.
+# Failure point:
+# SPIR-V translator: Requires SPV_INTEL_bfloat16_arithmetic for BF16 ops
+# Intel runtime: "Invalid SPIR-V module: unknown extension"
 ```
 
-### Current Hardware Support
+### Layer-by-Layer Analysis
 
-| Platform | BFloat16 Native | Status |
-|----------|-----------------|--------|
-| NVIDIA RTX 30/40 series | ✅ Yes (Tensor Cores) | Supported in CUDA |
-| Intel Arc (oneAPI) | ❌ No | Requires SPV_KHR_bfloat16 |
-| AMD RDNA3+ | ✅ Yes | Supported in ROCm |
+| Layer | BFloat16 Support | Status |
+|-------|------------------|--------|
+| Julia (BFloat16s.jl) | ✅ Yes | Works on CPU |
+| LLVM IR | ✅ Yes | bfloat type exists |
+| SPIR-V Translator | ⚠️ Partial | Needs extension |
+| oneAPI/SPIR-V | ❌ No | Extension unsupported |
+| Intel Arc Hardware | ❓ Unknown | Runtime rejects it |
 
-### Conclusion: Must Keep Float16
+### Hardware Support Reality Check
 
-**Our current approach is correct:**
-- Store as Float16 (supported on Intel Arc)
-- Compute with Float32 intermediate (prevents overflow)
-- This matches llama.cpp's numerical approach
+| Platform | BF16 Native | Extension Supported | Works? |
+|----------|-------------|---------------------|--------|
+| NVIDIA RTX 30/40 | ✅ Tensor Cores | CUDA supports BF16 | ✅ Yes |
+| Intel Arc | ❓ Unknown | ❌ Runtime rejects | ❌ No |
+| AMD RDNA3+ | ✅ Native | ROCm supports | ✅ Yes |
 
-**Cannot switch to BF16 because:**
-1. oneAPI doesn't support SPV_KHR_bfloat16 extension
-2. Intel Arc GPUs don't have native BF16 instructions
-3. Would require fallback to CPU (defeats purpose of GPU acceleration)
+**Conclusion**: This is **NOT** a oneAPI.jl limitation - it's an **Intel Arc GPU hardware/driver limitation**.
 
 ### Future Consideration
 
