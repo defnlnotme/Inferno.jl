@@ -649,4 +649,71 @@ function stream_to_stdout_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, d
     end
 end
 
+"""
+    stream_to_stdout_cpu(model, tok, prompt; kwargs...)
+
+Generate from a string prompt and print tokens as they are produced.
+This is a convenience method that handles tokenization internally.
+
+# Example
+```julia
+model, file = load_model_cpu("model.gguf")
+tok = SimpleTokenizer(file)
+stream_to_stdout_cpu(model, tok, "Hello, how are you?")
+```
+"""
+function stream_to_stdout_cpu(model::QwenModelCPU, tok, prompt::String; kwargs...)
+    prompt_tokens = encode_prompt(tok, prompt)
+    decode_fn = (ids) -> decode_tokens(tok, ids)
+    return stream_to_stdout_cpu(model, prompt_tokens, decode_fn; kwargs...)
+end
+
+# Helper functions for tokenization
+function encode_prompt(tok, prompt::String)
+    # Use Generate module's tokenizer if available, otherwise simple encoding
+    if hasfield(typeof(tok), :token_to_id)
+        tokens = Int[]
+        remaining = prompt
+        while !isempty(remaining)
+            found = false
+            for len in length(remaining):-1:1
+                candidate = SubString(remaining, 1, len)
+                for prefix in ["", "Ġ"]
+                    key = prefix * candidate
+                    if haskey(tok.token_to_id, key)
+                        push!(tokens, tok.token_to_id[key])
+                        remaining = len < length(remaining) ? SubString(remaining, len + 1) : ""
+                        found = true
+                        break
+                    end
+                end
+                found && break
+            end
+            if !found
+                remaining = length(remaining) > 1 ? SubString(remaining, 2) : ""
+            end
+        end
+        return tokens
+    else
+        # Fallback: assume tok is a function
+        return tok(prompt)
+    end
+end
+
+function decode_tokens(tok, ids::Vector{Int})
+    if hasfield(typeof(tok), :tokens)
+        parts = String[]
+        for id in ids
+            if 1 <= id + 1 <= length(tok.tokens)
+                t = tok.tokens[id + 1]
+                t = replace(t, "Ġ" => " ")
+                push!(parts, t)
+            end
+        end
+        return join(parts)
+    else
+        return tok(ids)
+    end
+end
+
 end # module
