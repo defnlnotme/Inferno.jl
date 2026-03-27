@@ -1,91 +1,118 @@
-# 🔥 Inferno.jl
+# Inferno.jl
 
-> [!WARNING]
-> **Status: Experimental / Work-in-Progress**
-> The codebase is currently in a pre-alpha state. While it can load GGUF models, it frequently hangs or fails to generate tokens on certain Intel GPU driver versions due to known memory synchronization issues. **It is not yet production-ready.**
+Julia native inference engine for GGUF models with Intel GPU (oneAPI) support.
 
-**Inferno.jl** is a research-oriented, Julia-native LLM inference engine specifically targeted at **Intel GPUs** and the **oneAPI** ecosystem. The project aims to provide a lean, high-performance solution for modern transformer-based models like the **Qwen 3.5** family, while explicitly handling the unique challenges of the Intel hardware stack.
+## Features
 
----
+- Pure Julia implementation (no Python dependencies)
+- CPU and Intel GPU (oneAPI) backends
+- GGUF format support with quantization (Q4_K, Q5_K, Q6_K, Q8_0, etc.)
+- Qwen3.5 architecture support (SSM + Full Attention hybrid)
 
-## 🚀 Project Goals
-
-- **Intel GPU Native**: Deep integration with `oneAPI.jl`, targeting **Intel Arc** and **Battlemage** (B580) series.
-- **Custom Quantization Kernels**: Hand-optimized dequantization for **IQ2_XXS**, **Q4_0**, and **Q8_0**.
-- **Self-Contained**: Native GGUF parsing and BPE tokenization without heavy external binary dependencies.
-- **Hardware Stability**: Implementing robust workarounds for Intel driver quirks through custom Level Zero integration.
-
----
-
-## ⚡ Current Status & Known Issues
-
-We are currently working through significant stability hurdles related to the Intel oneAPI driver stack.
-
-- **Driver Poisoning**: Certain kernel dispatches (especially mixed `HostBuffer`/`DeviceBuffer` operations) can "poison" the Level Zero command queue, causes subsequent operations to hang or return zeroed data. See [oneAPI.jl #458](https://github.com/JuliaGPU/oneAPI.jl/issues/458).
-- **Inconsistent Token Generation**: Due to the above, the engine may load successfully but fail to yield tokens during the `generate_stream` loop.
-- **Memory Synchronization**: Shared memory (`HostBuffer`) consistency is a primary blocker. We are transitioning to explicit copy-based synchronization and custom vendor-layer patches.
-
----
-
-## 📦 Installation (For Developers)
-
-Inferno is currently intended for developers and researchers.
-
-```julia
-using Pkg
-Pkg.add("Inferno")
-```
-
-### Requirements
-- **Hardware**: Intel Arc (Alchemist) or Battlemage GPU.
-- **Driver**: Intel Level Zero drivers installed on the system.
-- **Software**: Julia 1.10+ and the Intel oneAPI Base Toolkit.
-
----
-
-## 🛠️ Quick Start
-
-### Basic Usage (Experimental)
+## Quick Start
 
 ```julia
 using Inferno
 
-# Load the model (Note: may hang if driver is in a bad state)
-model, tokenizer = Inferno.load_model("path/to/qwen3.5-0.8b-iq2_xxs.gguf")
+# Load model on CPU
+model, file = LoaderCPU.load_model_cpu("path/to/model.gguf")
 
-# Generation attempt
-stream = Inferno.generate_stream(model, tokenizer, prompt; max_tokens=50)
+# Initialize KV cache and reset SSM states
+caches = [ModelCPU.init_kv_cache_cpu(model.config, 512) for _ in 1:model.config.num_hidden_layers]
+ModelCPU.reset_states_cpu!(model)
 
-for token in stream
-    print(token)
-    flush(stdout)
+# Run inference for a single token
+x = view(model.embed, :, token_id)  # Get embedding
+for (i, layer) in enumerate(model.layers)
+    x = layer(x, position, model.rope, caches[i])
 end
+x = model.final_norm(x)
+logits = model.lm_head * x
+
+# Get next token (greedy)
+next_token = argmax(logits)
 ```
 
-### HTTP Server
+## Example
 
-```julia
-# Starts an OpenAI-compatible server on port 8080
-Inferno.main("path/to/model.gguf"; port=8080)
+See `examples/basic_usage.jl` for a complete generation example:
+
+```bash
+julia --project=. examples/basic_usage.jl
 ```
 
----
+## Testing
 
-## 🏗️ Technical Architecture
+Run tests with:
 
-- **`Loader.jl`**: Maps GGUF tensors; handles the transition from disk to GPU memory.
-- **`Dequant.jl`**: High-performance oneAPI kernels for on-the-fly dequantization.
-- **`Model.jl`**: Transformer implementation with optimizations for Intel's execution model.
-- **`vendor/`**: A critical layer containing custom patches for **Level Zero** to bypass driver-level issues and provide stable synchronization primitives.
+```bash
+julia --project=. -e 'using Pkg; Pkg.test()'
+```
 
----
+## Model Download
 
-## 🤝 How to Help
+Download a test model:
 
-The project is currently blocked by low-level memory consistency issues on Intel hardware. We welcome help from developers familiar with **oneAPI**, **Level Zero**, and **JuliaGPU** architecture. Check the issue tracker for specific driver-repro cases.
+```bash
+./scripts/download_model.sh
+```
 
----
+Or manually download a Qwen3.5 GGUF model from HuggingFace and set the path:
 
-## 📄 License
+```bash
+export INFERNO_MODEL_PATH=/path/to/model.gguf
+```
 
-This project is open-source. See the repository for licensing details.
+## Architecture Support
+
+### Qwen3.5 (Hybrid SSM + Attention)
+
+- SSM layers (Mamba-like state space model) every 4th layer
+- Full attention layers with:
+  - Query/Gate gating mechanism
+  - Q/K normalization
+  - Grouped Query Attention (GQA)
+  - Partial rotary embeddings (25% of head_dim)
+
+### Weight Format
+
+The model expects GGUF format with:
+
+- `blk.N.attn_qkv.weight` for SSM layers
+- `blk.N.attn_q.weight`, `blk.N.attn_k.weight`, `blk.N.attn_v.weight` for attention layers
+- `blk.N.attn_output.weight` for output projection
+- `blk.N.attn_q_norm.weight`, `blk.N.attn_k_norm.weight` for normalization
+
+## Development Status
+
+- [x] GGUF loading and parsing
+- [x] Dequantization (Q4_K, Q5_K, Q6_K, Q8_0)
+- [x] RMSNorm (Qwen3.5 style: 1 + weight)
+- [x] Rotary Position Embeddings (partial rotary)
+- [x] SSM/Mamba layer
+- [x] Full Attention layer with Q/K norm and gating
+- [ ] GPU kernel optimization
+- [ ] Proper tokenizer (BPE)
+- [ ] Sampling strategies (temperature, top-p, top-k)
+- [ ] Batched inference
+
+## Project Structure
+
+```
+src/
+├── Inferno.jl         # Main module
+├── GGUF.jl            # GGUF file format parsing
+├── Dequant.jl         # Quantization dequantization
+├── ModelCPU.jl        # CPU inference kernels
+├── LoaderCPU.jl       # CPU model loading
+├── ModelGPU.jl        # GPU inference kernels (WIP)
+└── LoaderGPU.jl       # GPU model loading (WIP)
+test/
+└── runtests.jl        # Test suite
+examples/
+└── basic_usage.jl     # Usage example
+```
+
+## License
+
+MIT
