@@ -1,14 +1,19 @@
 module Inferno
 
-
-using oneAPI
+# GPU backend (optional)
+try
+    using oneAPI
+catch
+end
 
 include("QuantsData.jl")
 include("Dequant.jl")
 include("GGUF.jl")
 include("Model.jl")
+include("ModelCPU.jl")
 include("Tokenizer.jl")
 include("Loader.jl")
+include("LoaderCPU.jl")
 include("Engine.jl")
 include("Server.jl")
 
@@ -16,12 +21,15 @@ using .QuantsData
 using .Dequant
 using .GGUF
 using .Model
+using .ModelCPU
 using .Tokenizer
 using .Loader
+using .LoaderCPU
 using .Engine
 using .Server
 
-export load_model, start_server, non_nothing_fields, stream_to_stdout
+export load_model, load_model_cpu, start_server, non_nothing_fields, stream_to_stdout
+export LoaderCPU, ModelCPU
 
 """
     non_nothing_fields(obj) -> NamedTuple
