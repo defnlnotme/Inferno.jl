@@ -670,8 +670,34 @@ end
 
 # Helper functions for tokenization
 function encode_prompt(tok, prompt::String)
-    # Use Generate module's tokenizer if available, otherwise simple encoding
-    if hasfield(typeof(tok), :token_to_id)
+    # Handle Vector{String} (raw token list from GGUF)
+    if tok isa Vector{String}
+        tokens_data = tok
+        tokens = Int[]
+        remaining = prompt
+        while !isempty(remaining)
+            found = false
+            for len in length(remaining):-1:1
+                candidate = SubString(remaining, 1, len)
+                for prefix in ["", "Ġ"]
+                    key = prefix * candidate
+                    idx = findfirst(==(key), tokens_data)
+                    if idx !== nothing
+                        push!(tokens, idx - 1)  # 0-indexed
+                        remaining = len < length(remaining) ? SubString(remaining, len + 1) : ""
+                        found = true
+                        break
+                    end
+                end
+                found && break
+            end
+            if !found
+                remaining = length(remaining) > 1 ? SubString(remaining, 2) : ""
+            end
+        end
+        return tokens
+    # Handle SimpleTokenizer struct
+    elseif hasfield(typeof(tok), :token_to_id)
         tokens = Int[]
         remaining = prompt
         while !isempty(remaining)
@@ -701,7 +727,19 @@ function encode_prompt(tok, prompt::String)
 end
 
 function decode_tokens(tok, ids::Vector{Int})
-    if hasfield(typeof(tok), :tokens)
+    # Handle Vector{String} (raw token list from GGUF)
+    if tok isa Vector{String}
+        parts = String[]
+        for id in ids
+            if 1 <= id + 1 <= length(tok)
+                t = tok[id + 1]
+                t = replace(t, "Ġ" => " ")
+                push!(parts, t)
+            end
+        end
+        return join(parts)
+    # Handle SimpleTokenizer struct
+    elseif hasfield(typeof(tok), :tokens)
         parts = String[]
         for id in ids
             if 1 <= id + 1 <= length(tok.tokens)
