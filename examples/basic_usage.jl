@@ -13,51 +13,100 @@ println("  Hidden size: $(model.config.hidden_size)")
 println("  Layers: $(model.config.num_hidden_layers)")
 println("  Vocab size: $(model.config.vocab_size)")
 
-# Get tokenizer
+# Get tokenizer data
 tokens_data = file.metadata["tokenizer.ggml.tokens"]
 
-# Initialize KV caches for each layer
+# Simple tokenization function (production use requires proper BPE tokenizer)
+function simple_tokenize(text::String, tokens_data)
+    # This is a hack - for production use the Tokenizer module
+    # For now, just find whole-word matches
+    token_ids = Int[]
+    remaining = text
+    while !isempty(remaining)
+        found = false
+        # Try longest match first
+        for len in length(remaining):-1:1
+            candidate = SubString(remaining, 1, len)
+            for (i, t) in enumerate(tokens_data)
+                # Handle Ġ prefix (space marker in GPT-2 style tokenizers)
+                clean_t = replace(t, "Ġ" => " ")
+                if clean_t == candidate || t == candidate
+                    push!(token_ids, i - 1)  # 0-indexed
+                    remaining = length(candidate) < length(remaining) ? SubString(remaining, len + 1) : ""
+                    found = true
+                    break
+                end
+            end
+            found && break
+        end
+        if !found
+            # Skip unknown character
+            remaining = length(remaining) > 1 ? SubString(remaining, 2) : ""
+        end
+    end
+    return token_ids
+end
+
+# Decode function
+function decode_tokens(token_ids::Vector{Int}, tokens_data)
+    join([replace(tokens_data[t + 1], "Ġ" => " ") for t in token_ids])
+end
+
+# Example 1: Manual token-by-token generation
+println("\n" * "="^50)
+println("Example 1: Manual Generation")
+println("="^50)
+
+# Use some known tokens
+# "The" is typically token 562 (with Ġ prefix = " The")
+# Try a simple prompt
+prompt_tokens = [562]  # " The"
+
+println("Starting with token 562 (\" The\")")
+
+# Initialize caches and states
 caches = [ModelCPU.init_kv_cache_cpu(model.config, 512) for _ in 1:model.config.num_hidden_layers]
 ModelCPU.reset_states_cpu!(model)
 
-# Tokenize input (simple word lookup - for production use proper tokenizer)
-# "What is" in Qwen tokenizer
-input_tokens = [3710, 369]  # "What", " is"
-
-println("\nInput tokens: $input_tokens")
-println("Input text: ", join([tokens_data[t+1] for t in input_tokens]))
-
-# Generate tokens
-println("\nGenerating...")
-all_tokens = copy(input_tokens)
-
-for i in 1:20
-    tok = all_tokens[end]
-    pos = length(all_tokens) - 1
+tokens = copy(prompt_tokens)
+for i in 1:10
+    tok = tokens[end]
+    pos = length(tokens) - 1
     
-    # Get embedding
     x = view(model.embed, :, tok)
-    
-    # Forward through all layers
     for (j, layer) in enumerate(model.layers)
         x = layer(x, pos, model.rope, caches[j])
     end
-    
-    # Final normalization
     x = model.final_norm(x)
-    
-    # Compute logits
     logits = model.lm_head * x
     
-    # Greedy decode (take argmax)
     next_token = argmax(logits)
-    push!(all_tokens, next_token)
-    
-    # Print progress
-    print(".")
+    push!(tokens, next_token)
 end
-println()
 
-# Decode output
-output_text = join([tokens_data[t+1] for t in all_tokens])
-println("\nGenerated text: $output_text")
+output_text = decode_tokens(tokens, tokens_data)
+println("\nGenerated: $output_text")
+
+# Example 2: Using stream_to_stdout_cpu
+println("\n" * "="^50)
+println("Example 2: Streaming Generation")
+println("="^50)
+
+# Decode function for streaming
+decode_fn = (ids) -> decode_tokens(ids, tokens_data)
+
+println("\nPrompt: \" The\"")
+print("Output: ")
+
+# Use streaming generation with sampling
+result = stream_to_stdout_cpu(
+    model,
+    [562],  # " The"
+    decode_fn;
+    max_tokens=20,
+    temperature=0.7f0,
+    top_p=0.9f0,
+    top_k=40
+)
+
+println("\nFull output: $result")

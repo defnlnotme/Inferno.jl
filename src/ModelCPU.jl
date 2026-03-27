@@ -7,8 +7,8 @@ module ModelCPU
 using LinearAlgebra
 using Statistics
 
-export QwenConfigCPU, QwenModelCPU, KVCacheCPU, forward_cpu!, RMSNormCPU, MLPCPU, GatedDeltaNetCPU, FullAttentionCPU, DecoderLayerCPU
-export init_kv_cache_cpu, reset_states_cpu!
+export QwenConfigCPU, QwenModelCPU, KVCacheCPU, forward_cpu!, RMSNormCPU, MLPCPU, GatedDeltaNetCPU, FullAttentionCPU, DecoderLayerCPU, RotaryEmbeddingCPU
+export init_kv_cache_cpu, reset_states_cpu!, softmax_sample, generate_cpu, generate_stream_cpu, stream_to_stdout_cpu
 
 # --- Configuration ---
 Base.@kwdef struct QwenConfigCPU
@@ -423,6 +423,228 @@ function reset_states_cpu!(model::QwenModelCPU)
     for layer in model.layers
         if layer.is_ssm
             reset_states_cpu!(layer.op)
+        end
+    end
+end
+
+# --- Sampling Functions ---
+
+function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top_p::Float32=1.0f0, top_k::Int=0)
+    # Apply temperature
+    if temperature != 1.0f0
+        logits = logits ./ temperature
+    end
+    
+    # Apply top-k filtering
+    if top_k > 0
+        sorted_indices = sortperm(logits, rev=true)
+        keep_indices = Set(sorted_indices[1:min(top_k, length(logits))])
+        for i in 1:length(logits)
+            if i ∉ keep_indices
+                logits[i] = -Inf32
+            end
+        end
+    end
+    
+    # Apply softmax
+    max_logit = maximum(logits)
+    exp_logits = exp.(logits .- max_logit)
+    probs = exp_logits ./ sum(exp_logits)
+    
+    # Apply top-p (nucleus) filtering
+    if top_p < 1.0f0
+        sorted_indices = sortperm(probs, rev=true)
+        cumsum = 0.0f0
+        keep_indices = Set{Int}()
+        for idx in sorted_indices
+            push!(keep_indices, idx)
+            cumsum += probs[idx]
+            if cumsum >= top_p
+                break
+            end
+        end
+        # Zero out probabilities for tokens not in top-p
+        for i in 1:length(probs)
+            if i ∉ keep_indices
+                probs[i] = 0.0f0
+            end
+        end
+        # Renormalize
+        probs ./= sum(probs)
+    end
+    
+    # Sample from distribution
+    r = rand(Float32)
+    cumsum = 0.0f0
+    for i in 1:length(probs)
+        cumsum += probs[i]
+        if r <= cumsum
+            return i
+        end
+    end
+    return length(probs)
+end
+
+function apply_repetition_penalty!(logits::Vector{Float32}, token_counts::Dict{Int,Int}, penalty::Float32)
+    if penalty != 1.0f0
+        for (tok, count) in token_counts
+            if logits[tok] > 0
+                logits[tok] /= penalty^count
+            else
+                logits[tok] *= penalty^count
+            end
+        end
+    end
+end
+
+# --- Generation Functions ---
+
+"""
+    generate_cpu(model, tokens, pos, caches; kwargs...)
+
+Generate a single token from the model.
+
+Returns: (next_token, updated_logits)
+"""
+function generate_cpu(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches::Vector{KVCacheCPU};
+    temperature::Float32=1.0f0, top_p::Float32=1.0f0, top_k::Int=0,
+    repetition_penalty::Float32=1.0f0, token_counts::Dict{Int,Int}=Dict{Int,Int}())
+    
+    # Forward pass
+    logits = forward_cpu!(model, tokens, pos, caches)
+    
+    # Get logits for last token
+    logits_vec = vec(logits[:, end])
+    
+    # Apply repetition penalty
+    apply_repetition_penalty!(logits_vec, token_counts, repetition_penalty)
+    
+    # Sample
+    next_token = softmax_sample(logits_vec; temperature, top_p, top_k)
+    
+    return next_token, logits_vec
+end
+
+"""
+    generate_stream_cpu(model, prompt_tokens; kwargs...)
+
+Create a channel that yields decoded token strings as they are generated.
+
+Usage:
+```julia
+stream = generate_stream_cpu(model, prompt_tokens; max_tokens=100)
+for token_str in stream
+    print(token_str)
+end
+```
+"""
+function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, decode_fn::Function;
+    max_tokens::Int=512,
+    temperature::Float32=1.0f0,
+    top_p::Float32=0.95f0,
+    top_k::Int=0,
+    repetition_penalty::Float32=1.0f0,
+    stop_tokens::Set{Int}=Set{Int}())
+    
+    return Channel{String}(32) do chan
+        try
+            # Initialize caches and states
+            caches = [init_kv_cache_cpu(model.config, 512) for _ in 1:model.config.num_hidden_layers]
+            reset_states_cpu!(model)
+            
+            # Track token counts for repetition penalty
+            token_counts = Dict{Int,Int}()
+            for t in prompt_tokens
+                token_counts[t] = get(token_counts, t, 0) + 1
+            end
+            
+            # Process prompt tokens
+            curr_pos = 0
+            if !isempty(prompt_tokens)
+                _ = forward_cpu!(model, prompt_tokens[1:end-1], 0, caches)
+                curr_pos = length(prompt_tokens) - 1
+                
+                # Generate first token from prompt context
+                next_token, _ = generate_cpu(model, [prompt_tokens[end]], curr_pos, caches;
+                    temperature, top_p, top_k, repetition_penalty, token_counts)
+                
+                curr_pos += 1
+                token_counts[next_token] = get(token_counts, next_token, 0) + 1
+                
+                # Decode and yield
+                token_str = decode_fn([next_token])
+                put!(chan, token_str)
+                
+                last_token = next_token
+                
+                # Generate remaining tokens
+                for _ in 2:max_tokens
+                    if last_token in stop_tokens
+                        break
+                    end
+                    
+                    next_token, _ = generate_cpu(model, [last_token], curr_pos, caches;
+                        temperature, top_p, top_k, repetition_penalty, token_counts)
+                    
+                    curr_pos += 1
+                    token_counts[next_token] = get(token_counts, next_token, 0) + 1
+                    
+                    token_str = decode_fn([next_token])
+                    put!(chan, token_str)
+                    
+                    last_token = next_token
+                end
+            end
+            
+        catch e
+            if !(e isa InvalidStateException)
+                @error "ERROR during CPU generation stream" exception=(e, catch_backtrace())
+            end
+        finally
+            try
+                close(chan)
+            catch
+            end
+        end
+    end
+end
+
+"""
+    stream_to_stdout_cpu(model, prompt_tokens, decode_fn; kwargs...)
+
+Generate tokens and print them to stdout as they are produced.
+
+Returns the complete generated text as a String.
+"""
+function stream_to_stdout_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, decode_fn::Function;
+    max_tokens::Int=100,
+    temperature::Float32=0.7f0,
+    top_p::Float32=0.95f0,
+    top_k::Int=20,
+    repetition_penalty::Float32=1.0f0,
+    stop_tokens::Set{Int}=Set{Int}(),
+    io::IO=stdout)
+    
+    stream = generate_stream_cpu(model, prompt_tokens, decode_fn;
+        max_tokens, temperature, top_p, top_k, repetition_penalty, stop_tokens)
+    
+    generated_text = IOBuffer()
+    try
+        for token in stream
+            print(io, token)
+            flush(io)
+            print(generated_text, token)
+        end
+        println(io)
+        flush(io)
+        return String(take!(generated_text))
+    catch e
+        if e isa InterruptException
+            println(io)
+            flush(io)
+            return String(take!(generated_text))
+        else
+            rethrow(e)
         end
     end
 end

@@ -28,8 +28,8 @@ using .LoaderCPU
 using .Engine
 using .Server
 
-export load_model, load_model_cpu, start_server, non_nothing_fields, stream_to_stdout
-export LoaderCPU, ModelCPU
+export load_model, load_model_cpu, start_server, non_nothing_fields, stream_to_stdout, stream_to_stdout_cpu
+export LoaderCPU, ModelCPU, generate_stream_cpu, generate_cpu, softmax_sample
 
 """
     non_nothing_fields(obj) -> NamedTuple

@@ -80,7 +80,32 @@ function load_model_cpu(path::String)
     embed = extract_tensor_cpu(file, "token_embd.weight")
     embed = Float32.(embed)
     
+    # Get actual vocab size from embedding (may differ from metadata due to special tokens)
+    actual_vocab_size = size(embed, 2)
+    
     println("Embedding: $(size(embed))")
+    
+    # Update config with actual vocab size
+    config = ModelCPU.QwenConfigCPU(
+        architecture = config.architecture,
+        vocab_size = actual_vocab_size,
+        hidden_size = config.hidden_size,
+        intermediate_size = config.intermediate_size,
+        num_hidden_layers = config.num_hidden_layers,
+        num_attention_heads = config.num_attention_heads,
+        num_key_value_heads = config.num_key_value_heads,
+        head_dim = config.head_dim,
+        rms_norm_eps = config.rms_norm_eps,
+        rope_theta = config.rope_theta,
+        max_position_embeddings = config.max_position_embeddings,
+        full_attention_interval = config.full_attention_interval,
+        ssm_inner_size = config.ssm_inner_size,
+        ssm_state_size = config.ssm_state_size,
+        ssm_group_count = config.ssm_group_count,
+        ssm_time_step_rank = config.ssm_time_step_rank,
+        ssm_conv_kernel = config.ssm_conv_kernel,
+        partial_rotary_factor = config.partial_rotary_factor
+    )
     
     # Load layers
     layers = ModelCPU.DecoderLayerCPU[]
