@@ -16,6 +16,7 @@ include("Loader.jl")
 include("LoaderCPU.jl")
 include("Engine.jl")
 include("Server.jl")
+include("Generate.jl")
 
 using .QuantsData
 using .Dequant
@@ -27,9 +28,11 @@ using .Loader
 using .LoaderCPU
 using .Engine
 using .Server
+using .Generate
 
 export load_model, load_model_cpu, start_server, non_nothing_fields, stream_to_stdout, stream_to_stdout_cpu
 export LoaderCPU, ModelCPU, generate_stream_cpu, generate_cpu, softmax_sample
+export generate_text, chat, SimpleTokenizer
 
 """
     non_nothing_fields(obj) -> NamedTuple
