@@ -49,7 +49,11 @@ Base.@kwdef struct QwenConfig
 end
 
 abstract type QuantMatrix end
-struct IQ2XXSMatrix <: QuantMatrix end
+struct IQ2XXSMatrix <: QuantMatrix
+    data::oneVector{UInt8}
+    inner::Int
+    outer::Int
+end
 
 function free_gpu_tables!()
 end
@@ -136,97 +140,84 @@ end
 
 
 # --- GPU Softmax Kernel ---
-# Stable softmax on a 1D slice of length `len` stored in `scores[1:len, 1]`
-# Writes probabilities back into `probs[1:len, 1]`
-# Uses Float32 for exp() to prevent overflow
+# Optimized via broadcasting to keep execution on GPU and avoid scalar indexing
 function softmax_kernel!(probs, scores, len, scale)
- # Compute max in Float32 for stability
- mx = Float32(maximum(@view scores[1:len, 1]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:len
- v = exp(Float32(scores[i, 1] * scale) - mx)
- probs[i, 1] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:len
- probs[i, 1] *= inv_s
- end
- return nothing
+    T = eltype(probs)
+    sc_view = @view scores[1:len, 1]
+    pb_view = @view probs[1:len, 1]
+
+    # Compute max in Float32 for stability
+    mx = Float32(maximum(sc_view)) * Float32(scale)
+
+    # exp(x - mx) and sum
+    @. pb_view = T(exp(Float32(sc_view) * Float32(scale) - mx))
+    s = Float32(sum(pb_view))
+
+    # Normalize
+    @. pb_view *= T(1.0f0 / s)
+    return nothing
 end
 
 function batched_softmax_kernel!(probs, scores, total_len, n_heads, scale)
- for h in 1:n_heads
- mx = Float32(maximum(@view scores[1:total_len, h]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:total_len
- v = exp(Float32(scores[i, h] * scale) - mx)
- probs[i, h] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:total_len
- probs[i, h] *= inv_s
- end
- end
- return nothing
+    T = eltype(probs)
+    for h in 1:n_heads
+        sc_view = @view scores[1:total_len, h]
+        pb_view = @view probs[1:total_len, h]
+
+        mx = Float32(maximum(sc_view)) * Float32(scale)
+        @. pb_view = T(exp(Float32(sc_view) * Float32(scale) - mx))
+        s = Float32(sum(pb_view))
+        @. pb_view *= T(1.0f0 / s)
+    end
+    return nothing
 end
 
 # Numerically stable sigmoid using Float32 intermediate computation
-# Float16 exp() overflows/underflows for |x| > 6.5
 function sigmoid_kernel!(out, x, N)
- for i in 1:N
- # Use Float32 for exp() to avoid overflow/underflow
- x_f32 = Float32(x[i])
- sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-x_f32))
- out[i] = Float16(sigmoid_f32)
- end
- return nothing
+    T = eltype(out)
+    out_v = @view out[1:N]
+    x_v = @view x[1:N]
+    @. out_v = T(1.0f0 / (1.0f0 + exp(-Float32(x_v))))
+    return nothing
 end
 
 # Numerically stable softplus using Float32 intermediate computation
 function softplus_kernel!(out, x, bias, N)
- for i in 1:N
- # Use Float32 for exp() to avoid overflow/underflow
- x_f32 = Float32(x[i] + bias[i])
- # Use softplus identity: log(1 + exp(x)) ≈ max(x, 0) + log(1 + exp(-|x|))
- # This is numerically stable for all x
- if x_f32 > 20.0f0
- # For large x, log(1 + exp(x)) ≈ x
- softplus_f32 = x_f32
- elseif x_f32 < -20.0f0
- # For large negative x, log(1 + exp(x)) ≈ 0
- softplus_f32 = 0.0f0
- else
- softplus_f32 = log(1.0f0 + exp(x_f32))
- end
- out[i] = Float16(softplus_f32)
- end
- return nothing
+    T = eltype(out)
+    out_v = @view out[1:N]
+    x_v = @view x[1:N]
+    b_v = @view bias[1:N]
+
+    # Use softplus identity: log(1 + exp(x)) ≈ max(x, 0) + log(1 + exp(-|x|))
+    @. out_v = T(let v = Float32(x_v + b_v)
+        v > 20.0f0 ? v : (v < -20.0f0 ? 0.0f0 : log(1.0f0 + exp(v)))
+    end)
+    return nothing
 end
 
 # Numerically stable SiLU (Swish) using Float32 intermediate computation
 # SiLU(x) = x * sigmoid(x)
 function silu_kernel!(out, x, N)
- for i in 1:N
- x_f32 = Float32(x[i])
- sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-x_f32))
- silu_f32 = x_f32 * sigmoid_f32
- out[i] = Float16(silu_f32)
- end
- return nothing
+    T = eltype(out)
+    out_v = @view out[1:N]
+    x_v = @view x[1:N]
+    @. out_v = T(let v = Float32(x_v)
+        v * (1.0f0 / (1.0f0 + exp(-v)))
+    end)
+    return nothing
 end
 
 # Numerically stable SiLU gating with Float32 intermediate computation
 # SiLU_gating(z, normed) = z * sigmoid(z) * normed
 function silu_gating_kernel!(out, z, normed, N)
- for i in 1:N
- z_f32 = Float32(z[i])
- sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-z_f32))
- silu_f32 = z_f32 * sigmoid_f32 * Float32(normed[i])
- out[i] = Float16(silu_f32)
- end
- return nothing
+    T = eltype(out)
+    out_v = @view out[1:N]
+    z_v = @view z[1:N]
+    n_v = @view normed[1:N]
+    @. out_v = T(let v = Float32(z_v)
+        v * (1.0f0 / (1.0f0 + exp(-v))) * Float32(n_v)
+    end)
+    return nothing
 end
 
 # --- SiLU ---
@@ -359,24 +350,24 @@ function init_kv_cache(config::QwenConfig)
  oneAPI.synchronize() # Ensure cache is zeroed before use
 
  # Attention buffers
- q_all = oneArray(zeros(Float16, n_heads_q * head_dim * 2))
- k_buf = oneArray(zeros(Float16, n_heads_kv * head_dim))
- v_buf = oneArray(zeros(Float16, n_heads_kv * head_dim))
- scores = oneArray(zeros(Float16, max_pos))
- attn_out_buf = oneArray(zeros(Float16, n_heads_q * head_dim))
+ q_all = fill!(oneArray{Float16}(undef, n_heads_q * head_dim * 2), 0)
+ k_buf = fill!(oneArray{Float16}(undef, n_heads_kv * head_dim), 0)
+ v_buf = fill!(oneArray{Float16}(undef, n_heads_kv * head_dim), 0)
+ scores = fill!(oneArray{Float16}(undef, max_pos), 0)
+ attn_out_buf = fill!(oneArray{Float16}(undef, n_heads_q * head_dim), 0)
 
  # MLP buffers (2D column matrices for GPU matmul)
- mlp_gate = oneArray(zeros(Float16, intermediate_size, 1))
- mlp_up = oneArray(zeros(Float16, intermediate_size, 1))
- branch_out = oneArray(zeros(Float16, hidden_size, 1))
+ mlp_gate = fill!(oneArray{Float16}(undef, intermediate_size, 1), 0)
+ mlp_up = fill!(oneArray{Float16}(undef, intermediate_size, 1), 0)
+ branch_out = fill!(oneArray{Float16}(undef, hidden_size, 1), 0)
 
  # RoPE buffers
- rope_q_tmp = oneArray(zeros(Float16, rope_pairs * n_heads_q))
- rope_k_tmp = oneArray(zeros(Float16, rope_pairs * n_heads_kv))
+ rope_q_tmp = fill!(oneArray{Float16}(undef, rope_pairs * n_heads_q), 0)
+ rope_k_tmp = fill!(oneArray{Float16}(undef, rope_pairs * n_heads_kv), 0)
 
  # Normalization buffers
- norm1_buf = oneArray(zeros(Float16, hidden_size))
- norm2_buf = oneArray(zeros(Float16, hidden_size))
+ norm1_buf = fill!(oneArray{Float16}(undef, hidden_size), 0)
+ norm2_buf = fill!(oneArray{Float16}(undef, hidden_size), 0)
 
  return KVCache(k, v, 0, q_all, k_buf, v_buf, scores, attn_out_buf,
  mlp_gate, mlp_up, branch_out,
@@ -490,7 +481,7 @@ function (m::MLP)(x::oneMatrix{Float16})
  # SiLU: g * sigmoid(g) in Float32
  @. g = g * (Float32(1.0) / (Float32(1.0) + exp(-Float32(g))))
  g .*= u
- return mat_mul(m.down_weight, oneArray(Float16.(g)))
+ return mat_mul(m.down_weight, oneArray(Float16.(g))) # oneArray(Matrix) is ok
 end
 
 function reset_states!(m::MLP)
@@ -558,7 +549,7 @@ function (m::MoE)(x::oneMatrix{Float16})
  hidden_size, seq_len = size(x)
  gate_logits = mat_mul(m.gate, x)
  gate_logits_cpu = collect(gate_logits)
- output = oneArray(zeros(Float16, hidden_size, seq_len))
+ output = fill!(oneArray{Float16}(undef, hidden_size, seq_len), 0)
 
  for t in 1:seq_len
  logits = gate_logits_cpu[:, t]
@@ -623,22 +614,22 @@ end
 
 function FullAttention(index::Int, arch, wq, wk, wv, wqkv, wo, q_norm, k_norm, n_heads, n_kv, hd, config::QwenConfig)
  q_size = (arch == :qwen || arch == :qwen2 || arch == :qwen2_5 || arch == :qwen35) ? hd * 2 * n_heads : hd * n_heads
- decode_q_full = oneArray(zeros(Float16, q_size, 1))
- decode_k = oneArray(zeros(Float16, hd * n_kv, 1))
- decode_v = oneArray(zeros(Float16, hd * n_kv, 1))
- decode_combined = oneArray(zeros(Float16, hd * n_heads, 1))
+ decode_q_full = fill!(oneArray{Float16}(undef, q_size, 1), 0)
+ decode_k = fill!(oneArray{Float16}(undef, hd * n_kv, 1), 0)
+ decode_v = fill!(oneArray{Float16}(undef, hd * n_kv, 1), 0)
+ decode_combined = fill!(oneArray{Float16}(undef, hd * n_heads, 1), 0)
 
  # Fixed buffer sizes - sufficient for 4096 context
  max_len = 4096
- decode_scores = oneArray(zeros(Float16, max_len, 1))
- decode_pb = oneArray(zeros(Float16, max_len, 1))
- decode_out_h = oneArray(zeros(Float16, hd, 1))
+ decode_scores = fill!(oneArray{Float16}(undef, max_len, 1), 0)
+ decode_pb = fill!(oneArray{Float16}(undef, max_len, 1), 0)
+ decode_out_h = fill!(oneArray{Float16}(undef, hd, 1), 0)
  wo_out_size = size(wo, 1)
- decode_wo_buf = oneArray(zeros(Float16, wo_out_size, 1))
+ decode_wo_buf = fill!(oneArray{Float16}(undef, wo_out_size, 1), 0)
 
  # Prefill buffers - fixed size for 4096 context
- prefill_scores = oneArray(zeros(Float16, max_len, n_heads))
- prefill_pb = oneArray(zeros(Float16, max_len, n_heads))
+ prefill_scores = fill!(oneArray{Float16}(undef, max_len, n_heads), 0)
+ prefill_pb = fill!(oneArray{Float16}(undef, max_len, n_heads), 0)
 
  return FullAttention(index, arch, wq, wk, wv, wqkv, wo, q_norm, k_norm, n_heads, n_kv, hd,
  decode_q_full, decode_k, decode_v, decode_combined, decode_scores, decode_pb, decode_out_h,
@@ -851,7 +842,7 @@ function (m::MLAttention)(x::oneMatrix{Float16}, pos::Int, rope::RotaryEmbedding
     # We still need a proper MLA implementation.
     # For now, just a slightly better skeleton that uses some inputs.
     # Return zero for now as the full implementation is out of scope for a quick fix.
-    return oneArray(zeros(Float16, size(x, 1), seq))
+    return fill!(oneArray{Float16}(undef, size(x, 1), seq), 0)
 end
 
 # --- Gated Delta Net (SSM Layer) ---
@@ -936,11 +927,11 @@ function GatedDeltaNet(index::Int, in_proj, gate_proj, ssm_out, ssm_conv1d, ssm_
  h = zeros(Float32, head_v_dim, head_k_dim, num_v_heads)
 
     # GPU scratchpads (2D column matrices for GPU matmul compatibility)
-    qkv_proj = oneArray(zeros(Float16, conv_channels, 1))
-    z_buf = oneArray(zeros(Float16, d_inner, 1))
-    x_conv = oneArray(zeros(Float16, conv_channels, 1))
-    y_all = oneArray(zeros(Float16, d_inner, 1))
-    branch_out = oneArray(zeros(Float16, d_inner, 1))
+    qkv_proj = fill!(oneArray{Float16}(undef, conv_channels, 1), 0)
+    z_buf = fill!(oneArray{Float16}(undef, d_inner, 1), 0)
+    x_conv = fill!(oneArray{Float16}(undef, conv_channels, 1), 0)
+    y_all = fill!(oneArray{Float16}(undef, d_inner, 1), 0)
+    branch_out = fill!(oneArray{Float16}(undef, d_inner, 1), 0)
 
  # CPU scratchpads
  x_norm_cpu = zeros(Float16, config.hidden_size)
