@@ -102,8 +102,9 @@ function load_model_cpu(path::String)
         lm_head = embed'
     end
     
-    # Create RoPE
-    rope = ModelCPU.RotaryEmbeddingCPU(config.head_dim, config.rope_theta, config.max_position_embeddings)
+    # Create RoPE with partial rotary
+    rotary_dim = round(Int, config.head_dim * config.partial_rotary_factor)
+    rope = ModelCPU.RotaryEmbeddingCPU(config.head_dim, config.rope_theta, config.max_position_embeddings; rotary_dim=rotary_dim)
     
     return ModelCPU.QwenModelCPU(config, embed, lm_head, layers, final_norm, rope), file
 end
@@ -227,7 +228,9 @@ function load_attention_layer(file::GGUF.GGUFFile, layer_idx::Int, config::Model
     k_norm = ModelCPU.RMSNormCPU(k_norm_w, config.rms_norm_eps)
     
     # Get head dimensions from weights
-    n_heads = size(wq, 1) ÷ config.head_dim
+    # wq projects to n_heads * head_dim * 2 (query + gate)
+    # So n_heads = size(wq, 1) ÷ head_dim ÷ 2
+    n_heads = size(wq, 1) ÷ config.head_dim ÷ 2
     n_kv = size(wk, 1) ÷ config.head_dim
     
     scale = 1.0f0 / sqrt(Float32(config.head_dim))

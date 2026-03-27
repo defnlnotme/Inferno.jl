@@ -29,9 +29,13 @@ Base.@kwdef struct QwenConfigCPU
     ssm_group_count::Int = 16
     ssm_time_step_rank::Int = 16
     ssm_conv_kernel::Int = 4
+    partial_rotary_factor::Float32 = 0.25f0  # Only 25% of head_dim gets rotary
 end
 
-# --- Normalization ---
+# Helper functions
+sigmoid(x) = 1.0f0 / (1.0f0 + exp(-x))
+
+# --- RMS Norm ---
 struct RMSNormCPU
     weight::Vector{Float32}
     eps::Float32
@@ -45,14 +49,16 @@ function (norm::RMSNormCPU)(x::AbstractArray{Float32})
     ss = mapreduce(abs2, +, x)
     m = ss / length(x)
     scale = 1.0f0 / sqrt(m + norm.eps)
-    return x .* scale .* norm.weight
+    # Qwen3.5 uses (1 + weight) instead of just weight
+    return x .* scale .* (1.0f0 .+ norm.weight)
 end
 
 function rmsnorm_cpu!(out::AbstractArray{Float32}, x::AbstractArray{Float32}, norm::RMSNormCPU)
     ss = mapreduce(abs2, +, x)
     m = ss / length(x)
     scale = 1.0f0 / sqrt(m + norm.eps)
-    out .= x .* scale .* norm.weight
+    # Qwen3.5 uses (1 + weight) instead of just weight
+    out .= x .* scale .* (1.0f0 .+ norm.weight)
     return out
 end
 
@@ -60,16 +66,18 @@ end
 struct RotaryEmbeddingCPU
     inv_freq::Vector{Float32}
     max_seq_len::Int
+    rotary_dim::Int  # Number of dimensions that get rotary (partial rotary)
 end
 
-function RotaryEmbeddingCPU(head_dim::Int, theta::Float32 = 10000.0f0, max_seq_len::Int = 4096)
-    inv_freq = Float32[1.0 / (theta ^ (2(i-1)/head_dim)) for i in 1:div(head_dim, 2)]
-    return RotaryEmbeddingCPU(inv_freq, max_seq_len)
+function RotaryEmbeddingCPU(head_dim::Int, theta::Float32 = 10000.0f0, max_seq_len::Int = 4096; rotary_dim::Int = head_dim)
+    # Only compute inv_freq for the rotary dimensions
+    inv_freq = Float32[1.0 / (theta ^ (2(i-1)/head_dim)) for i in 1:div(rotary_dim, 2)]
+    return RotaryEmbeddingCPU(inv_freq, max_seq_len, rotary_dim)
 end
 
 function apply_rotary_emb!(x::Matrix{Float32}, pos::Int, rope::RotaryEmbeddingCPU)
     head_dim, num_heads = size(x, 1), size(x, 2)
-    half = div(head_dim, 2)
+    half = div(rope.rotary_dim, 2)
     
     for h in 1:num_heads
         for i in 1:half
@@ -264,10 +272,10 @@ end
 # --- Full Attention ---
 struct FullAttentionCPU
     index::Int
-    wq::Matrix{Float32}
-    wk::Matrix{Float32}
-    wv::Matrix{Float32}
-    wo::Matrix{Float32}
+    wq::Matrix{Float32}  # Projects to n_heads * head_dim * 2 (query + gate)
+    wk::Matrix{Float32}  # Projects to n_kv * head_dim
+    wv::Matrix{Float32}  # Projects to n_kv * head_dim
+    wo::Matrix{Float32}  # Projects from n_heads * head_dim to hidden
     q_norm::RMSNormCPU
     k_norm::RMSNormCPU
     n_heads::Int
@@ -278,35 +286,41 @@ end
 
 function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddingCPU, cache::KVCacheCPU)
     # Q, K, V projections
-    q = attn.wq * x
+    qkv = attn.wq * x  # This produces n_heads * head_dim * 2 output
     k = attn.wk * x
     v = attn.wv * x
     
+    # Split qkv into query and gate
+    # qkv has shape (n_heads * head_dim * 2,) = (n_heads * head_dim,) + (n_heads * head_dim,)
+    q_size = attn.n_heads * attn.head_dim
+    query_states = qkv[1:q_size]
+    gate = qkv[q_size+1:end]
+    
     # Reshape to (head_dim, num_heads)
-    q = reshape(q, attn.head_dim, attn.n_heads)
+    query_states = reshape(query_states, attn.head_dim, attn.n_heads)
     k = reshape(k, attn.head_dim, attn.n_kv)
     v = reshape(v, attn.head_dim, attn.n_kv)
     
     # Apply Q/K normalization
-    q = attn.q_norm(q)
+    query_states = attn.q_norm(query_states)
     k = attn.k_norm(k)
     
     # Apply RoPE
-    apply_rotary_emb!(q, pos, rope)
+    apply_rotary_emb!(query_states, pos, rope)
     apply_rotary_emb!(k, pos, rope)
     
     # Update KV cache
     update_kv_cache!(cache, k, v, pos)
     
     # Compute attention scores
-    output = zeros(Float32, attn.head_dim * attn.n_heads)
+    output = zeros(Float32, attn.n_heads * attn.head_dim)
     
     gqa_ratio = div(attn.n_heads, attn.n_kv)
     
     for h in 1:attn.n_heads
         kv_h = div(h - 1, gqa_ratio) + 1
         
-        q_h = view(q, :, h)
+        q_h = view(query_states, :, h)
         
         # Compute scores for all cached positions
         scores = zeros(Float32, pos + 1)
@@ -329,6 +343,11 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
         
         output[(h-1)*attn.head_dim+1:h*attn.head_dim] .= out_h
     end
+    
+    # Apply gate with sigmoid
+    # gate is (n_heads * head_dim,) and output is (n_heads * head_dim,)
+    # Apply sigmoid element-wise and multiply
+    output .*= sigmoid.(gate)
     
     # Output projection
     return attn.wo * output
