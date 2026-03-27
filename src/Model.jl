@@ -1097,7 +1097,9 @@ function (m::GatedDeltaNet)(x::AbstractArray{Float16,2}, pos::Int, rope::RotaryE
  # 10. Output projection (ssm_out is (hidden, d_inner) after get_weight transpose)
  fill!(m.branch_out, Float16(0.0))
  copyto!(m.branch_out, reshape(Float16.(m.y_all_cpu), :, 1))
+ oneAPI.synchronize()  # Ensure copy is complete before matmul
  result = mat_mul(m.ssm_out, m.branch_out)
+ oneAPI.synchronize()  # Ensure result is computed before returning
 
  return result
 end
