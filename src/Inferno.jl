@@ -55,7 +55,7 @@ function probe_device(dev)::Symbol
         arr = oneArray(Int32[1])
         oneAPI.unsafe_free!(arr)
         # Medium probe to detect partial failures (256KB)
-        arr2 = oneArray(zeros(Float16, 64 * 1024))
+        arr2 = fill!(oneArray{Float16}(undef, 64 * 1024), Float16(0.0))
         oneAPI.unsafe_free!(arr2)
         return :ok
     catch
