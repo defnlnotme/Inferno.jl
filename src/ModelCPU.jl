@@ -131,9 +131,9 @@ end
 const QuantOrFloat32 = Union{Matrix{Float32}, Q4_K_Matrix, Q5_K_Matrix, Q6_K_Matrix, Q8_0_Matrix}
 
 struct MLPCPU
-    gate_weight::QuantOrFloat32 # (intermediate, hidden)
-    up_weight::QuantOrFloat32
-    down_weight::QuantOrFloat32
+    gate_weight::QuantOrFloat32  # (hidden, intermediate) after GGUF reshape+transpose
+    up_weight::QuantOrFloat32    # (hidden, intermediate)
+    down_weight::QuantOrFloat32  # (intermediate, hidden)
 end
 
 # MLP call for Float32 weights
@@ -296,15 +296,15 @@ end
 struct GatedDeltaNetCPU
     index::Int
     
-    # Weights (transposed for matrix-vector multiply)
-    in_proj::Matrix{Float32}     # (conv_channels, hidden)
-    gate_proj::Matrix{Float32}   # (d_inner, hidden)
-    ssm_out::Matrix{Float32}     # (hidden, d_inner)
-    ssm_conv1d::Matrix{Float32}  # (conv_channels, conv_kernel)
+    # Weight matrices (GGUF stores (out, in) row-major; reshape+transpose → Julia (in, out))
+    in_proj::Matrix{Float32}     # (hidden, conv_channels)   — projects to Q+K+V
+    gate_proj::Matrix{Float32}   # (hidden, d_inner)         — SiLU gate
+    ssm_out::Matrix{Float32}     # (d_inner, hidden)         — output projection
+    ssm_conv1d::Matrix{Float32}  # (conv_kernel, conv_channels) — no transpose, stored as-is
     
-    # Alpha/beta projections
-    ssm_alpha_weight::Matrix{Float32}  # (num_v_heads, hidden)
-    ssm_beta_weight::Matrix{Float32}
+    # Alpha/beta projections (GGUF (heads, hidden) → Julia (hidden, heads) after reshape)
+    ssm_alpha_weight::Matrix{Float32}  # (hidden, num_v_heads)
+    ssm_beta_weight::Matrix{Float32}   # (hidden, num_v_heads)
     
     # SSM parameters
     ssm_a::Vector{Float32}
@@ -342,12 +342,12 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
     end
     m.conv_state[:, m.conv_kernel] .= qkv
     
- # 3. Compute convolution - x_conv[c] = sum_k conv_state[c,k] * ssm_conv1d[k,c]
-  # Using BLAS dot product for each channel (diagonal of matrix product)
-  x_conv = Vector{Float32}(undef, m.conv_channels)
-  for c in 1:m.conv_channels
-      x_conv[c] = dot(view(m.conv_state, c, :), view(m.ssm_conv1d, :, c))
-  end
+    # 3. Compute convolution - x_conv[c] = sum_k conv_state[c,k] * ssm_conv1d[k,c]
+    # Using BLAS dot product for each channel (diagonal of matrix product)
+    x_conv = Vector{Float32}(undef, m.conv_channels)
+    for c in 1:m.conv_channels
+        x_conv[c] = dot(view(m.conv_state, c, :), view(m.ssm_conv1d, :, c))
+    end
     
     # 4. SiLU activation
     @. x_conv = x_conv * (1.0f0 / (1.0f0 + exp(-x_conv)))
@@ -373,9 +373,9 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
         kg = view(k_all, :, g)
         vg = view(v_all, :, h)
         
- # Q/K L2 normalization
- q_norm = sqrt(sum(abs2, qg) + Float32(1e-6))
- k_norm = sqrt(sum(abs2, kg) + Float32(1e-6))
+        # Q/K L2 normalization
+        q_norm = sqrt(sum(abs2, qg) + Float32(1e-6))
+        k_norm = sqrt(sum(abs2, kg) + Float32(1e-6))
         
         q_normalized = qg ./ q_norm .* scale
         k_normalized = kg ./ k_norm
@@ -406,30 +406,30 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
         mul!(yg, state, q_normalized)
     end
     
- # 8. Apply SSM norm (per-head normalization)
- # y_all has shape (d_inner,) = (head_v_dim * num_v_heads,)
- # norm is applied per-head
- for h in 1:m.num_v_heads
- y_h = view(y_all, (h-1)*m.head_v_dim+1:h*m.head_v_dim)
- rmsnorm_cpu!(y_h, y_h, m.ssm_norm)
- end
+    # 8. Apply SSM norm (per-head normalization)
+    # y_all has shape (d_inner,) = (head_v_dim * num_v_heads,)
+    # norm is applied per-head
+    for h in 1:m.num_v_heads
+    y_h = view(y_all, (h-1)*m.head_v_dim+1:h*m.head_v_dim)
+    rmsnorm_cpu!(y_h, y_h, m.ssm_norm)
+    end
 
- # 9. SiLU gate on z
- # silu(z) = z * sigmoid(z) = z / (1 + exp(-z))
- # Output: norm(y_all) * silu(z)
- @. y_all = y_all * z * (1.0f0 / (1.0f0 + exp(-z)))
+    # 9. SiLU gate on z
+    # silu(z) = z * sigmoid(z) = z / (1 + exp(-z))
+    # Output: norm(y_all) * silu(z)
+    @. y_all = y_all * z * (1.0f0 / (1.0f0 + exp(-z)))
  
- # 10. Output projection
- return m.ssm_out * y_all
+    # 10. Output projection
+    return m.ssm_out * y_all
 end
 
 # --- Full Attention ---
 struct FullAttentionCPU
     index::Int
-    wq::Matrix{Float32}  # Projects to n_heads * head_dim * 2 (query + gate)
-    wk::Matrix{Float32}  # Projects to n_kv * head_dim
-    wv::Matrix{Float32}  # Projects to n_kv * head_dim
-    wo::Matrix{Float32}  # Projects from n_heads * head_dim to hidden
+    wq::Matrix{Float32}  # (n_heads * head_dim * 2, hidden) — query + gate projection
+    wk::Matrix{Float32}  # (n_kv * head_dim, hidden)
+    wv::Matrix{Float32}  # (n_kv * head_dim, hidden)
+    wo::Matrix{Float32}  # (hidden, n_heads * head_dim)     — output projection
     q_norm::RMSNormCPU
     k_norm::RMSNormCPU
     n_heads::Int
