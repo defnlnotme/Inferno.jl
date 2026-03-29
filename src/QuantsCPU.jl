@@ -21,7 +21,7 @@ export dequantize_block!, dequantize_row!
 # Block sizes for each quantization type
 const Q4_K_BLOCK_SIZE = 144  # bytes per 256 elements
 const Q5_K_BLOCK_SIZE = 176
-const Q6_K_BLOCK_SIZE = 208
+const Q6_K_BLOCK_SIZE = 210  # 208 + 2 for the scale at end
 const Q8_0_BLOCK_SIZE = 34   # 32 elements per block
 
 # ============================================================================
@@ -143,25 +143,32 @@ function dequantize_q4_k_block(data::Vector{UInt8}, block_offset::Int)
     # Output array
     values = MVector{256, Float32}(undef)
     
-    # Process 4 super-groups of 64 elements each
-    for j in 0:3
-        is_idx = 2 * j
-        
-        # sc1, m1 (first 32 elements of this super-group)
-        sc1, m1 = if is_idx < 4
-            UInt8(scales[is_idx + 1] & 63), UInt8(scales[is_idx + 5] & 63)
-        else
-            UInt8((scales[is_idx + 5] & 0x0f) | ((scales[is_idx - 3] >> 6) << 4)),
-            UInt8((scales[is_idx + 5] >> 4) | ((scales[is_idx + 1] >> 6) << 4))
-        end
-        
-        # sc2, m2 (next 32 elements of this super-group)
-        sc2, m2 = if (is_idx + 1) < 4
-            UInt8(scales[is_idx + 2] & 63), UInt8(scales[is_idx + 6] & 63)
-        else
-            UInt8((scales[is_idx + 6] & 0x0f) | ((scales[is_idx - 2] >> 6) << 4)),
-            UInt8((scales[is_idx + 6] >> 4) | ((scales[is_idx + 2] >> 6) << 4))
-        end
+ # Process 4 super-groups of 64 elements each
+ for j in 0:3
+ is_idx = 2 * j
+ 
+ # sc1, m1 (first 32 elements of this super-group)
+ # In C (0-indexed): if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
+ # In Julia (1-indexed): scales[j+1] & 63, scales[j+5] & 63
+ sc1, m1 = if is_idx < 4
+ UInt8(scales[is_idx + 1] & 63), UInt8(scales[is_idx + 5] & 63)
+ else
+ # In C: d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4)
+ # In Julia: (scales[j+5] & 0x0f) | ((scales[j-3] >> 6) << 4)
+ UInt8((scales[is_idx + 5] & 0x0f) | ((scales[is_idx - 3] >> 6) << 4)),
+ # In C: m = (q[j+4] >> 4) | ((q[j-0] >> 6) << 4) = (q[j+4] >> 4) | ((q[j] >> 6) << 4)
+ # In Julia: (scales[j+5] >> 4) | ((scales[j+1] >> 6) << 4)
+ UInt8((scales[is_idx + 5] >> 4) | ((scales[is_idx + 1] >> 6) << 4))
+ end
+ 
+ # sc2, m2 (next 32 elements of this super-group)
+ sc2, m2 = if (is_idx + 1) < 4
+ UInt8(scales[is_idx + 2] & 63), UInt8(scales[is_idx + 6] & 63)
+ else
+ # Same pattern for is_idx + 1
+ UInt8((scales[is_idx + 6] & 0x0f) | ((scales[is_idx - 2] >> 6) << 4)),
+ UInt8((scales[is_idx + 6] >> 4) | ((scales[is_idx + 2] >> 6) << 4))
+ end
         
         d1, min1 = d * Float32(sc1), dmin * Float32(m1)
         d2, min2 = d * Float32(sc2), dmin * Float32(m2)
@@ -189,56 +196,83 @@ Q5_K block structure (176 bytes):
 - qs: 128 bytes (low bits)
 """
 function dequantize_q5_k_block(data::Vector{UInt8}, block_offset::Int)
-    d = Float32(reinterpret(Float16, data[block_offset:block_offset+1])[1])
-    dmin = Float32(reinterpret(Float16, data[block_offset+2:block_offset+3])[1])
-    
-    scales = @view data[block_offset+4:block_offset+15]
-    qh = @view data[block_offset+16:block_offset+47]
-    qs = @view data[block_offset+48:block_offset+175]
-    
-    values = MVector{256, Float32}(undef)
-    
-    for j in 0:3
-        is_idx = 2 * j
-        
-        sc1, m1 = if is_idx < 4
-            scales[is_idx + 1] & 63, scales[is_idx + 5] & 63
-        else
-            (scales[is_idx + 5] & 0x0f) | ((scales[is_idx - 3] >> 6) << 4),
-            (scales[is_idx + 5] >> 4) | ((scales[is_idx + 1] >> 6) << 4)
-        end
-        
-        sc2, m2 = if (is_idx + 1) < 4
-            scales[is_idx + 2] & 63, scales[is_idx + 6] & 63
-        else
-            (scales[is_idx + 6] & 0x0f) | ((scales[is_idx - 2] >> 6) << 4),
-            (scales[is_idx + 6] >> 4) | ((scales[is_idx + 2] >> 6) << 4)
-        end
-        
-        d1, min1 = d * Float32(sc1), dmin * Float32(m1)
-        d2, min2 = d * Float32(sc2), dmin * Float32(m2)
-        
-        base_idx = j * 64
-        for l in 0:31
-            qh_val = qh[j * 8 + (l ÷ 4) + 1]
-            qs_val = qs[j * 32 + l + 1]
-            
-            # Combine low and high bits
-            h_shift = (l % 4) * 2
-            h_bit = (qh_val >> h_shift) & 0x03
-            
-            low1 = qs_val & 0x0f
-            low2 = qs_val >> 4
-            
-            v1 = Float32((low1 | (h_bit << 4)) - 16)  # Range: -16 to 15
-            v2 = Float32((low2 | ((qh_val >> (h_shift + 2)) << 4)) - 16)
-            
-            values[base_idx + l + 1] = d1 * v1 - min1
-            values[base_idx + 32 + l + 1] = d2 * v2 - min2
-        end
-    end
-    
-    return NTuple{256, Float32}(values)
+ # Q5_K block structure (176 bytes):
+ # - d: 2 bytes (Float16 scale)
+ # - dmin: 2 bytes (Float16 min scale)
+ # - scales: 12 bytes (packed scales and mins)
+ # - qh: 32 bytes (high bits, 1 bit per element)
+ # - qs: 128 bytes (low bits, 4 bits per element)
+ 
+ # This implementation follows the CPU dequantize_row_q5_K from ggml-quants.c
+ 
+ d = Float32(reinterpret(Float16, data[block_offset:block_offset+1])[1])
+ dmin = Float32(reinterpret(Float16, data[block_offset+2:block_offset+3])[1])
+ scales = @view data[block_offset+4:block_offset+15]
+ qh = @view data[block_offset+16:block_offset+47]
+ qs = @view data[block_offset+48:block_offset+175]
+ 
+ values = MVector{256, Float32}(undef)
+ 
+ # Process 8 sub-blocks of 32 elements each (is = 0..7)
+ is_idx = 0
+ u1 = 0x01
+ u2 = 0x02
+ 
+ for block in 0:3 # 4 blocks of 64 elements
+ # Get scale and min for first 32 elements (is)
+ sc1, m1 = if is_idx < 4
+ UInt8(scales[is_idx + 1] & 63), UInt8(scales[is_idx + 5] & 63)
+ else
+ # (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4)
+ UInt8((scales[is_idx + 5] & 0x0f) | ((scales[is_idx - 3] >> 6) << 4)),
+ # (q[j+4] >> 4) | ((q[j-0] >> 6) << 4)
+ UInt8((scales[is_idx + 5] >> 4) | ((scales[is_idx + 1] >> 6) << 4))
+ end
+ 
+ # Get scale and min for next 32 elements (is + 1)
+ sc2, m2 = if (is_idx + 1) < 4
+ UInt8(scales[is_idx + 2] & 63), UInt8(scales[is_idx + 6] & 63)
+ else
+ UInt8((scales[is_idx + 6] & 0x0f) | ((scales[is_idx - 2] >> 6) << 4)),
+ UInt8((scales[is_idx + 6] >> 4) | ((scales[is_idx + 2] >> 6) << 4))
+ end
+ 
+ d1 = d * Float32(sc1)
+ m1_val = dmin * Float32(m1)
+ d2 = d * Float32(sc2)
+ m2_val = dmin * Float32(m2)
+ 
+ # Process first 32 elements (using low nibble)
+ base_idx = block * 64
+ for l in 0:31
+ ql_val = qs[block * 32 + l + 1]
+ qh_val = qh[l + 1]
+ 
+ low = ql_val & 0x0f
+ high = (qh_val & u1) != 0 ? 16.0f0 : 0.0f0
+ v = Float32(low) + high
+ 
+ values[base_idx + l + 1] = d1 * v - m1_val
+ end
+ 
+ # Process next 32 elements (using high nibble)
+ for l in 0:31
+ ql_val = qs[block * 32 + l + 1]
+ qh_val = qh[l + 1]
+ 
+ low = (ql_val >> 4)
+ high = (qh_val & u2) != 0 ? 16.0f0 : 0.0f0
+ v = Float32(low) + high
+ 
+ values[base_idx + 32 + l + 1] = d2 * v - m2_val
+ end
+ 
+ is_idx += 2
+ u1 = u1 << 2
+ u2 = u2 << 2
+ end
+ 
+ return NTuple{256, Float32}(values)
 end
 
 """
@@ -493,77 +527,119 @@ function dequantize_q4_k_block!(out::AbstractVector{Float32}, data::Vector{UInt8
 end
 
 function dequantize_q5_k_block!(out::AbstractVector{Float32}, data::Vector{UInt8}, block_offset::Int)
-    d = Float32(reinterpret(Float16, data[block_offset:block_offset+1])[1])
-    dmin = Float32(reinterpret(Float16, data[block_offset+2:block_offset+3])[1])
-    
-    scales = @view data[block_offset+4:block_offset+15]
-    qh = @view data[block_offset+16:block_offset+47]
-    qs = @view data[block_offset+48:block_offset+175]
-    
-    for j in 0:3
-        is_idx = 2 * j
-        
-        sc1, m1 = if is_idx < 4
-            scales[is_idx + 1] & 63, scales[is_idx + 5] & 63
-        else
-            (scales[is_idx + 5] & 0x0f) | ((scales[is_idx - 3] >> 6) << 4),
-            (scales[is_idx + 5] >> 4) | ((scales[is_idx + 1] >> 6) << 4)
-        end
-        
-        sc2, m2 = if (is_idx + 1) < 4
-            scales[is_idx + 2] & 63, scales[is_idx + 6] & 63
-        else
-            (scales[is_idx + 6] & 0x0f) | ((scales[is_idx - 2] >> 6) << 4),
-            (scales[is_idx + 6] >> 4) | ((scales[is_idx + 2] >> 6) << 4)
-        end
-        
-        d1, min1 = d * Float32(sc1), dmin * Float32(m1)
-        d2, min2 = d * Float32(sc2), dmin * Float32(m2)
-        
-        base_idx = j * 64
-        for l in 0:31
-            qh_val = qh[j * 8 + (l ÷ 4) + 1]
-            qs_val = qs[j * 32 + l + 1]
-            
-            h_shift = (l % 4) * 2
-            h_bit = (qh_val >> h_shift) & 0x03
-            
-            low1 = qs_val & 0x0f
-            low2 = qs_val >> 4
-            
-            v1 = Float32((low1 | (h_bit << 4)) - 16)
-            v2 = Float32((low2 | ((qh_val >> (h_shift + 2)) << 4)) - 16)
-            
-            out[base_idx + l + 1] = d1 * v1 - min1
-            out[base_idx + 32 + l + 1] = d2 * v2 - min2
-        end
-    end
-    
-    return out
+ # Q5_K block structure (176 bytes):
+ # - d: 2 bytes (Float16 scale)
+ # - dmin: 2 bytes (Float16 min scale)
+ # - scales: 12 bytes (packed scales and mins)
+ # - qh: 32 bytes (high bits, 1 bit per element)
+ # - qs: 128 bytes (low bits, 4 bits per element)
+ 
+ # This implementation follows the CPU dequantize_row_q5_K from ggml-quants.c
+ 
+ d = Float32(reinterpret(Float16, data[block_offset:block_offset+1])[1])
+ dmin = Float32(reinterpret(Float16, data[block_offset+2:block_offset+3])[1])
+ scales = @view data[block_offset+4:block_offset+15]
+ qh = @view data[block_offset+16:block_offset+47]
+ qs = @view data[block_offset+48:block_offset+175]
+ 
+ # Process 8 sub-blocks of 32 elements each (is = 0..7)
+ # Each sub-block pair (is, is+1) processes 64 elements (32 each)
+ 
+ is_idx = 0
+ u1 = 0x01
+ u2 = 0x02
+ 
+ for block in 0:3 # 4 blocks of 64 elements
+ # Get scale and min for first 32 elements (is)
+ sc1, m1 = if is_idx < 4
+ UInt8(scales[is_idx + 1] & 63), UInt8(scales[is_idx + 5] & 63)
+ else
+ # (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4)
+ UInt8((scales[is_idx + 5] & 0x0f) | ((scales[is_idx - 3] >> 6) << 4)),
+ # (q[j+4] >> 4) | ((q[j-0] >> 6) << 4)
+ UInt8((scales[is_idx + 5] >> 4) | ((scales[is_idx + 1] >> 6) << 4))
+ end
+ 
+ # Get scale and min for next 32 elements (is + 1)
+ sc2, m2 = if (is_idx + 1) < 4
+ UInt8(scales[is_idx + 2] & 63), UInt8(scales[is_idx + 6] & 63)
+ else
+ UInt8((scales[is_idx + 6] & 0x0f) | ((scales[is_idx - 2] >> 6) << 4)),
+ UInt8((scales[is_idx + 6] >> 4) | ((scales[is_idx + 2] >> 6) << 4))
+ end
+ 
+ d1 = d * Float32(sc1)
+ m1_val = dmin * Float32(m1)
+ d2 = d * Float32(sc2)
+ m2_val = dmin * Float32(m2)
+ 
+ # Process first 32 elements (using low nibble)
+ base_idx = block * 64
+ for l in 0:31
+ ql_val = qs[block * 32 + l + 1]
+ qh_val = qh[l + 1]
+ 
+ low = ql_val & 0x0f
+ high = (qh_val & u1) != 0 ? 16.0f0 : 0.0f0
+ v = Float32(low) + high
+ 
+ out[base_idx + l + 1] = d1 * v - m1_val
+ end
+ 
+ # Process next 32 elements (using high nibble)
+ for l in 0:31
+ ql_val = qs[block * 32 + l + 1]
+ qh_val = qh[l + 1]
+ 
+ low = (ql_val >> 4)
+ high = (qh_val & u2) != 0 ? 16.0f0 : 0.0f0
+ v = Float32(low) + high
+ 
+ out[base_idx + 32 + l + 1] = d2 * v - m2_val
+ end
+ 
+ is_idx += 2
+ u1 = u1 << 2
+ u2 = u2 << 2
+ end
+ 
+ return out
 end
 
 function dequantize_q6_k_block!(out::AbstractVector{Float32}, data::Vector{UInt8}, block_offset::Int)
+    # Q6_K block structure (210 bytes):
+    # - ql: 128 bytes (QK_K/2)
+    # - qh: 64 bytes (QK_K/4)
+    # - scales: 16 bytes (QK_K/16)
+    # - d: 2 bytes (ggml_half)
+    # Total = 128 + 64 + 16 + 2 = 210 bytes
+    
     ql = @view data[block_offset:block_offset+127]
     qh = @view data[block_offset+128:block_offset+191]
-    scales_data = @view data[block_offset+192:block_offset+207]
+    sc = reinterpret(Int8, data[block_offset+192:block_offset+207])
     d = Float32(reinterpret(Float16, data[block_offset+208:block_offset+209])[1])
     
-    for j in 0:255
-        inner_idx = j % 128
+    # Process 2 super-groups
+    for n_sg in 0:1
+        ql_sg = @view ql[(n_sg * 64 + 1):(n_sg * 64 + 64)]
+        qh_sg = @view qh[(n_sg * 32 + 1):(n_sg * 32 + 32)]
+        sc_sg = @view sc[(n_sg * 8 + 1):(n_sg * 8 + 8)]
         
-        l = Int(ql[inner_idx + 1])
-        h = Int((qh[inner_idx + 1] >> (2 * (j % 128))) & 0x03)
-        
-        raw_val = (l & 0x0f) | (h << 4)
-        
-        if raw_val >= 32
-            raw_val -= 64
+        for l in 0:31
+            is_idx = l ÷ 16
+            
+            qh_val = qh_sg[l + 1]
+            
+            q1 = Int8((ql_sg[l + 1] & 0x0f) | ((qh_val & 0x03) << 4)) - Int8(32)
+            q2 = Int8((ql_sg[l + 32 + 1] & 0x0f) | (((qh_val >> 2) & 0x03) << 4)) - Int8(32)
+            q3 = Int8((ql_sg[l + 1] >> 4) | (((qh_val >> 4) & 0x03) << 4)) - Int8(32)
+            q4 = Int8((ql_sg[l + 32 + 1] >> 4) | (((qh_val >> 6) & 0x03) << 4)) - Int8(32)
+            
+            out[n_sg * 128 + l + 1] = d * Float32(sc_sg[is_idx + 1]) * Float32(q1)
+            out[n_sg * 128 + l + 32 + 1] = d * Float32(sc_sg[is_idx + 2 + 1]) * Float32(q2)
+            out[n_sg * 128 + l + 64 + 1] = d * Float32(sc_sg[is_idx + 4 + 1]) * Float32(q3)
+            out[n_sg * 128 + l + 96 + 1] = d * Float32(sc_sg[is_idx + 6 + 1]) * Float32(q4)
         end
-        
-        scale_idx = j ÷ 16 + 1
-        scale = Float32(scales_data[scale_idx])
-        
-        out[j + 1] = d * scale * Float32(raw_val)
     end
     
     return out

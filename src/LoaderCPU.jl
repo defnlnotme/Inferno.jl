@@ -1,4 +1,3 @@
-"""
 """CPU-only model loader for Inferno.jl
 Loads GGUF models without GPU dependencies.
 """
@@ -103,7 +102,7 @@ function extract_tensor_cpu(file::GGUF.GGUFFile, name::String)
     return extract_tensor_cpu(file, info)
 end
 
-function load_model_cpu(path::String)
+function load_model_cpu(path::String; keep_quantized::Bool=false)
     # Load GGUF file
     file = GGUF.read_gguf(path)
     
@@ -147,9 +146,9 @@ function load_model_cpu(path::String)
     layers = ModelCPU.DecoderLayerCPU[]
     
     for i in 0:(config.num_hidden_layers - 1)
-        layer = load_layer(file, i, config)
+        layer = load_layer(file, i, config; keep_quantized=keep_quantized)
         push!(layers, layer)
-        println("  Layer $i: $(layer.is_ssm ? "SSM" : "Attention")")
+        println(" Layer $i: $(layer.is_ssm ? "SSM" : "Attention")")
     end
     
     # Load final norm
@@ -200,7 +199,7 @@ function get_config(file::GGUF.GGUFFile)
     return config
 end
 
-function load_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU)
+function load_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU; keep_quantized::Bool=false)
     prefix = "blk.$(layer_idx)"
     
     # Load norms
@@ -220,7 +219,7 @@ function load_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenCo
     end
     
     # Load MLP
-    mlp = load_mlp(file, layer_idx, config)
+    mlp = load_mlp(file, layer_idx, config; keep_quantized=keep_quantized)
     
     return ModelCPU.DecoderLayerCPU(in_norm, op, post_norm, mlp, is_ssm)
 end
@@ -334,10 +333,10 @@ function load_mlp(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConf
         down_weight = extract_tensor_cpu(file, down_info; keep_quantized=true)
         return ModelCPU.MLPCPU(gate_weight, up_weight, down_weight)
     else
-        # Dequantize to Float32 and transpose
-        gate_weight = Float32.(extract_tensor_cpu(file, "$(prefix).ffn_gate.weight"))'
-        up_weight = Float32.(extract_tensor_cpu(file, "$(prefix).ffn_up.weight"))'
-        down_weight = Float32.(extract_tensor_cpu(file, "$(prefix).ffn_down.weight"))'
+        # Dequantize to Float32 and transpose, then convert to Matrix
+        gate_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_gate.weight"))')
+        up_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_up.weight"))')
+        down_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_down.weight"))')
         return ModelCPU.MLPCPU(gate_weight, up_weight, down_weight)
     end
 end

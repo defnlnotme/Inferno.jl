@@ -36,7 +36,7 @@ using .Chat
 
 export load_model, load_model_cpu, start_server, non_nothing_fields, stream_to_stdout, stream_to_stdout_cpu
 export LoaderCPU, ModelCPU, generate_stream_cpu, generate_cpu, softmax_sample
-export generate_text, chat, SimpleTokenizer
+export generate_text, chat
 export chat!, start_chat, Message, build_prompt
 
 """
@@ -333,20 +333,13 @@ function stream_to_stdout(model, tok, prompt::AbstractString;
         elseif model isa ModelCPU.QwenModelCPU
             chosen_backend = :cpu
         else
-            # Fallback to tokenizer-based inference for older call sites
-            if tok isa Tokenizer.BPETokenizer
-                chosen_backend = :gpu
-            elseif tok isa SimpleTokenizer
-                chosen_backend = :cpu
-            else
-                error("stream_to_stdout: unable to infer backend from model type $(typeof(model)). Provide backend=:gpu or :cpu explicitly.")
-            end
+            error("stream_to_stdout: unable to infer backend from model type $(typeof(model)). Provide backend=:gpu or :cpu explicitly.")
         end
     end
 
     if chosen_backend == :gpu
         if !(tok isa Tokenizer.BPETokenizer)
-            error("GPU backend requires a Tokenizer.BPETokenizer. Provided tokenizer is $(typeof(tok)). Use backend=:cpu with SimpleTokenizer or provide a BPETokenizer.")
+            error("GPU backend requires a Tokenizer.BPETokenizer. Provided tokenizer is $(typeof(tok)).")
         end
 
         # Convert all float parameters to Float16
@@ -385,19 +378,9 @@ function stream_to_stdout(model, tok, prompt::AbstractString;
             end
         end
     elseif chosen_backend == :cpu
-        # CPU backend: accept SimpleTokenizer or BPETokenizer (converted if necessary)
-        # If a BPETokenizer is provided for CPU model, attempt a safe conversion to SimpleTokenizer
-        tok_for_cpu = tok
-        if tok isa Tokenizer.BPETokenizer
-            # Convert id_to_token (1-indexed) to SimpleTokenizer which uses 0-indexed ids
-            id_to_token = tok.id_to_token
-            # Build SimpleTokenizer-like struct expected by CPU routines
-            token_to_id = Dict{String,Int}()
-            for (i, tstr) in enumerate(id_to_token)
-                token_to_id[tstr] = i - 1
-            end
-            # Create a lightweight SimpleTokenizer-like object with required fields
-            tok_for_cpu = SimpleTokenizer(id_to_token, token_to_id, tok.bos_id - 1, tok.eos_id - 1, -1)
+        # CPU backend accepts BPETokenizer directly
+        if !(tok isa Tokenizer.BPETokenizer)
+            error("CPU backend requires a Tokenizer.BPETokenizer. Provided tokenizer is $(typeof(tok)).")
         end
 
         # Convert float params to Float32 for CPU backend
@@ -407,7 +390,7 @@ function stream_to_stdout(model, tok, prompt::AbstractString;
         rep_f32 = Float32(repetition_penalty)
         min_p_f32 = Float32(min_p)
         stop_tokens = stop_token === nothing ? Set{Int}() : Set([stop_token])
-        return ModelCPU.stream_to_stdout_cpu(model, tok_for_cpu, prompt;
+        return ModelCPU.stream_to_stdout_cpu(model, tok, prompt;
             max_tokens=max_tokens, temperature=temp_f32, top_p=top_p_f32, top_k=top_k,
             presence_penalty=penalty_f32, repetition_penalty=rep_f32, min_p=min_p_f32, stop_tokens=stop_tokens, io=io)
     else

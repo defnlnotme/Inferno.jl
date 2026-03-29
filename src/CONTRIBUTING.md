@@ -1,0 +1,6 @@
+- Apply one fix at a time and commit (such that in case of regressions we can bisect)
+- every new feature should add tests
+- every regression should be fixed and a new test added (such that the regression doesn't happen again)
+- DRY (do not repeat yourself)
+- keep code maintanable
+- spaghetti code is not tolerated
