@@ -1,5 +1,5 @@
 """
-CPU-only model loader for Inferno.jl
+"""CPU-only model loader for Inferno.jl
 Loads GGUF models without GPU dependencies.
 """
 module LoaderCPU
@@ -7,13 +7,51 @@ module LoaderCPU
 using ..ModelCPU
 using ..GGUF
 using ..Dequant
+using ..QuantsCPU
 using ..Tokenizer
 
 export load_model_cpu
 
-function extract_tensor_cpu(file::GGUF.GGUFFile, info::GGUF.TensorInfo)
+# Union type for weight matrices (either Float32 or quantized)
+const WeightMatrix = Union{Matrix{Float32}, Q4_K_Matrix, Q5_K_Matrix, Q6_K_Matrix, Q8_0_Matrix}
+
+"""
+Extract tensor data, optionally keeping quantized format.
+Set `keep_quantized=true` to preserve quantized weights.
+"""
+function extract_tensor_cpu(file::GGUF.GGUFFile, info::GGUF.TensorInfo; keep_quantized::Bool=false)
     num_elements = Int(prod(info.dimensions))
     start = Int(file.data_offset + info.offset) + 1
+    
+    dims = Tuple(Int.(info.dimensions))
+    inner = dims[1]
+    outer = length(dims) > 1 ? dims[2] : 1
+
+    if keep_quantized
+        # Return quantized matrix wrapper instead of dequantizing
+        if info.type == GGUF.GGML_TYPE_Q4_K
+            num_blocks = num_elements ÷ 256
+            data_size = num_blocks * QuantsCPU.Q4_K_BLOCK_SIZE
+            data = collect(@view file.tensor_data[start:start+data_size-1])
+            return Q4_K_Matrix(data, inner, outer)
+        elseif info.type == GGUF.GGML_TYPE_Q5_K
+            num_blocks = num_elements ÷ 256
+            data_size = num_blocks * QuantsCPU.Q5_K_BLOCK_SIZE
+            data = collect(@view file.tensor_data[start:start+data_size-1])
+            return Q5_K_Matrix(data, inner, outer)
+        elseif info.type == GGUF.GGML_TYPE_Q6_K
+            num_blocks = num_elements ÷ 256
+            data_size = num_blocks * QuantsCPU.Q6_K_BLOCK_SIZE
+            data = collect(@view file.tensor_data[start:start+data_size-1])
+            return Q6_K_Matrix(data, inner, outer)
+        elseif info.type == GGUF.GGML_TYPE_Q8_0
+            num_blocks = num_elements ÷ 32
+            data_size = num_blocks * QuantsCPU.Q8_0_BLOCK_SIZE
+            data = collect(@view file.tensor_data[start:start+data_size-1])
+            return Q8_0_Matrix(data, inner, outer)
+        end
+        # Fall through for other types
+    end
 
     data = if info.type == GGUF.GGML_TYPE_F32
         reinterpret(Float32, @view file.tensor_data[start:start+num_elements*4-1]) |> collect
@@ -49,12 +87,9 @@ function extract_tensor_cpu(file::GGUF.GGUFFile, info::GGUF.TensorInfo)
         zeros(Float32, num_elements)
     end
 
-    dims = Tuple(Int.(info.dimensions))
     if length(dims) > 2
         return reshape(data, dims)
     else
-        inner = dims[1]
-        outer = length(dims) > 1 ? dims[2] : 1
         return reshape(data, inner, outer)
     end
 end
@@ -282,14 +317,29 @@ function load_attention_layer(file::GGUF.GGUFFile, layer_idx::Int, config::Model
     )
 end
 
-function load_mlp(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU)
+function load_mlp(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU; keep_quantized::Bool=false)
     prefix = "blk.$(layer_idx)"
     
-    gate_weight = Float32.(extract_tensor_cpu(file, "$(prefix).ffn_gate.weight"))'
-    up_weight = Float32.(extract_tensor_cpu(file, "$(prefix).ffn_up.weight"))'
-    down_weight = Float32.(extract_tensor_cpu(file, "$(prefix).ffn_down.weight"))'
+    # Load weights - transpose from GGUF format
+    # For quantized weights, we store them directly and handle transpose in multiplication
+    gate_info = file.tensors["$(prefix).ffn_gate.weight"]
+    up_info = file.tensors["$(prefix).ffn_up.weight"]
+    down_info = file.tensors["$(prefix).ffn_down.weight"]
     
-    return ModelCPU.MLPCPU(gate_weight, up_weight, down_weight)
+    if keep_quantized && gate_info.type in (GGUF.GGML_TYPE_Q4_K, GGUF.GGML_TYPE_Q5_K, 
+                                              GGUF.GGML_TYPE_Q6_K, GGUF.GGML_TYPE_Q8_0)
+        # Load quantized weights - no transpose, we'll handle it in multiplication
+        gate_weight = extract_tensor_cpu(file, gate_info; keep_quantized=true)
+        up_weight = extract_tensor_cpu(file, up_info; keep_quantized=true)
+        down_weight = extract_tensor_cpu(file, down_info; keep_quantized=true)
+        return ModelCPU.MLPCPU(gate_weight, up_weight, down_weight)
+    else
+        # Dequantize to Float32 and transpose
+        gate_weight = Float32.(extract_tensor_cpu(file, "$(prefix).ffn_gate.weight"))'
+        up_weight = Float32.(extract_tensor_cpu(file, "$(prefix).ffn_up.weight"))'
+        down_weight = Float32.(extract_tensor_cpu(file, "$(prefix).ffn_down.weight"))'
+        return ModelCPU.MLPCPU(gate_weight, up_weight, down_weight)
+    end
 end
 
 end # module

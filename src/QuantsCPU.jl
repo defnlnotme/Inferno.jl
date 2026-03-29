@@ -454,7 +454,7 @@ function mul_quant_vec!(out::Vector{Float32}, mat::Q4_K_Matrix, x::Vector{Float3
 end
 
 # For Q4_K, implement a row-by-row dequantization approach
-function dequantize_q4_k_block!(out::MVector{256, Float32}, data::Vector{UInt8}, block_offset::Int)
+function dequantize_q4_k_block!(out::AbstractVector{Float32}, data::Vector{UInt8}, block_offset::Int)
     d = Float32(reinterpret(Float16, data[block_offset:block_offset+1])[1])
     dmin = Float32(reinterpret(Float16, data[block_offset+2:block_offset+3])[1])
     
@@ -492,7 +492,7 @@ function dequantize_q4_k_block!(out::MVector{256, Float32}, data::Vector{UInt8},
     return out
 end
 
-function dequantize_q5_k_block!(out::MVector{256, Float32}, data::Vector{UInt8}, block_offset::Int)
+function dequantize_q5_k_block!(out::AbstractVector{Float32}, data::Vector{UInt8}, block_offset::Int)
     d = Float32(reinterpret(Float16, data[block_offset:block_offset+1])[1])
     dmin = Float32(reinterpret(Float16, data[block_offset+2:block_offset+3])[1])
     

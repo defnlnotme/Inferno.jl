@@ -1,11 +1,12 @@
 """
-CPU-only inference backend for Inferno.jl
+"""CPU-only inference backend for Inferno.jl
 This module provides pure CPU implementations without GPU dependencies.
 """
 module ModelCPU
 
 using LinearAlgebra
 using Statistics
+using ..QuantsCPU
 
 export QwenConfigCPU, QwenModelCPU, KVCacheCPU, forward_cpu!, RMSNormCPU, MLPCPU, GatedDeltaNetCPU, FullAttentionCPU, DecoderLayerCPU, RotaryEmbeddingCPU
 export init_kv_cache_cpu, reset_states_cpu!, softmax_sample, generate_cpu, generate_stream_cpu, stream_to_stdout_cpu
@@ -126,16 +127,20 @@ function update_kv_cache!(cache::KVCacheCPU, k::Matrix{Float32}, v::Matrix{Float
 end
 
 # --- MLP ---
+# Union type for weight matrices (either Float32 or quantized)
+const QuantOrFloat32 = Union{Matrix{Float32}, Q4_K_Matrix, Q5_K_Matrix, Q6_K_Matrix, Q8_0_Matrix}
+
 struct MLPCPU
-    gate_weight::Matrix{Float32}  # (intermediate, hidden)
-    up_weight::Matrix{Float32}
-    down_weight::Matrix{Float32}
+    gate_weight::QuantOrFloat32 # (intermediate, hidden)
+    up_weight::QuantOrFloat32
+    down_weight::QuantOrFloat32
 end
 
-function (mlp::MLPCPU)(x::Vector{Float32})
+# MLP call for Float32 weights
+function (mlp::MLPCPU)(x::Vector{Float32}) where {T<:Matrix{Float32}}
     # Gate with SiLU
     gate = mlp.gate_weight * x
-    @. gate = gate * (1.0f0 / (1.0f0 + exp(-gate)))  # SiLU
+    @. gate = gate * (1.0f0 / (1.0f0 + exp(-gate))) # SiLU
     
     # Up projection
     up = mlp.up_weight * x
@@ -145,6 +150,146 @@ function (mlp::MLPCPU)(x::Vector{Float32})
     
     # Down projection
     return mlp.down_weight * hidden
+end
+
+# Helper: multiply quantized matrix by vector (row-wise)
+function mul_quant_mat_vec(mat::Q4_K_Matrix, x::Vector{Float32}, out::Vector{Float32})
+    # Dequantize and multiply row by row
+    # mat is stored as (inner_dim, outer_dim), we need to compute mat' * x
+    # which gives us a vector of size outer_dim
+    fill!(out, 0.0f0)
+    
+    block_values = zeros(Float32, 256)
+    
+    for row in 1:mat.outer_dim
+        sum_val = 0.0f0
+        row_start = (row - 1) * mat.inner_dim
+        
+        for block in 0:(mat.inner_dim ÷ 256 - 1)
+            global_block_idx = (row - 1) * (mat.inner_dim ÷ 256) + block
+            block_offset = global_block_idx * QuantsCPU.Q4_K_BLOCK_SIZE + 1
+            
+            # Dequantize this block
+            QuantsCPU.dequantize_q4_k_block!(block_values, mat.data, block_offset)
+            
+            for i in 1:256
+                col_idx = block * 256 + i
+                sum_val += block_values[i] * x[col_idx]
+            end
+        end
+        out[row] = sum_val
+    end
+    return out
+end
+
+function mul_quant_mat_vec(mat::Q5_K_Matrix, x::Vector{Float32}, out::Vector{Float32})
+    fill!(out, 0.0f0)
+    block_values = zeros(Float32, 256)
+    
+    for row in 1:mat.outer_dim
+        sum_val = 0.0f0
+        
+        for block in 0:(mat.inner_dim ÷ 256 - 1)
+            global_block_idx = (row - 1) * (mat.inner_dim ÷ 256) + block
+            block_offset = global_block_idx * QuantsCPU.Q5_K_BLOCK_SIZE + 1
+            
+            QuantsCPU.dequantize_q5_k_block!(block_values, mat.data, block_offset)
+            
+            for i in 1:256
+                col_idx = block * 256 + i
+                sum_val += block_values[i] * x[col_idx]
+            end
+        end
+        out[row] = sum_val
+    end
+    return out
+end
+
+function mul_quant_mat_vec(mat::Q6_K_Matrix, x::Vector{Float32}, out::Vector{Float32})
+    fill!(out, 0.0f0)
+    block_values = zeros(Float32, 256)
+    
+    for row in 1:mat.outer_dim
+        sum_val = 0.0f0
+        
+        for block in 0:(mat.inner_dim ÷ 256 - 1)
+            global_block_idx = (row - 1) * (mat.inner_dim ÷ 256) + block
+            block_offset = global_block_idx * QuantsCPU.Q6_K_BLOCK_SIZE + 1
+            
+            QuantsCPU.dequantize_q6_k_block!(block_values, mat.data, block_offset)
+            
+            for i in 1:256
+                col_idx = block * 256 + i
+                sum_val += block_values[i] * x[col_idx]
+            end
+        end
+        out[row] = sum_val
+    end
+    return out
+end
+
+function mul_quant_mat_vec(mat::Q8_0_Matrix, x::Vector{Float32}, out::Vector{Float32})
+    fill!(out, 0.0f0)
+    block_values = zeros(Float32, 32)
+    
+    for row in 1:mat.outer_dim
+        sum_val = 0.0f0
+        
+        for block in 0:(mat.inner_dim ÷ 32 - 1)
+            global_block_idx = (row - 1) * (mat.inner_dim ÷ 32) + block
+            block_offset = global_block_idx * QuantsCPU.Q8_0_BLOCK_SIZE + 1
+            
+            QuantsCPU.dequantize_q8_0_block!(block_values, mat.data, block_offset)
+            
+            for i in 1:32
+                col_idx = block * 32 + i
+                sum_val += block_values[i] * x[col_idx]
+            end
+        end
+        out[row] = sum_val
+    end
+    return out
+end
+
+# Generic multiplication for quantized or Float32 weights
+function mlp_mat_vec_mul(weight::Matrix{Float32}, x::Vector{Float32})
+    return weight * x
+end
+
+function mlp_mat_vec_mul(weight::Q4_K_Matrix, x::Vector{Float32})
+    out = Vector{Float32}(undef, weight.outer_dim)
+    return mul_quant_mat_vec(weight, x, out)
+end
+
+function mlp_mat_vec_mul(weight::Q5_K_Matrix, x::Vector{Float32})
+    out = Vector{Float32}(undef, weight.outer_dim)
+    return mul_quant_mat_vec(weight, x, out)
+end
+
+function mlp_mat_vec_mul(weight::Q6_K_Matrix, x::Vector{Float32})
+    out = Vector{Float32}(undef, weight.outer_dim)
+    return mul_quant_mat_vec(weight, x, out)
+end
+
+function mlp_mat_vec_mul(weight::Q8_0_Matrix, x::Vector{Float32})
+    out = Vector{Float32}(undef, weight.outer_dim)
+    return mul_quant_mat_vec(weight, x, out)
+end
+
+# Generic MLP forward pass
+function mlp_forward(mlp::MLPCPU, x::Vector{Float32})
+    # Gate with SiLU
+    gate = mlp_mat_vec_mul(mlp.gate_weight, x)
+    @. gate = gate * (1.0f0 / (1.0f0 + exp(-gate))) # SiLU
+    
+    # Up projection
+    up = mlp_mat_vec_mul(mlp.up_weight, x)
+    
+    # Element-wise multiply
+    hidden = gate .* up
+    
+    # Down projection
+    return mlp_mat_vec_mul(mlp.down_weight, hidden)
 end
 
 # --- GatedDeltaNet (SSM) ---
