@@ -542,7 +542,7 @@ function dequantize_q5_k_block!(out::AbstractVector{Float32}, data::Vector{UInt8
     return out
 end
 
-function dequantize_q6_k_block!(out::MVector{256, Float32}, data::Vector{UInt8}, block_offset::Int)
+function dequantize_q6_k_block!(out::AbstractVector{Float32}, data::Vector{UInt8}, block_offset::Int)
     ql = @view data[block_offset:block_offset+127]
     qh = @view data[block_offset+128:block_offset+191]
     scales_data = @view data[block_offset+192:block_offset+207]
@@ -569,7 +569,7 @@ function dequantize_q6_k_block!(out::MVector{256, Float32}, data::Vector{UInt8},
     return out
 end
 
-function dequantize_q8_0_block!(out::MVector{32, Float32}, data::Vector{UInt8}, block_offset::Int)
+function dequantize_q8_0_block!(out::AbstractVector{Float32}, data::Vector{UInt8}, block_offset::Int)
     d = Float32(reinterpret(Float16, data[block_offset:block_offset+1])[1])
     qs = @view data[block_offset+2:block_offset+33]
     
