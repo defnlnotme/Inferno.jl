@@ -1,5 +1,5 @@
 """
-"""CPU-only inference backend for Inferno.jl
+CPU-only inference backend for Inferno.jl
 This module provides pure CPU implementations without GPU dependencies.
 """
 module ModelCPU
@@ -555,31 +555,39 @@ struct QwenModelCPU
     rope::RotaryEmbeddingCPU
 end
 
-function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches::Vector{KVCacheCPU})
+function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches::Vector{KVCacheCPU}; full_logits::Bool=false)
     seq_len = length(tokens)
-    all_logits = zeros(Float32, model.config.vocab_size, seq_len)
-    
-    for t in 1:seq_len
-        tok = tokens[t]
-        curr_pos = pos + t - 1
-        
-        # Get embedding
-        x = view(model.embed, :, tok)  # (hidden,)
-        
-        # Process through layers
-        for (i, layer) in enumerate(model.layers)
-            x = layer(x, curr_pos, model.rope, caches[i])
+
+    if full_logits
+        all_logits = zeros(Float32, model.config.vocab_size, seq_len)
+        for t in 1:seq_len
+            tok = tokens[t]
+            curr_pos = pos + t - 1
+            x = view(model.embed, :, tok)
+            for (i, layer) in enumerate(model.layers)
+                x = layer(x, curr_pos, model.rope, caches[i])
+            end
+            x = model.final_norm(x)
+            all_logits[:, t] = model.lm_head * x
         end
-        
-        # Final normalization
-        x = model.final_norm(x)
-        
-        # LM head (compute logits)
-        logits = model.lm_head * x
-        all_logits[:, t] = logits
+        return all_logits
+    else
+        # Only compute LM head for the last position
+        last_logits = Vector{Float32}(undef, model.config.vocab_size)
+        for t in 1:seq_len
+            tok = tokens[t]
+            curr_pos = pos + t - 1
+            x = view(model.embed, :, tok)
+            for (i, layer) in enumerate(model.layers)
+                x = layer(x, curr_pos, model.rope, caches[i])
+            end
+            x = model.final_norm(x)
+            if t == seq_len
+                last_logits .= model.lm_head * x
+            end
+        end
+        return reshape(last_logits, model.config.vocab_size, 1)
     end
-    
-    return all_logits
 end
 
 function reset_states_cpu!(model::QwenModelCPU)
@@ -593,10 +601,15 @@ end
 # --- Sampling Functions ---
 
 function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top_p::Float32=1.0f0, top_k::Int=0, min_p::Float32=0.0f0)
-    # Apply temperature
-    if temperature != 1.0f0
-        logits = logits ./ temperature
-    end
+ # Handle temperature=0 (greedy/argmax sampling)
+ if temperature == 0.0f0
+ return argmax(logits)
+ end
+ 
+ # Apply temperature
+ if temperature != 1.0f0
+ logits = logits ./ temperature
+ end
     
     # Apply top-k filtering
     if top_k > 0
