@@ -7,62 +7,20 @@ using Inferno
 const MODEL_PATH = get(ENV, "INFERNO_MODEL_PATH", "tests/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
 
 println("Loading model from: $MODEL_PATH")
-model, file = LoaderCPU.load_model_cpu(MODEL_PATH)
+model, tokenizer = LoaderCPU.load_model_cpu(MODEL_PATH)
 println("Model loaded successfully!")
 println("  Hidden size: $(model.config.hidden_size)")
 println("  Layers: $(model.config.num_hidden_layers)")
 println("  Vocab size: $(model.config.vocab_size)")
-
-# Get tokenizer data
-tokens_data = file.metadata["tokenizer.ggml.tokens"]
-
-# Simple tokenization function (production use requires proper BPE tokenizer)
-function simple_tokenize(text::String, tokens_data)
-    # This is a hack - for production use the Tokenizer module
-    # For now, just find whole-word matches
-    token_ids = Int[]
-    remaining = text
-    while !isempty(remaining)
-        found = false
-        # Try longest match first
-        for len in length(remaining):-1:1
-            candidate = SubString(remaining, 1, len)
-            for (i, t) in enumerate(tokens_data)
-                # Handle Ġ prefix (space marker in GPT-2 style tokenizers)
-                clean_t = replace(t, "Ġ" => " ")
-                if clean_t == candidate || t == candidate
-                    push!(token_ids, i - 1)  # 0-indexed
-                    remaining = length(candidate) < length(remaining) ? SubString(remaining, len + 1) : ""
-                    found = true
-                    break
-                end
-            end
-            found && break
-        end
-        if !found
-            # Skip unknown character
-            remaining = length(remaining) > 1 ? SubString(remaining, 2) : ""
-        end
-    end
-    return token_ids
-end
-
-# Decode function
-function decode_tokens(token_ids::Vector{Int}, tokens_data)
-    join([replace(tokens_data[t + 1], "Ġ" => " ") for t in token_ids])
-end
 
 # Example 1: Manual token-by-token generation
 println("\n" * "="^50)
 println("Example 1: Manual Generation")
 println("="^50)
 
-# Use some known tokens
-# "The" is typically token 562 (with Ġ prefix = " The")
-# Try a simple prompt
-prompt_tokens = [562]  # " The"
-
-println("Starting with token 562 (\" The\")")
+# Use the BPETokenizer to encode/decode
+prompt_tokens = Tokenizer.encode(tokenizer, "The")
+println("Starting with prompt tokens: $(prompt_tokens)")
 
 # Initialize caches and states
 caches = [ModelCPU.init_kv_cache_cpu(model.config, 512) for _ in 1:model.config.num_hidden_layers]
@@ -84,7 +42,7 @@ for i in 1:10
     push!(tokens, next_token)
 end
 
-output_text = decode_tokens(tokens, tokens_data)
+output_text = Tokenizer.decode(tokenizer, tokens)
 println("\nGenerated: $output_text")
 
 # Example 2: Using stream_to_stdout_cpu
@@ -92,17 +50,14 @@ println("\n" * "="^50)
 println("Example 2: Streaming Generation")
 println("="^50)
 
-# Decode function for streaming
-decode_fn = (ids) -> decode_tokens(ids, tokens_data)
-
-println("\nPrompt: \" The\"")
+# Use the convenience method that handles tokenization internally
+println("\nPrompt: \"The\"")
 print("Output: ")
 
-# Use streaming generation with sampling
 result = stream_to_stdout_cpu(
     model,
-    [562],  # " The"
-    decode_fn;
+    tokenizer,
+    "The";
     max_tokens=20,
     temperature=0.7f0,
     top_p=0.9f0,
