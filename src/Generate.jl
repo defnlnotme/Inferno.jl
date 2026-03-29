@@ -7,6 +7,7 @@ module Generate
 using ..GGUF
 using ..LoaderCPU
 using ..ModelCPU
+using ..Tokenizer
 
 export generate_text, chat, SimpleTokenizer
 
@@ -94,6 +95,14 @@ function decode(tok::SimpleTokenizer, ids::Vector{Int})
     return join(parts)
 end
 
+function encode(tok::Tokenizer.BPETokenizer, text::String)
+    return Tokenizer.encode(tok, text)
+end
+
+function decode(tok::Tokenizer.BPETokenizer, ids::Vector{Int})
+    return Tokenizer.decode(tok, ids)
+end
+
 """
     generate_text(model, tokenizer, prompt; kwargs...)
 
@@ -157,6 +166,43 @@ function generate_text(model::ModelCPU.QwenModelCPU, tok::SimpleTokenizer, promp
     return result
 end
 
+function generate_text(model::ModelCPU.QwenModelCPU, tok::Tokenizer.BPETokenizer, prompt::String;
+    max_tokens::Int=256,
+    temperature::Float32=0.7f0,
+    top_p::Float32=0.9f0,
+    top_k::Int=40,
+    repetition_penalty::Float32=1.1f0,
+    stop_tokens::Set{Int}=Set{Int}())
+
+    # Add EOS to stop tokens (eos_id is already 1-indexed)
+    push!(stop_tokens, tok.eos_id)
+
+    # Tokenize prompt (returns 1-indexed IDs)
+    prompt_tokens = encode(tok, prompt)
+
+    if isempty(prompt_tokens)
+        return ""
+    end
+
+    # Create decode function
+    decode_fn = (ids) -> decode(tok, ids)
+
+    # Generate
+    result = ModelCPU.stream_to_stdout_cpu(
+        model,
+        prompt_tokens,
+        decode_fn;
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        stop_tokens=stop_tokens
+    )
+
+    return result
+end
+
 """
     chat(model, tokenizer, messages; kwargs...)
 
@@ -183,22 +229,22 @@ function chat(model::ModelCPU.QwenModelCPU, tok::SimpleTokenizer, messages::Vect
     top_k::Int=40,
     repetition_penalty::Float32=1.1f0)
     
-    # Format messages for Qwen chat template
+    # Format messages for Qwen chat template (correct <|im_start|> format)
     parts = String[]
     for (role, content) in messages
         if role == "system"
-            push!(parts, "<|im_start|>system\n$(content)<|im_end|>\n")
+            push!(parts, "<|im_start|>system\n$(content)<|im_end|>")
         elseif role == "user"
-            push!(parts, "<|im_start|>user\n$(content)<|im_end|>\n")
+            push!(parts, "<|im_start|>user\n$(content)<|im_end|>")
         elseif role == "assistant"
-            push!(parts, "<|im_start|>assistant\n$(content)<|im_end|>\n")
+            push!(parts, "<|im_start|>assistant\n$(content)<|im_end|>")
         end
     end
     push!(parts, "<|im_start|>assistant\n")
     
-    prompt = join(parts)
+    prompt = join(parts, "\n")
     
-    # Add assistant start token as stop sequence
+    # Add im_end and eos as stop sequences
     stop_tokens = Set{Int}()
     # Try to find <|im_end|> token
     for (i, t) in enumerate(tok.tokens)
@@ -207,6 +253,48 @@ function chat(model::ModelCPU.QwenModelCPU, tok::SimpleTokenizer, messages::Vect
         end
     end
     push!(stop_tokens, tok.eos_id)
+    
+    return generate_text(model, tok, prompt;
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        stop_tokens=stop_tokens
+    )
+end
+
+function chat(model::ModelCPU.QwenModelCPU, tok::Tokenizer.BPETokenizer, messages::Vector{Tuple{String,String}};
+    max_tokens::Int=512,
+    temperature::Float32=0.7f0,
+    top_p::Float32=0.9f0,
+    top_k::Int=40,
+    repetition_penalty::Float32=1.1f0)
+
+    # Format messages for Qwen chat template (correct <|im_start|> format)
+    parts = String[]
+    for (role, content) in messages
+        if role == "system"
+            push!(parts, "<|im_start|>system\n$(content)<|im_end|>")
+        elseif role == "user"
+            push!(parts, "<|im_start|>user\n$(content)<|im_end|>")
+        elseif role == "assistant"
+            push!(parts, "<|im_start|>assistant\n$(content)<|im_end|>")
+        end
+    end
+    push!(parts, "<|im_start|>assistant\n")
+
+    prompt = join(parts, "\n")
+
+    # Add im_end and eos as stop sequences (convert 1-indexed to 0-indexed)
+    stop_tokens = Set{Int}()
+    # Try to find <|im_end|> token
+    for (i, t) in enumerate(tok.id_to_token)
+        if occursin("<|im_end|>", t)
+            push!(stop_tokens, i - 1)  # Convert 1-indexed to 0-indexed
+        end
+    end
+    push!(stop_tokens, tok.eos_id - 1)  # Convert 1-indexed to 0-indexed
     
     return generate_text(model, tok, prompt;
         max_tokens=max_tokens,

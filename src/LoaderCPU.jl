@@ -7,6 +7,7 @@ module LoaderCPU
 using ..ModelCPU
 using ..GGUF
 using ..Dequant
+using ..Tokenizer
 
 export load_model_cpu
 
@@ -131,7 +132,10 @@ function load_model_cpu(path::String)
     rotary_dim = round(Int, config.head_dim * config.partial_rotary_factor)
     rope = ModelCPU.RotaryEmbeddingCPU(config.head_dim, config.rope_theta, config.max_position_embeddings; rotary_dim=rotary_dim)
     
-    return ModelCPU.QwenModelCPU(config, embed, lm_head, layers, final_norm, rope), file
+    # Load tokenizer
+    tok = Tokenizer.load_tokenizer(file.metadata)
+    
+    return ModelCPU.QwenModelCPU(config, embed, lm_head, layers, final_norm, rope), tok
 end
 
 function get_config(file::GGUF.GGUFFile)
@@ -149,6 +153,13 @@ function get_config(file::GGUF.GGUFFile)
         rms_norm_eps = Float32(get(file.metadata, "qwen3.attention.layer_norm_rms_epsilon", get(file.metadata, "attention.layer_norm_rms_epsilon", 1e-6))),
         rope_theta = Float32(get(file.metadata, "qwen3.rope.freq_base", get(file.metadata, "rope.freq_base", 10000000.0))),
         max_position_embeddings = get(file.metadata, "qwen3.context_length", get(file.metadata, "context_length", 4096)),
+        partial_rotary_factor = Float32(get(file.metadata, "qwen3.rope.partial_rotary_factor", get(file.metadata, "rope.partial_rotary_factor", 0.25))),
+        full_attention_interval = get(file.metadata, "qwen3.full_attention_interval", get(file.metadata, "full_attention_interval", 4)),
+        ssm_inner_size = get(file.metadata, "qwen3.ssm.inner_size", get(file.metadata, "ssm.inner_size", 2048)),
+        ssm_state_size = get(file.metadata, "qwen3.ssm.state_size", get(file.metadata, "ssm.state_size", 128)),
+        ssm_group_count = get(file.metadata, "qwen3.ssm.group_count", get(file.metadata, "ssm.group_count", 16)),
+        ssm_time_step_rank = get(file.metadata, "qwen3.ssm.time_step_rank", get(file.metadata, "ssm.time_step_rank", 16)),
+        ssm_conv_kernel = get(file.metadata, "qwen3.ssm.conv_kernel", get(file.metadata, "ssm.conv_kernel", 4)),
     )
     
     return config
@@ -188,8 +199,11 @@ function load_ssm_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.Qw
     gate_proj = Float32.(extract_tensor_cpu(file, "$(prefix).attn_gate.weight"))'
     ssm_out = Float32.(extract_tensor_cpu(file, "$(prefix).ssm_out.weight"))'
     
-    # Conv1d - stored as (out_features, kernel_size)
-    ssm_conv1d = Float32.(extract_tensor_cpu(file, "$(prefix).ssm_conv1d.weight"))'
+ # Conv1d - stored as (kernel_size, out_features) in GGUF for Qwen3.5
+ # We need (conv_kernel, conv_channels) for the convolution
+ ssm_conv1d_raw = Float32.(extract_tensor_cpu(file, "$(prefix).ssm_conv1d.weight"))
+ # GGUF stores as (kernel, channels), we keep it that way
+ ssm_conv1d = ssm_conv1d_raw
     
     # Alpha/beta weights
     ssm_alpha_weight = Float32.(extract_tensor_cpu(file, "$(prefix).ssm_alpha.weight"))'
@@ -212,9 +226,9 @@ function load_ssm_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.Qw
     head_v_dim = d_inner ÷ num_v_heads
     head_k_dim = size(ssm_alpha_weight, 1) ÷ num_k_heads  # Actually need to check this
     
-    # conv_channels = d_inner + 2 * num_k_heads * head_k_dim
-    conv_channels = size(in_proj, 1)
-    conv_kernel = size(ssm_conv1d, 2)
+ # conv_channels = d_inner + 2 * num_k_heads * head_k_dim
+ conv_channels = size(in_proj, 1)
+ conv_kernel = size(ssm_conv1d, 1)  # First dimension is kernel size
     
     # Recompute head_k_dim from conv_channels
     # conv_channels = d_inner + 2 * num_k_heads * head_k_dim

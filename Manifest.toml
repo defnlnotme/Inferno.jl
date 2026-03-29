@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "564b2b2a529149b52c9ca62ddff3ee82eb06fa83"
+project_hash = "22b629c1384ae5d72fcedaffe356ed2ad4c07cd9"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -191,7 +191,7 @@ uuid = "e33a78d0-f292-5ffc-b300-72abe9b543c8"
 version = "2.13.0+0"
 
 [[deps.Inferno]]
-deps = ["ArgParse", "HTTP", "JSON", "JSON3", "Libdl", "LinearAlgebra", "Mmap", "OrderedCollections", "Random", "Sockets", "Statistics", "StructTypes", "Tar", "Unicode", "oneAPI"]
+deps = ["ArgParse", "BFloat16s", "HTTP", "JSON", "JSON3", "Libdl", "LinearAlgebra", "Mmap", "OrderedCollections", "REPL", "Random", "Sockets", "Statistics", "StructTypes", "Tar", "Unicode", "oneAPI"]
 path = "."
 uuid = "4e1e2c4b-a6e7-48e4-a8cc-a3a3a2d64561"
 version = "0.1.0"
@@ -432,12 +432,10 @@ version = "2.8.3"
 deps = ["Artifacts", "Dates", "Downloads", "FileWatching", "LibGit2", "Libdl", "Logging", "Markdown", "Printf", "Random", "SHA", "TOML", "Tar", "UUIDs", "p7zip_jll"]
 uuid = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 version = "1.12.1"
+weakdeps = ["REPL"]
 
     [deps.Pkg.extensions]
     REPLExt = "REPL"
-
-    [deps.Pkg.weakdeps]
-    REPL = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
 
 [[deps.PrecompileTools]]
 deps = ["Preferences"]
@@ -454,6 +452,11 @@ version = "1.5.2"
 [[deps.Printf]]
 deps = ["Unicode"]
 uuid = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+version = "1.11.0"
+
+[[deps.REPL]]
+deps = ["InteractiveUtils", "JuliaSyntaxHighlighting", "Markdown", "Sockets", "StyledStrings", "Unicode"]
+uuid = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
 version = "1.11.0"
 
 [[deps.Random]]

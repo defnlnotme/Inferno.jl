@@ -30,10 +30,21 @@ Base.@kwdef struct QwenConfigCPU
     ssm_time_step_rank::Int = 16
     ssm_conv_kernel::Int = 4
     partial_rotary_factor::Float32 = 0.25f0  # Only 25% of head_dim gets rotary
+    # MLA (Multi-Head Latent Attention for DeepSeek)
+    q_lora_rank::Int = 0
+    kv_lora_rank::Int = 0
+    qk_rope_head_dim::Int = 0
+    qk_nope_head_dim::Int = 0
+    v_head_dim::Int = 0
 end
 
 # Helper functions
 sigmoid(x) = 1.0f0 / (1.0f0 + exp(-x))
+
+function sigmoid!(out::AbstractArray, x::AbstractArray)
+    @. out = 1.0f0 / (1.0f0 + exp(-x))
+    return out
+end
 
 # --- RMS Norm ---
 struct RMSNormCPU
@@ -46,20 +57,18 @@ function RMSNormCPU(weight::AbstractArray{Float32}, eps::Float32)
 end
 
 function (norm::RMSNormCPU)(x::AbstractArray{Float32})
-    ss = mapreduce(abs2, +, x)
-    m = ss / length(x)
-    scale = 1.0f0 / sqrt(m + norm.eps)
-    # Qwen3.5 uses (1 + weight) instead of just weight
-    return x .* scale .* (1.0f0 .+ norm.weight)
+ ss = mapreduce(abs2, +, x)
+ m = ss / length(x)
+ scale = 1.0f0 / sqrt(m + norm.eps)
+ return x .* scale .* norm.weight
 end
 
 function rmsnorm_cpu!(out::AbstractArray{Float32}, x::AbstractArray{Float32}, norm::RMSNormCPU)
-    ss = mapreduce(abs2, +, x)
-    m = ss / length(x)
-    scale = 1.0f0 / sqrt(m + norm.eps)
-    # Qwen3.5 uses (1 + weight) instead of just weight
-    out .= x .* scale .* (1.0f0 .+ norm.weight)
-    return out
+ ss = mapreduce(abs2, +, x)
+ m = ss / length(x)
+ scale = 1.0f0 / sqrt(m + norm.eps)
+ out .= x .* scale .* norm.weight
+ return out
 end
 
 # --- Rotary Position Embedding ---
@@ -102,13 +111,12 @@ end
 struct KVCacheCPU
     k::Array{Float32,3}  # (head_dim, n_kv_heads, max_seq)
     v::Array{Float32,3}
-    pos::Int
 end
 
 function init_kv_cache_cpu(config::QwenConfigCPU, max_seq::Int = 4096)
     k = zeros(Float32, config.head_dim, config.num_key_value_heads, max_seq)
     v = zeros(Float32, config.head_dim, config.num_key_value_heads, max_seq)
-    return KVCacheCPU(k, v, 0)
+    return KVCacheCPU(k, v)
 end
 
 function update_kv_cache!(cache::KVCacheCPU, k::Matrix{Float32}, v::Matrix{Float32}, pos::Int)
@@ -189,13 +197,12 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
     end
     m.conv_state[:, m.conv_kernel] .= qkv
     
-    # 3. Compute convolution
-    x_conv = zeros(Float32, m.conv_channels)
-    for k in 1:m.conv_kernel
-        for c in 1:m.conv_channels
-            x_conv[c] += m.conv_state[c, k] * m.ssm_conv1d[c, k]
-        end
-    end
+ # 3. Compute convolution - x_conv[c] = sum_k conv_state[c,k] * ssm_conv1d[k,c]
+  # Using BLAS dot product for each channel (diagonal of matrix product)
+  x_conv = Vector{Float32}(undef, m.conv_channels)
+  for c in 1:m.conv_channels
+      x_conv[c] = dot(view(m.conv_state, c, :), view(m.ssm_conv1d, :, c))
+  end
     
     # 4. SiLU activation
     @. x_conv = x_conv * (1.0f0 / (1.0f0 + exp(-x_conv)))
@@ -258,11 +265,13 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
  # y_all has shape (d_inner,) = (head_v_dim * num_v_heads,)
  # norm is applied per-head
  for h in 1:m.num_v_heads
-     y_h = view(y_all, (h-1)*m.head_v_dim+1:h*m.head_v_dim)
-     rmsnorm_cpu!(y_h, y_h, m.ssm_norm)
+ y_h = view(y_all, (h-1)*m.head_v_dim+1:h*m.head_v_dim)
+ rmsnorm_cpu!(y_h, y_h, m.ssm_norm)
  end
- 
+
  # 9. SiLU gate on z
+ # silu(z) = z * sigmoid(z) = z / (1 + exp(-z))
+ # Output: norm(y_all) * silu(z)
  @. y_all = y_all * z * (1.0f0 / (1.0f0 + exp(-z)))
  
  # 10. Output projection
@@ -301,53 +310,62 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
     k = reshape(k, attn.head_dim, attn.n_kv)
     v = reshape(v, attn.head_dim, attn.n_kv)
     
-    # Apply Q/K normalization
-    query_states = attn.q_norm(query_states)
-    k = attn.k_norm(k)
+ # Apply Q/K normalization (per-head)
+ # query_states has shape (head_dim, n_heads), normalize each column independently
+ for h in 1:attn.n_heads
+     q_h = view(query_states, :, h)
+     rmsnorm_cpu!(q_h, q_h, attn.q_norm)
+ end
+ for h in 1:attn.n_kv
+     k_h = view(k, :, h)
+     rmsnorm_cpu!(k_h, k_h, attn.k_norm)
+ end
     
     # Apply RoPE
     apply_rotary_emb!(query_states, pos, rope)
     apply_rotary_emb!(k, pos, rope)
-    
+
+    # Apply SiLU gating to Q before attention (matches GPU implementation)
+    gate_silu = similar(gate)
+    @. gate_silu = gate * (1.0f0 / (1.0f0 + exp(-gate)))  # SiLU
+    gate_reshaped = reshape(gate_silu, attn.head_dim, attn.n_heads)
+    query_states .*= gate_reshaped
+
     # Update KV cache
     update_kv_cache!(cache, k, v, pos)
-    
-    # Compute attention scores
+
+    # Compute attention scores using BLAS
+    # cache.k is (head_dim, n_kv, max_seq), cache.v is (head_dim, n_kv, max_seq)
+    # query_states is (head_dim, n_heads)
     output = zeros(Float32, attn.n_heads * attn.head_dim)
-    
+
     gqa_ratio = div(attn.n_heads, attn.n_kv)
-    
+    seq_len = pos + 1
+
     for h in 1:attn.n_heads
         kv_h = div(h - 1, gqa_ratio) + 1
-        
-        q_h = view(query_states, :, h)
-        
-        # Compute scores for all cached positions
-        scores = zeros(Float32, pos + 1)
-        for p in 0:pos
-            k_h = view(cache.k, :, kv_h, p + 1)
-            scores[p + 1] = dot(q_h, k_h) * attn.scale
-        end
-        
+
+        q_h = query_states[:, h]
+
+        # Extract K and V for this KV head: (head_dim, seq_len)
+        K_h = view(cache.k, :, kv_h, 1:seq_len)
+        V_h = view(cache.v, :, kv_h, 1:seq_len)
+
+        # Compute scores: K' * q = (seq_len, head_dim) * (head_dim,) = (seq_len,)
+        # Using BLAS: scores = K_h' * q_h
+        scores = K_h' * q_h
+        scores .*= attn.scale
+
         # Softmax
         max_score = maximum(scores)
         scores = exp.(scores .- max_score)
         scores ./= sum(scores)
-        
-        # Weighted sum of values
-        out_h = zeros(Float32, attn.head_dim)
-        for p in 0:pos
-            v_h = view(cache.v, :, kv_h, p + 1)
-            out_h .+= scores[p + 1] .* v_h
-        end
-        
+
+        # Weighted sum: V * scores = (head_dim, seq_len) * (seq_len,) = (head_dim,)
+        out_h = V_h * scores
+
         output[(h-1)*attn.head_dim+1:h*attn.head_dim] .= out_h
     end
-    
-    # Apply gate with sigmoid
-    # gate is (n_heads * head_dim,) and output is (n_heads * head_dim,)
-    # Apply sigmoid element-wise and multiply
-    output .*= sigmoid.(gate)
     
     # Output projection
     return attn.wo * output
@@ -429,7 +447,7 @@ end
 
 # --- Sampling Functions ---
 
-function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top_p::Float32=1.0f0, top_k::Int=0)
+function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top_p::Float32=1.0f0, top_k::Int=0, min_p::Float32=0.0f0)
     # Apply temperature
     if temperature != 1.0f0
         logits = logits ./ temperature
@@ -470,7 +488,21 @@ function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top
             end
         end
         # Renormalize
-        probs ./= sum(probs)
+        total = sum(probs)
+        if total > 0.0f0
+            probs ./= total
+        end
+    end
+    
+    # Apply minimum probability floor and renormalize
+    if min_p > 0.0f0
+        @inbounds for i in 1:length(probs)
+            probs[i] = max(probs[i], min_p)
+        end
+        total = sum(probs)
+        if total > 0.0f0
+            probs ./= total
+        end
     end
     
     # Sample from distribution
@@ -485,13 +517,26 @@ function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top
     return length(probs)
 end
 
+function apply_presence_penalty!(logits::Vector{Float32}, token_counts::Dict{Int,Int}, penalty::Float32)
+    if penalty == 0.0f0
+        return
+    end
+    for (tokid, _cnt) in token_counts
+        if 1 <= tokid <= length(logits)
+            logits[tokid] -= penalty
+        end
+    end
+end
+
 function apply_repetition_penalty!(logits::Vector{Float32}, token_counts::Dict{Int,Int}, penalty::Float32)
     if penalty != 1.0f0
-        for (tok, count) in token_counts
-            if logits[tok] > 0
-                logits[tok] /= penalty^count
-            else
-                logits[tok] *= penalty^count
+        for (tokid, _count) in token_counts
+            if 1 <= tokid <= length(logits)
+                if logits[tokid] > 0
+                    logits[tokid] /= penalty
+                else
+                    logits[tokid] *= penalty
+                end
             end
         end
     end
@@ -508,7 +553,7 @@ Returns: (next_token, updated_logits)
 """
 function generate_cpu(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches::Vector{KVCacheCPU};
     temperature::Float32=1.0f0, top_p::Float32=1.0f0, top_k::Int=0,
-    repetition_penalty::Float32=1.0f0, token_counts::Dict{Int,Int}=Dict{Int,Int}())
+    repetition_penalty::Float32=1.0f0, token_counts::Dict{Int,Int}=Dict{Int,Int}(), presence_penalty::Float32=0.0f0, min_p::Float32=0.0f0)
     
     # Forward pass
     logits = forward_cpu!(model, tokens, pos, caches)
@@ -516,11 +561,12 @@ function generate_cpu(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
     # Get logits for last token
     logits_vec = vec(logits[:, end])
     
-    # Apply repetition penalty
+    # Apply presence then repetition penalties
+    apply_presence_penalty!(logits_vec, token_counts, presence_penalty)
     apply_repetition_penalty!(logits_vec, token_counts, repetition_penalty)
     
     # Sample
-    next_token = softmax_sample(logits_vec; temperature, top_p, top_k)
+    next_token = softmax_sample(logits_vec; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
     
     return next_token, logits_vec
 end
@@ -544,15 +590,18 @@ function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, de
     top_p::Float32=0.95f0,
     top_k::Int=0,
     repetition_penalty::Float32=1.0f0,
+    presence_penalty::Float32=0.0f0,
+    min_p::Float32=0.0f0,
     stop_tokens::Set{Int}=Set{Int}())
     
     return Channel{String}(32) do chan
         try
-            # Initialize caches and states
-            caches = [init_kv_cache_cpu(model.config, 512) for _ in 1:model.config.num_hidden_layers]
+            # Initialize caches and states using model's max position embeddings
+            cache_size = model.config.max_position_embeddings
+            caches = [init_kv_cache_cpu(model.config, cache_size) for _ in 1:model.config.num_hidden_layers]
             reset_states_cpu!(model)
             
-            # Track token counts for repetition penalty
+            # Track token counts for repetition/presence penalty
             token_counts = Dict{Int,Int}()
             for t in prompt_tokens
                 token_counts[t] = get(token_counts, t, 0) + 1
@@ -566,7 +615,7 @@ function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, de
                 
                 # Generate first token from prompt context
                 next_token, _ = generate_cpu(model, [prompt_tokens[end]], curr_pos, caches;
-                    temperature, top_p, top_k, repetition_penalty, token_counts)
+                    temperature=temperature, top_p=top_p, top_k=top_k, repetition_penalty=repetition_penalty, token_counts=token_counts, presence_penalty=presence_penalty, min_p=min_p)
                 
                 curr_pos += 1
                 token_counts[next_token] = get(token_counts, next_token, 0) + 1
@@ -579,12 +628,13 @@ function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, de
                 
                 # Generate remaining tokens
                 for _ in 2:max_tokens
-                    if last_token in stop_tokens
+                    next_token, _ = generate_cpu(model, [last_token], curr_pos, caches;
+                        temperature=temperature, top_p=top_p, top_k=top_k, repetition_penalty=repetition_penalty, token_counts=token_counts, presence_penalty=presence_penalty, min_p=min_p)
+                    
+                    # Check stop token BEFORE updating state and yielding
+                    if next_token in stop_tokens
                         break
                     end
-                    
-                    next_token, _ = generate_cpu(model, [last_token], curr_pos, caches;
-                        temperature, top_p, top_k, repetition_penalty, token_counts)
                     
                     curr_pos += 1
                     token_counts[next_token] = get(token_counts, next_token, 0) + 1
@@ -622,11 +672,13 @@ function stream_to_stdout_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, d
     top_p::Float32=0.95f0,
     top_k::Int=20,
     repetition_penalty::Float32=1.0f0,
+    presence_penalty::Float32=0.0f0,
+    min_p::Float32=0.0f0,
     stop_tokens::Set{Int}=Set{Int}(),
     io::IO=stdout)
     
     stream = generate_stream_cpu(model, prompt_tokens, decode_fn;
-        max_tokens, temperature, top_p, top_k, repetition_penalty, stop_tokens)
+        max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p, stop_tokens=stop_tokens)
     
     generated_text = IOBuffer()
     try
@@ -670,33 +722,41 @@ end
 
 # Helper functions for tokenization
 function encode_prompt(tok, prompt::String)
-    # Handle Vector{String} (raw token list from GGUF)
-    if tok isa Vector{String}
-        tokens_data = tok
-        tokens = Int[]
-        remaining = prompt
-        while !isempty(remaining)
-            found = false
-            for len in length(remaining):-1:1
-                candidate = SubString(remaining, 1, len)
-                for prefix in ["", "Ġ"]
-                    key = prefix * candidate
-                    idx = findfirst(==(key), tokens_data)
-                    if idx !== nothing
-                        push!(tokens, idx - 1)  # 0-indexed
-                        remaining = len < length(remaining) ? SubString(remaining, len + 1) : ""
-                        found = true
-                        break
-                    end
-                end
-                found && break
-            end
-            if !found
-                remaining = length(remaining) > 1 ? SubString(remaining, 2) : ""
-            end
-        end
-        return tokens
-    # Handle SimpleTokenizer struct
+ # Handle Vector{String} (raw token list from GGUF)
+ if tok isa Vector{String}
+ tokens_data = tok
+ tokens = Int[]
+ remaining = prompt
+ is_first = true
+ while !isempty(remaining)
+ found = false
+ for len in length(remaining):-1:1
+ candidate = SubString(remaining, 1, len)
+ # For first token, try without prefix first, then with prefix
+ # For subsequent tokens, try with prefix first (space prefix in BPE)
+ prefixes = is_first ? ["", "Ġ"] : ["Ġ", ""]
+ for prefix in prefixes
+ key = prefix * candidate
+ idx = findfirst(==(key), tokens_data)
+ if idx !== nothing
+ push!(tokens, idx) # 1-indexed for Julia arrays
+ remaining = len < length(remaining) ? SubString(remaining, len + 1) : ""
+ found = true
+ is_first = false
+ break
+ end
+ end
+ found && break
+ end
+ if !found
+ remaining = length(remaining) > 1 ? SubString(remaining, 2) : ""
+ end
+ end
+ return tokens
+    # Handle BPETokenizer (already 1-indexed, pass through)
+    elseif hasfield(typeof(tok), :id_to_token) && hasfield(typeof(tok), :merges)
+        return Base.invokelatest(getfield(parentmodule(typeof(tok)), :encode), tok, prompt)
+    # Handle SimpleTokenizer struct (0-indexed -> convert to 1-indexed)
     elseif hasfield(typeof(tok), :token_to_id)
         tokens = Int[]
         remaining = prompt
@@ -707,7 +767,7 @@ function encode_prompt(tok, prompt::String)
                 for prefix in ["", "Ġ"]
                     key = prefix * candidate
                     if haskey(tok.token_to_id, key)
-                        push!(tokens, tok.token_to_id[key])
+                        push!(tokens, tok.token_to_id[key] + 1)  # Convert 0-indexed to 1-indexed
                         remaining = len < length(remaining) ? SubString(remaining, len + 1) : ""
                         found = true
                         break
@@ -720,6 +780,7 @@ function encode_prompt(tok, prompt::String)
             end
         end
         return tokens
+    # Handle BPETokenizer (1-indexed encode -> convert to 0-indexed)
     else
         # Fallback: assume tok is a function
         return tok(prompt)
@@ -731,24 +792,27 @@ function decode_tokens(tok, ids::Vector{Int})
     if tok isa Vector{String}
         parts = String[]
         for id in ids
-            if 1 <= id + 1 <= length(tok)
-                t = tok[id + 1]
+            if 1 <= id <= length(tok)
+                t = tok[id]
                 t = replace(t, "Ġ" => " ")
                 push!(parts, t)
             end
         end
         return join(parts)
-    # Handle SimpleTokenizer struct
+    # Handle SimpleTokenizer struct (0-indexed ids -> need +1 for 1-indexed tokens vector)
     elseif hasfield(typeof(tok), :tokens)
         parts = String[]
         for id in ids
-            if 1 <= id + 1 <= length(tok.tokens)
-                t = tok.tokens[id + 1]
+            if 1 <= id <= length(tok.tokens)
+                t = tok.tokens[id]
                 t = replace(t, "Ġ" => " ")
                 push!(parts, t)
             end
         end
         return join(parts)
+    # Handle BPETokenizer (already 1-indexed, pass through)
+    elseif hasfield(typeof(tok), :id_to_token) && hasfield(typeof(tok), :merges)
+        return Base.invokelatest(getfield(parentmodule(typeof(tok)), :decode), tok, ids)
     else
         return tok(ids)
     end

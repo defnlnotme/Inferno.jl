@@ -21,12 +21,12 @@ function simple_sample(probs::Vector{Float16})
     return length(probs)
 end
 
-function sample(logits::Vector{Float16}, temperature::Float16, top_p::Float16, top_k::Int=40)
-    return cpu_sample(logits, temperature, top_p, top_k)
+function sample(logits::Vector{Float16}, temperature::Float16, top_p::Float16, top_k::Int=40, min_p::Float16=Float16(0.0))
+    return cpu_sample(logits, temperature, top_p, top_k, min_p)
 end
 
 # CPU sampling implementation with Float32 stability
-function cpu_sample(logits::Vector{Float16}, temperature::Float16, top_p::Float16, top_k::Int=40)
+function cpu_sample(logits::Vector{Float16}, temperature::Float16, top_p::Float16, top_k::Int=40, min_p::Float16=Float16(0.0))
     # Sanitize logits - replace NaN and Inf with -Inf so they're never selected
     @inbounds for i in eachindex(logits)
         if !isfinite(logits[i])
@@ -93,11 +93,24 @@ function cpu_sample(logits::Vector{Float16}, temperature::Float16, top_p::Float1
         end
     end
 
+    # Apply minimum probability floor and renormalize
+    if min_p > Float16(0.0)
+        probs32 = Float32.(probs)
+        @inbounds for i in eachindex(probs32)
+            probs32[i] = max(probs32[i], Float32(min_p))
+        end
+        total = sum(probs32)
+        if total > 0.0f0
+            probs32 ./= total
+        end
+        probs .= Float16.(probs32)
+    end
+
     return simple_sample(probs)
 end
 
 # CPU sampling from already scaled logits
-function cpu_sample_from_scaled(scaled_logits::Vector{Float16}, temperature::Float16, top_p::Float16, top_k::Int=40)
+function cpu_sample_from_scaled(scaled_logits::Vector{Float16}, temperature::Float16, top_p::Float16, top_k::Int=40, min_p::Float16=Float16(0.0))
     mx = Float32(maximum(scaled_logits))
     exp_vals = exp.(Float32.(scaled_logits) .- mx)
     probs = Float16.(exp_vals ./ sum(exp_vals))
@@ -134,11 +147,25 @@ function cpu_sample_from_scaled(scaled_logits::Vector{Float16}, temperature::Flo
         probs ./= sum(probs)
     end
 
+    # Apply minimum probability floor and renormalize
+    if min_p > Float16(0.0)
+        # Work in Float32 for stability
+        probs32 = Float32.(probs)
+        @inbounds for i in eachindex(probs32)
+            probs32[i] = max(probs32[i], Float32(min_p))
+        end
+        total = sum(probs32)
+        if total > 0.0f0
+            probs32 ./= total
+        end
+        probs .= Float16.(probs32)
+    end
+
     return simple_sample(probs)
 end
 
 # mask_and_sample: avoids returning PAD-like tokens when streaming
-function mask_and_sample(logits::AbstractVector{Float16}, pad_ids::Vector{Int}, temperature::Float16, top_p::Float16, top_k::Int=40; max_attempts::Int=5)
+function mask_and_sample(logits::AbstractVector{Float16}, pad_ids::Vector{Int}, temperature::Float16, top_p::Float16, top_k::Int=40; max_attempts::Int=5, min_p::Float16=Float16(0.0))
     logits_copy = logits isa Vector{Float16} ? copy(logits) : Vector{Float16}(logits)
 
     if !isempty(pad_ids)
@@ -150,7 +177,7 @@ function mask_and_sample(logits::AbstractVector{Float16}, pad_ids::Vector{Int}, 
     end
 
     for attempt in 1:max_attempts
-        cand = sample(logits_copy, temperature, top_p, top_k)
+        cand = sample(logits_copy, temperature, top_p, top_k, min_p)
         if !isempty(pad_ids) && cand <= length(logits_copy) && logits_copy[cand] <= -1e8
             logits_copy[cand] = -Float16(Inf)
             continue
@@ -166,9 +193,9 @@ function apply_presence_penalty!(logits::AbstractVector{Float16}, token_counts::
     if penalty == Float16(0.0)
         return logits
     end
-    for (tokid, cnt) in token_counts
+    for (tokid, _cnt) in token_counts
         if 1 <= tokid <= length(logits)
-            logits[tokid] -= Float16(cnt) * penalty
+            logits[tokid] -= penalty
         end
     end
     return logits
@@ -197,6 +224,7 @@ end
 # - top_p: 0.95
 # - top_k: 0 (disabled, use all tokens in top-p)
 # - repetition_penalty: 1.0 (use 1.1-1.2 for long texts)
+# - gc_interval: 0 (disabled by default to avoid stuttering, set > 0 to enable periodic GC)
 
 function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::String;
     max_tokens::Int=512,
@@ -205,7 +233,9 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
     top_k::Int=0,
     presence_penalty::Float16=Float16(0.0),
     repetition_penalty::Float16=Float16(1.0),
-    stop_token::Union{Int,Nothing}=nothing)
+    min_p::Float16=Float16(0.0),
+    stop_token::Union{Int,Nothing}=nothing,
+    gc_interval::Int=0)
 
     tokens = Tokenizer.encode(tok, prompt)
     if isempty(tokens)
@@ -232,13 +262,13 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
             Model.reset_states!(model)
             kv_caches = [Model.init_kv_cache(model.config) for _ in 1:model.config.num_hidden_layers]
 
-            logits = Model.forward!(model, tokens, 0, kv_caches)
+            logits = Model.forward!(model, tokens, 0, kv_caches; gc_interval=gc_interval)
             curr_pos = length(tokens)
 
             logits_vec = vec(collect(logits[:, end]))
             apply_presence_penalty!(logits_vec, token_counts, presence_penalty)
             apply_repetition_penalty!(logits_vec, token_counts, repetition_penalty)
-            last_token = mask_and_sample(logits_vec, [tok.eos_id], temperature, top_p, top_k)
+            last_token = mask_and_sample(logits_vec, [tok.eos_id], temperature, top_p, top_k; min_p=min_p)
 
             token_str = Tokenizer.decode(tok, [last_token])
             put!(chan, token_str)
@@ -250,20 +280,21 @@ function generate_stream(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, pr
                     break
                 end
 
-                logits = Model.forward!(model, [last_token], curr_pos, kv_caches)
+                logits = Model.forward!(model, [last_token], curr_pos, kv_caches; gc_interval=gc_interval)
                 curr_pos += 1
 
                 logits_vec = vec(collect(logits[:, 1]))
                 apply_presence_penalty!(logits_vec, token_counts, presence_penalty)
                 apply_repetition_penalty!(logits_vec, token_counts, repetition_penalty)
-                last_token = mask_and_sample(logits_vec, [tok.eos_id], temperature, top_p, top_k)
+                last_token = mask_and_sample(logits_vec, [tok.eos_id], temperature, top_p, top_k; min_p=min_p)
 
                 token_str = Tokenizer.decode(tok, [last_token])
                 put!(chan, token_str)
 
                 token_counts[last_token] = get(token_counts, last_token, 0) + 1
 
-                if step % 4 == 0
+                # Optional GC during generation (disabled by default)
+                if gc_interval > 0 && step % gc_interval == 0
                     GC.gc(false)
                 end
             end
@@ -300,9 +331,11 @@ function generate(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::S
     top_k::Int=0,
     presence_penalty::Float16=Float16(0.0),
     repetition_penalty::Float16=Float16(1.0),
-    stop_token::Union{Int,Nothing}=nothing)
+    min_p::Float16=Float16(0.0),
+    stop_token::Union{Int,Nothing}=nothing,
+    gc_interval::Int=0)
 
-    stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, top_k, presence_penalty, repetition_penalty, stop_token)
+    stream = generate_stream(model, tok, prompt; max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, presence_penalty=presence_penalty, repetition_penalty=repetition_penalty, min_p=min_p, stop_token=stop_token, gc_interval=gc_interval)
     res = String[]
     for token_str in stream
         push!(res, token_str)
@@ -316,9 +349,11 @@ function stream_to_stdout(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, p
     top_p::Float16=Float16(0.95),
     top_k::Int=0,
     presence_penalty::Float16=Float16(0.0),
-    repetition_penalty::Float16=Float16(1.0))
+    repetition_penalty::Float16=Float16(1.0),
+    min_p::Float16=Float16(0.0),
+    gc_interval::Int=0)
 
-    stream = generate_stream(model, tok, prompt; max_tokens, temperature, top_p, top_k, presence_penalty, repetition_penalty)
+    stream = generate_stream(model, tok, prompt; max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, presence_penalty=presence_penalty, repetition_penalty=repetition_penalty, min_p=min_p, gc_interval=gc_interval)
     for token_str in stream
         print(token_str)
     end

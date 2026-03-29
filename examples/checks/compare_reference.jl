@@ -13,7 +13,7 @@ using LinearAlgebra, Printf, Statistics
 # ── Minimal .npy reader ─────────────────────────────────────────────────
 
 const REFERENCE_DIR = joinpath(@__DIR__, "reference_outputs")
-const TOKEN_ID = 151646
+const TOKEN_ID = 562
 const TOKEN_JULIA = TOKEN_ID + 1
 
 function read_npy(path::String)

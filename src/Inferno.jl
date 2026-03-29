@@ -8,6 +8,7 @@ end
 
 include("QuantsData.jl")
 include("Dequant.jl")
+include("QuantsCPU.jl")
 include("GGUF.jl")
 include("Model.jl")
 include("ModelCPU.jl")
@@ -17,9 +18,11 @@ include("LoaderCPU.jl")
 include("Engine.jl")
 include("Server.jl")
 include("Generate.jl")
+include("Chat.jl")
 
 using .QuantsData
 using .Dequant
+using .QuantsCPU
 using .GGUF
 using .Model
 using .ModelCPU
@@ -29,10 +32,12 @@ using .LoaderCPU
 using .Engine
 using .Server
 using .Generate
+using .Chat
 
 export load_model, load_model_cpu, start_server, non_nothing_fields, stream_to_stdout, stream_to_stdout_cpu
 export LoaderCPU, ModelCPU, generate_stream_cpu, generate_cpu, softmax_sample
 export generate_text, chat, SimpleTokenizer
+export chat!, start_chat, Message, build_prompt
 
 """
     non_nothing_fields(obj) -> NamedTuple
@@ -141,7 +146,14 @@ function find_related_file(model_path::String, pattern::String)
 end
 
 function load_model(path::String; device::Union{Int, Nothing}=nothing,
-    mmproj::Union{String, Nothing}=nothing)
+    mmproj::Union{String, Nothing}=nothing,
+    backend::Symbol=:auto)
+    
+    # Handle backend selection
+    if backend == :cpu
+        return load_model_cpu(path)
+    end
+
     model = nothing
     tok = nothing
 
@@ -181,8 +193,8 @@ function load_model(path::String; device::Union{Int, Nothing}=nothing,
             num_attention_heads=Int(get(file.metadata, "$(arch_str).attention.head_count", 8)),
             num_key_value_heads=Int(get(file.metadata, "$(arch_str).attention.head_count_kv", 2)),
             head_dim=Int(get(file.metadata, "$(arch_str).attention.key_length", 256)),
-            rms_norm_eps=Float16(get(file.metadata, "$(arch_str).attention.layer_norm_rms_epsilon", 1.0e-6)),
-            rope_theta=Float16(get(file.metadata, "$(arch_str).rope.freq_base", 10000000.0)),
+ rms_norm_eps=Float32(get(file.metadata, "$(arch_str).attention.layer_norm_rms_epsilon", 1.0e-6)),
+ rope_theta=Float32(get(file.metadata, "$(arch_str).rope.freq_base", 10000000.0)),
             max_position_embeddings=min(4096, Int(get(file.metadata, "$(arch_str).context_length", 32768))),
             full_attention_interval=Int(get(file.metadata, "$(arch_str).full_attention_interval", 4)),
             ssm_inner_size=Int(get(file.metadata, "$(arch_str).ssm.inner_size", 2048)),
@@ -248,8 +260,8 @@ end
 
 Load model and start the HTTP server.
 """
-function main(model_path::String; port::Int=8080, device::Union{Int, Nothing}=nothing, auth_token::Union{String, Nothing}=nothing)
-    model, tok = load_model(model_path; device=device)
+function main(model_path::String; port::Int=8080, device::Union{Int, Nothing}=nothing, auth_token::Union{String, Nothing}=nothing, backend::Symbol=:auto)
+    model, tok = load_model(model_path; device=device, backend=backend)
     Server.start_server(port; model=model, tokenizer=tok, auth_token=auth_token)
 end
 
@@ -282,65 +294,124 @@ parameters to Float16 for compatibility with the GPU inference engine.
 - `top_p`: Nucleus sampling probability (default: 0.8) - accepts Float16/Float32/Float64
 - `top_k`: Top-k sampling parameter (default: 20)
 - `presence_penalty`: Penalty for repeated tokens (default: 0.0) - accepts Float16/Float32/Float64
+- `repetition_penalty`: Multiplicative repetition penalty (default: 1.0) - accepts Float16/Float32/Float64
 - `io`: Output IO stream (default: stdout)
 
-# Presence Penalty
-The presence_penalty parameter helps reduce repetition by penalizing tokens that have 
-already appeared in the output. A value of 0.0 means no penalty, while higher values
-(e.g., 1.0-2.0) more strongly discourage repetition.
+# Presence & Repetition Penalties
+- `presence_penalty` is an additive penalty applied proportional to how many times a token has appeared.
+- `repetition_penalty` is a multiplicative penalty applied to logits of previously seen tokens (common default: 1.0; use 1.1-1.2 to discourage repetition).
 
 # Examples
 ```julia
 # Using Float64 (automatically converted)
-result = stream_to_stdout(model, tok, "Hello"; temperature=0.7)
+result = stream_to_stdout(model, tok, "Hello"; temperature=0.7, repetition_penalty=1.1)
 
 # Using Float32
-result = stream_to_stdout(model, tok, "Hello"; temperature=0.7f0)
+result = stream_to_stdout(model, tok, "Hello"; temperature=0.7f0, repetition_penalty=1.1f0)
 
 # Using Float16 directly
-result = stream_to_stdout(model, tok, "Hello"; temperature=Float16(0.7))
+result = stream_to_stdout(model, tok, "Hello"; temperature=Float16(0.7), repetition_penalty=Float16(1.1))
 ```
 """
-function stream_to_stdout(model::Model.QwenModel, tok::Tokenizer.BPETokenizer, prompt::AbstractString;
+function stream_to_stdout(model, tok, prompt::AbstractString;
+    backend::Symbol=:auto,
     max_tokens::Int=100,
     temperature=0.7,
     top_p=0.8,
     top_k::Int=20,
     presence_penalty=0.0,
+    repetition_penalty=1.0,
+    min_p=0.0,
+    stop_token::Union{Int,Nothing}=nothing,
     io::IO=stdout)
     
-    # Convert all float parameters to Float16
-    temp_f16 = to_float16(temperature)
-    top_p_f16 = to_float16(top_p)
-    penalty_f16 = to_float16(presence_penalty)
-    
-    stream = Engine.generate_stream(model, tok, prompt;
-        max_tokens=max_tokens, temperature=temp_f16, top_p=top_p_f16, 
-        top_k=top_k, presence_penalty=penalty_f16)
-    
-    generated_text = IOBuffer()
-    try
-        for token in stream
-            print(io, token)
-            flush(io)
-            print(generated_text, token)
+    # Auto-select backend when not specified, prefer model type
+    chosen_backend = backend
+    if backend == :auto
+        if model isa Model.QwenModel
+            chosen_backend = :gpu
+        elseif model isa ModelCPU.QwenModelCPU
+            chosen_backend = :cpu
+        else
+            # Fallback to tokenizer-based inference for older call sites
+            if tok isa Tokenizer.BPETokenizer
+                chosen_backend = :gpu
+            elseif tok isa SimpleTokenizer
+                chosen_backend = :cpu
+            else
+                error("stream_to_stdout: unable to infer backend from model type $(typeof(model)). Provide backend=:gpu or :cpu explicitly.")
+            end
         end
-        println(io)
-        flush(io)
-        return String(take!(generated_text))
-    catch e
-        if e isa InterruptException
-            # Signal the generator to stop if possible
-            try
-                close(stream)
-            catch
+    end
+
+    if chosen_backend == :gpu
+        if !(tok isa Tokenizer.BPETokenizer)
+            error("GPU backend requires a Tokenizer.BPETokenizer. Provided tokenizer is $(typeof(tok)). Use backend=:cpu with SimpleTokenizer or provide a BPETokenizer.")
+        end
+
+        # Convert all float parameters to Float16
+        temp_f16 = to_float16(temperature)
+        top_p_f16 = to_float16(top_p)
+        penalty_f16 = to_float16(presence_penalty)
+        rep_f16 = to_float16(repetition_penalty)
+        min_p_f16 = to_float16(min_p)
+
+        stream = Engine.generate_stream(model, tok, prompt;
+            max_tokens=max_tokens, temperature=temp_f16, top_p=top_p_f16,
+            top_k=top_k, presence_penalty=penalty_f16, repetition_penalty=rep_f16, min_p=min_p_f16, stop_token=stop_token)
+
+        generated_text = IOBuffer()
+        try
+            for token in stream
+                print(io, token)
+                flush(io)
+                print(generated_text, token)
             end
             println(io)
             flush(io)
             return String(take!(generated_text))
-        else
-            rethrow(e)
+        catch e
+            if e isa InterruptException
+                # Signal the generator to stop if possible
+                try
+                    close(stream)
+                catch
+                end
+                println(io)
+                flush(io)
+                return String(take!(generated_text))
+            else
+                rethrow(e)
+            end
         end
+    elseif chosen_backend == :cpu
+        # CPU backend: accept SimpleTokenizer or BPETokenizer (converted if necessary)
+        # If a BPETokenizer is provided for CPU model, attempt a safe conversion to SimpleTokenizer
+        tok_for_cpu = tok
+        if tok isa Tokenizer.BPETokenizer
+            # Convert id_to_token (1-indexed) to SimpleTokenizer which uses 0-indexed ids
+            id_to_token = tok.id_to_token
+            # Build SimpleTokenizer-like struct expected by CPU routines
+            token_to_id = Dict{String,Int}()
+            for (i, tstr) in enumerate(id_to_token)
+                token_to_id[tstr] = i - 1
+            end
+            # Create a lightweight SimpleTokenizer-like object with required fields
+            tok_for_cpu = SimpleTokenizer(id_to_token, token_to_id, tok.bos_id - 1, tok.eos_id - 1, -1)
+        end
+
+        # Convert float params to Float32 for CPU backend
+        temp_f32 = Float32(temperature)
+        top_p_f32 = Float32(top_p)
+        penalty_f32 = Float32(presence_penalty)
+        rep_f32 = Float32(repetition_penalty)
+        min_p_f32 = Float32(min_p)
+        stop_tokens = stop_token === nothing ? Set{Int}() : Set([stop_token])
+        return ModelCPU.stream_to_stdout_cpu(model, tok_for_cpu, prompt;
+            max_tokens=max_tokens, temperature=temp_f32, top_p=top_p_f32, top_k=top_k,
+            presence_penalty=penalty_f32, repetition_penalty=rep_f32, min_p=min_p_f32, stop_tokens=stop_tokens, io=io)
+    else
+        error("Unsupported backend: $(backend). Use :cpu or :gpu.")
     end
 end
 

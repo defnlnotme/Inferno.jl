@@ -21,30 +21,31 @@ const AbstractArrayH = AbstractArray
 
 # --- Configuration ---
 Base.@kwdef struct QwenConfig
-    architecture::Symbol = :qwen
-    vocab_size::Int = 151936
-    hidden_size::Int = 1024
-    intermediate_size::Int = 3584
-    num_hidden_layers::Int = 24
-    num_attention_heads::Int = 8    # q heads for full-attention layers
-    num_key_value_heads::Int = 2    # kv heads for full-attention layers
-    head_dim::Int = 256             # from attn_key_length
-    rms_norm_eps::Float16 = Float16(1e-6)
-    rope_theta::Float16 = Float16(10000000.0)
-    max_position_embeddings::Int = 4096
-    full_attention_interval::Int = 4
-    ssm_inner_size::Int = 2048
-    ssm_state_size::Int = 128       # head_k_dim
-    ssm_group_count::Int = 16       # num_k_heads = num_v_heads
-    ssm_time_step_rank::Int = 16    # num_v_heads
+ architecture::Symbol = :qwen
+ vocab_size::Int = 151936
+ hidden_size::Int = 1024
+ intermediate_size::Int = 3584
+ num_hidden_layers::Int = 24
+ num_attention_heads::Int = 8 # q heads for full-attention layers
+ num_key_value_heads::Int = 2 # kv heads for full-attention layers
+ head_dim::Int = 256 # from attn_key_length
+ rms_norm_eps::Float16 = Float16(1e-6)
+ rope_theta::Float32 = 10000000.0f0 # Use Float32 to avoid overflow
+ max_position_embeddings::Int = 4096
+ full_attention_interval::Int = 4
+ ssm_inner_size::Int = 2048
+ ssm_state_size::Int = 128 # head_k_dim
+ ssm_group_count::Int = 16 # num_k_heads = num_v_heads
+ ssm_time_step_rank::Int = 16 # num_v_heads
     ssm_conv_kernel::Int = 4
     # MoE
     num_experts::Int = 0
     num_experts_per_tok::Int = 0
-    # MLA
+    # MLA (Multi-Head Latent Attention for DeepSeek)
     q_lora_rank::Int = 0
     kv_lora_rank::Int = 0
     qk_rope_head_dim::Int = 0
+    qk_nope_head_dim::Int = 0  # Non-RoPE head dimension for Q/K
     v_head_dim::Int = 0
 end
 
@@ -140,35 +141,49 @@ end
 # Writes probabilities back into `probs[1:len, 1]`
 # Uses Float32 for exp() to prevent overflow
 function softmax_kernel!(probs, scores, len, scale)
+ # Copy to CPU for computation (avoids scalar indexing on GPU)
+ probs_cpu = Array(probs)
+ scores_cpu = Array(scores)
+
  # Compute max in Float32 for stability
- mx = Float32(maximum(@view scores[1:len, 1]) * scale)
+ mx = Float32(maximum(scores_cpu[1:len, 1]) * scale)
  s = Float32(0.0)
  @inbounds for i in 1:len
- v = exp(Float32(scores[i, 1] * scale) - mx)
- probs[i, 1] = v
+ v = exp(Float32(scores_cpu[i, 1] * scale) - mx)
+ probs_cpu[i, 1] = v
  s += v
  end
  inv_s = Float32(1.0) / s
  @inbounds for i in 1:len
- probs[i, 1] *= inv_s
+ probs_cpu[i, 1] *= inv_s
  end
+
+ # Copy back to GPU
+ copyto!(probs, Float16.(probs_cpu))
  return nothing
 end
 
 function batched_softmax_kernel!(probs, scores, total_len, n_heads, scale)
+ # Copy to CPU for computation (avoids scalar indexing on GPU)
+ probs_cpu = Array(probs)
+ scores_cpu = Array(scores)
+
  for h in 1:n_heads
- mx = Float32(maximum(@view scores[1:total_len, h]) * scale)
+ mx = Float32(maximum(scores_cpu[1:total_len, h]) * scale)
  s = Float32(0.0)
  @inbounds for i in 1:total_len
- v = exp(Float32(scores[i, h] * scale) - mx)
- probs[i, h] = v
+ v = exp(Float32(scores_cpu[i, h] * scale) - mx)
+ probs_cpu[i, h] = v
  s += v
  end
  inv_s = Float32(1.0) / s
  @inbounds for i in 1:total_len
- probs[i, h] *= inv_s
+ probs_cpu[i, h] *= inv_s
  end
  end
+
+ # Copy back to GPU
+ copyto!(probs, Float16.(probs_cpu))
  return nothing
 end
 
@@ -241,27 +256,29 @@ struct RotaryEmbedding
  dim::Int
  base::Float32  # Use Float32 for base to prevent precision loss
  inv_freq::Vector{Float32}  # Use Float32 for more precision
+ rotary_dim::Int  # Number of dimensions that get rotary (partial rotary support)
 end
 
-function RotaryEmbedding(dim::Int; base=Float32(10000000.0))
- # Compute inv_freq in Float32 for numerical stability
- inv_freq = Float32(1.0) ./ (Float32(base) .^ (Float32.(range(0, stop=dim - 1, step=2)) ./ Float32(dim)))
- return RotaryEmbedding(dim, Float32(base), inv_freq)
+function RotaryEmbedding(dim::Int; base=Float32(10000000.0), rotary_dim::Int=dim)
+ # Only compute inv_freq for the rotary dimensions
+ inv_freq = Float32(1.0) ./ (Float32(base) .^ (Float32.(range(0, stop=rotary_dim - 1, step=2)) ./ Float32(rotary_dim)))
+ return RotaryEmbedding(dim, Float32(base), inv_freq, rotary_dim)
 end
 
 function rope_kernel!(x, inv_freq, pos, d, h, seq, d_rope)
  T = eltype(x)
  half_d = d_rope ÷ 2
- 
+
  # Copy to CPU, compute, copy back (avoids scalar indexing on GPU)
  x_cpu = Array(x)
  inv_freq_cpu = Array(inv_freq)
- 
+
  for t in 1:seq
  for head in 1:h
  for i in 1:half_d
- idx1 = 2 * i - 1
- idx2 = 2 * i
+ # Half-split pairing: first half paired with second half
+ idx1 = i
+ idx2 = i + half_d
 
  # Use Float32 for position computation to prevent precision loss
  p = Float32(pos + t - 1)
@@ -276,23 +293,23 @@ function rope_kernel!(x, inv_freq, pos, d, h, seq, d_rope)
  end
  end
  end
- 
+
  copyto!(x, x_cpu)
  return x
 end
 
 function (rope::RotaryEmbedding)(x::AbstractArray{T,3}, pos::Int) where T
     d, h, seq = size(x)
-    d_rope = min(d, rope.dim)
+    d_rope = min(d, rope.rotary_dim)
     rope_kernel!(x, rope.inv_freq, pos, d, h, seq, d_rope)
     return x
 end
 
 # --- KV Cache ---
 mutable struct KVCache{T<:AbstractArray,V<:AbstractVector,M<:AbstractMatrix}
- k::T # (head_dim, n_kv, max_seq)
- v::T
- pos::Int
+    k::T # (head_dim, n_kv, max_seq)
+    v::T
+    pos::Int
 
  # --- Scratchpad Buffers (To avoid any memory allocations) ---
  # Attention buffers
@@ -391,6 +408,7 @@ function update_kv_cache!(cache::KVCache, k::AbstractArray{Float16,2}, v::Abstra
  # pos is 0-indexed, convert to 1-indexed for Julia arrays
  @views cache.k[:, :, pos + 1] .= k
  @views cache.v[:, :, pos + 1] .= v
+ cache.pos = pos + 1
  return cache.k, cache.v
 end
 
@@ -402,51 +420,8 @@ function update_kv_cache!(cache::KVCache, k::AbstractArray{Float16,3}, v::Abstra
  @views cache.k[:, :, pos + t] .= k[:, :, t]
  @views cache.v[:, :, pos + t] .= v[:, :, t]
  end
+ cache.pos = pos + seq
  return cache.k, cache.v
-end
-
-# RoPE application function
-const ROPE_CACHE_SIZE = 4096
-const rope_sin_cache = zeros(Float32, ROPE_CACHE_SIZE ÷ 2)  # Use Float32 for precision
-const rope_cos_cache = zeros(Float32, ROPE_CACHE_SIZE ÷ 2)
-
-function init_rope_caches!(config::QwenConfig)
- rope_dim = config.head_dim
- rope_pairs = rope_dim ÷ 2
- base = Float32(config.rope_theta)  # Use Float32
-
- for p in 1:rope_pairs
- freq = Float32(1.0) / (base^(Float32(2 * (p - 1)) / Float32(rope_dim)))
- for pos in 1:ROPE_CACHE_SIZE
- rope_sin_cache[(p-1)*ROPE_CACHE_SIZE+pos] = sin(Float32(pos) * freq)
- rope_cos_cache[(p-1)*ROPE_CACHE_SIZE+pos] = cos(Float32(pos) * freq)
- end
- end
-end
-
-function apply_rope!(q::AbstractArray{Float16,2}, k::AbstractArray{Float16,2}, pos::Int, cache::KVCache)
-    rope_dim = size(q, 1)
-    rope_pairs = rope_dim ÷ 2
-
-    # Reshape cache views
-    sin_vals = reshape(view(rope_sin_cache, (pos-1)*rope_pairs+1:pos*rope_pairs), rope_pairs, 1)
-    cos_vals = reshape(view(rope_cos_cache, (pos-1)*rope_pairs+1:pos*rope_pairs), rope_pairs, 1)
-
-    # Apply RoPE to Q
-    q_odd = view(q, 1:2:rope_dim, :)
-    q_even = view(q, 2:2:rope_dim, :)
-    rope_q_tmp = reshape(cache.rope_q_tmp, rope_pairs, size(q, 2))
-    copyto!(rope_q_tmp, q_odd)
-    @. q_odd = rope_q_tmp * cos_vals - q_even * sin_vals
-    @. q_even = rope_q_tmp * sin_vals + q_even * cos_vals
-
-    # Apply RoPE to K
-    k_odd = view(k, 1:2:rope_dim, :)
-    k_even = view(k, 2:2:rope_dim, :)
-    rope_k_tmp = reshape(cache.rope_k_tmp, rope_pairs, size(k, 2))
-    copyto!(rope_k_tmp, k_odd)
-    @. k_odd = rope_k_tmp * cos_vals - k_even * sin_vals
-    @. k_even = rope_k_tmp * sin_vals + k_even * cos_vals
 end
 
 # --- MLP ---
@@ -823,35 +798,275 @@ struct MLAttention
     kv_lora_rank::Int
     qk_rope_head_dim::Int
     v_head_dim::Int
+    qk_nope_head_dim::Int  # Non-RoPE dimension per head for Q/K
     softmax_scale::Float16
+
+    # Pre-allocated GPU buffers for decode (single token)
+    decode_q_latent::oneMatrix{Float16}      # (q_lora_rank, 1)
+    decode_q_latent_norm::oneMatrix{Float16} # (q_lora_rank, 1)
+    decode_q_all::oneMatrix{Float16}         # (n_heads * (qk_nope + qk_rope), 1)
+    decode_kv_a::oneMatrix{Float16}          # (kv_lora_rank + qk_rope_head_dim, 1)
+    decode_kv_latent::oneMatrix{Float16}     # (kv_lora_rank, 1)
+    decode_kv_latent_norm::oneMatrix{Float16}# (kv_lora_rank, 1)
+    decode_kv_b::oneMatrix{Float16}          # (n_heads * (qk_nope + v_head_dim), 1)
+    decode_scores::oneMatrix{Float16}        # (max_seq, n_heads)
+    decode_pb::oneMatrix{Float16}            # (max_seq, n_heads)
+    decode_out::oneMatrix{Float16}           # (n_heads * v_head_dim, 1)
+    decode_wo_buf::oneMatrix{Float16}        # (hidden_size, 1)
+
+    # CPU scratchpads for numerical stability
+    q_pe_cpu::Vector{Float32}
+    k_pe_cpu::Vector{Float32}
+    scores_cpu::Vector{Float32}
+    pb_cpu::Vector{Float32}
+end
+
+function MLAttention(q_a_proj, q_a_norm, q_b_proj, kv_a_proj_with_mqa, kv_a_norm, kv_b_proj, wo,
+    n_heads::Int, head_dim::Int, q_lora_rank::Int, kv_lora_rank::Int,
+    qk_rope_head_dim::Int, v_head_dim::Int, qk_nope_head_dim::Int,
+    softmax_scale::Float16, config::QwenConfig)
+
+    max_seq = config.max_position_embeddings
+
+    # Pre-allocated GPU buffers for decode path
+    decode_q_latent = oneArray(zeros(Float16, q_lora_rank, 1))
+    decode_q_latent_norm = oneArray(zeros(Float16, q_lora_rank, 1))
+    decode_q_all = oneArray(zeros(Float16, n_heads * (qk_nope_head_dim + qk_rope_head_dim), 1))
+    decode_kv_a = oneArray(zeros(Float16, kv_lora_rank + qk_rope_head_dim, 1))
+    decode_kv_latent = oneArray(zeros(Float16, kv_lora_rank, 1))
+    decode_kv_latent_norm = oneArray(zeros(Float16, kv_lora_rank, 1))
+    decode_kv_b = oneArray(zeros(Float16, n_heads * (qk_nope_head_dim + v_head_dim), 1))
+    decode_scores = oneArray(zeros(Float16, max_seq, n_heads))
+    decode_pb = oneArray(zeros(Float16, max_seq, n_heads))
+    decode_out = oneArray(zeros(Float16, n_heads * v_head_dim, 1))
+    wo_out_size = size(wo, 1)
+    decode_wo_buf = oneArray(zeros(Float16, wo_out_size, 1))
+
+    # CPU scratchpads
+    q_pe_cpu = zeros(Float32, n_heads * qk_rope_head_dim)
+    k_pe_cpu = zeros(Float32, n_heads * qk_rope_head_dim)
+    scores_cpu = zeros(Float32, max_seq)
+    pb_cpu = zeros(Float32, max_seq)
+
+    return MLAttention(q_a_proj, q_a_norm, q_b_proj, kv_a_proj_with_mqa, kv_a_norm, kv_b_proj, wo,
+        n_heads, head_dim, q_lora_rank, kv_lora_rank, qk_rope_head_dim, v_head_dim, qk_nope_head_dim,
+        softmax_scale, decode_q_latent, decode_q_latent_norm, decode_q_all, decode_kv_a,
+        decode_kv_latent, decode_kv_latent_norm, decode_kv_b, decode_scores, decode_pb,
+        decode_out, decode_wo_buf, q_pe_cpu, k_pe_cpu, scores_cpu, pb_cpu)
 end
 
 function (m::MLAttention)(x::oneMatrix{Float16}, pos::Int, rope::RotaryEmbedding, cache::KVCache)
     # x: (hidden_size, seq)
-    hd, seq = m.head_dim, size(x, 2)
+    seq = size(x, 2)
+    T = Float16
 
-    # 1. Q projection
-    q_latent = mat_mul(m.q_a_proj, x)
-    q_latent_norm = m.q_a_norm(q_latent)
-    q_all = mat_mul(m.q_b_proj, q_latent_norm) # (n_heads * (qk_rope_head_dim + v_head_dim), seq)
+    # Compute dimensions
+    qk_pe_size = m.n_heads * m.qk_rope_head_dim  # Total RoPE dimensions
+    qk_nope_size = m.n_heads * m.qk_nope_head_dim  # Total non-RoPE dimensions
+    v_size = m.n_heads * m.v_head_dim
 
-    # Split q_all into q_nopace and q_pe
-    q_pe_size = m.n_heads * m.qk_rope_head_dim
-    q_pe = view(q_all, 1:q_pe_size, :)
-    q_nope = view(q_all, q_pe_size+1:size(q_all, 1), :)
+    if seq == 1
+        # === Decode path (single token) ===
 
-    # 2. KV projection
-    kv_a = mat_mul(m.kv_a_proj_with_mqa, x) # (kv_lora_rank + qk_rope_head_dim, seq)
-    kv_latent = view(kv_a, 1:m.kv_lora_rank, :)
-    k_pe = view(kv_a, m.kv_lora_rank+1:size(kv_a, 1), :)
+        # 1. Q projection: x -> q_latent -> q_latent_norm -> q_all
+        mat_mul!(m.decode_q_latent, m.q_a_proj, x)
+        q_latent_norm = m.q_a_norm(reshape(m.decode_q_latent, :))
+        copyto!(m.decode_q_latent_norm, reshape(q_latent_norm, :, 1))
+        mat_mul!(m.decode_q_all, m.q_b_proj, m.decode_q_latent_norm)
 
-    kv_latent_norm = m.kv_a_norm(kv_latent)
-    kv_b = mat_mul(m.kv_b_proj, kv_latent_norm) # (n_heads * v_head_dim, seq)
+        # Split q_all into q_nope and q_pe
+        q_pe = view(m.decode_q_all, 1:qk_pe_size, :)
+        q_nope = view(m.decode_q_all, qk_pe_size+1:qk_pe_size+qk_nope_size, :)
 
-    # We still need a proper MLA implementation.
-    # For now, just a slightly better skeleton that uses some inputs.
-    # Return zero for now as the full implementation is out of scope for a quick fix.
-    return oneArray(zeros(Float16, size(x, 1), seq))
+        # 2. KV projection
+        mat_mul!(m.decode_kv_a, m.kv_a_proj_with_mqa, x)
+        copyto!(m.decode_kv_latent, view(m.decode_kv_a, 1:m.kv_lora_rank, :))
+        k_pe = view(m.decode_kv_a, m.kv_lora_rank+1:m.kv_lora_rank+m.qk_rope_head_dim, :)
+
+        # Normalize kv_latent and project to k_nope and v
+        kv_latent_norm = m.kv_a_norm(reshape(m.decode_kv_latent, :))
+        copyto!(m.decode_kv_latent_norm, reshape(kv_latent_norm, :, 1))
+        mat_mul!(m.decode_kv_b, m.kv_b_proj, m.decode_kv_latent_norm)
+
+        # Split kv_b into k_nope and v
+        k_nope = view(m.decode_kv_b, 1:qk_nope_size, :)
+        v = view(m.decode_kv_b, qk_nope_size+1:qk_nope_size+v_size, :)
+
+        # 3. Apply RoPE to q_pe and k_pe
+        q_pe_3d = reshape(q_pe, m.qk_rope_head_dim, m.n_heads, 1)
+        k_pe_3d = reshape(k_pe, m.qk_rope_head_dim, m.n_heads, 1)
+        rope(q_pe_3d, pos)
+        rope(k_pe_3d, pos)
+
+        # 4. Update KV cache
+        # For MLA, we store full K (k_nope + k_pe) and V in the cache
+        # K cache shape: (qk_nope_head_dim + qk_rope_head_dim, n_heads, max_seq)
+        # But standard cache has: (head_dim, n_kv, max_seq)
+        # We'll use a simplified approach: store k_nope and k_pe separately
+        
+        # Store k_nope in cache.k (reshaped to fit)
+        # Store k_pe in cache.v's extra space (we'll use a workaround)
+        # For now, store combined K in cache.k and V in cache.v
+        k_combined = vcat(reshape(k_nope, :, 1), reshape(k_pe_3d, :, 1))
+        v_combined = reshape(v, :, 1)
+        
+        # Update cache - note: this assumes cache can hold n_heads channels
+        @views cache.k[:, 1, pos + 1] .= k_combined
+        @views cache.v[:, 1, pos + 1] .= v_combined
+        cache.pos = pos + 1
+
+        # 5. Compute attention scores
+        total_len = cache.pos
+        k_head_dim = m.qk_nope_head_dim + m.qk_rope_head_dim
+        
+        # Compute attention for each head
+        fill!(m.decode_scores, T(0.0))
+        fill!(m.decode_pb, T(0.0))
+
+        for h in 1:m.n_heads
+            # Get cached K and V for this head
+            # K is stored as (k_nope + k_pe) for all positions
+            k_cached = view(cache.k, (h-1)*k_head_dim+1:h*k_head_dim, 1, 1:total_len)
+            v_cached = view(cache.v, (h-1)*m.v_head_dim+1:h*m.v_head_dim, 1, 1:total_len)
+            
+            # Current Q for this head
+            q_h_nope = view(q_nope, (h-1)*m.qk_nope_head_dim+1:h*m.qk_nope_head_dim, :)
+            q_h_pe = view(q_pe_3d, :, h, :)
+            q_h_combined = vcat(vec(q_h_nope), vec(q_h_pe))
+
+            # Score computation with numerical stability in Float32
+            for p in 1:total_len
+                k_p = view(k_cached, :, p)
+                score = Float32(0.0)
+                for d in 1:k_head_dim
+                    score += Float32(q_h_combined[d]) * Float32(k_p[d])
+                end
+                m.scores_cpu[p] = score * Float32(m.softmax_scale)
+            end
+
+            # Stable softmax in Float32
+            mx = maximum(m.scores_cpu[1:total_len])
+            s = Float32(0.0)
+            for p in 1:total_len
+                m.pb_cpu[p] = exp(m.scores_cpu[p] - mx)
+                s += m.pb_cpu[p]
+            end
+            inv_s = Float32(1.0) / s
+            for p in 1:total_len
+                m.pb_cpu[p] *= inv_s
+            end
+            copyto!(view(m.decode_pb, 1:total_len, h), m.pb_cpu[1:total_len])
+
+            # Weighted sum of V
+            out_h = view(m.decode_out, (h-1)*m.v_head_dim+1:h*m.v_head_dim, :)
+            mul!(out_h, v_cached, view(m.decode_pb, 1:total_len, h:h))
+        end
+
+        # 6. Output projection
+        result = mat_mul(m.wo, m.decode_out)
+        return result
+
+    else
+        # === Prefill path (multiple tokens) ===
+        # Similar to decode but processes all tokens in parallel
+
+        # 1. Q projection
+        q_latent = mat_mul(m.q_a_proj, x)
+        q_latent_norm_2d = m.q_a_norm(q_latent)
+        q_all = mat_mul(m.q_b_proj, q_latent_norm_2d)
+
+        # Split q_all into q_nope and q_pe
+        q_pe = view(q_all, 1:qk_pe_size, :)
+        q_nope = view(q_all, qk_pe_size+1:qk_pe_size+qk_nope_size, :)
+
+        # 2. KV projection
+        kv_a = mat_mul(m.kv_a_proj_with_mqa, x)
+        kv_latent = view(kv_a, 1:m.kv_lora_rank, :)
+        k_pe = view(kv_a, m.kv_lora_rank+1:m.kv_lora_rank+m.qk_rope_head_dim, :)
+
+        # Normalize kv_latent and project to k_nope and v
+        kv_latent_norm_2d = m.kv_a_norm(kv_latent)
+        kv_b = mat_mul(m.kv_b_proj, kv_latent_norm_2d)
+
+        # Split kv_b into k_nope and v
+        k_nope = view(kv_b, 1:qk_nope_size, :)
+        v = view(kv_b, qk_nope_size+1:qk_nope_size+v_size, :)
+
+        # 3. Apply RoPE to q_pe and k_pe
+        q_pe_3d = reshape(q_pe, m.qk_rope_head_dim, m.n_heads, seq)
+        k_pe_3d = reshape(k_pe, m.qk_rope_head_dim, m.n_heads, seq)
+        rope(q_pe_3d, pos + 1)  # pos is 0-indexed, RoPE expects 1-indexed start
+        rope(k_pe_3d, pos + 1)
+
+        # 4. Update KV cache
+        k_head_dim = m.qk_nope_head_dim + m.qk_rope_head_dim
+        for s in 1:seq
+            for h in 1:m.n_heads
+                k_nope_h = view(k_nope, (h-1)*m.qk_nope_head_dim+1:h*m.qk_nope_head_dim, s)
+                k_pe_h = view(k_pe_3d, :, h, s)
+                k_combined = vcat(vec(k_nope_h), vec(k_pe_h))
+                v_h = view(v, (h-1)*m.v_head_dim+1:h*m.v_head_dim, s)
+                
+                cache_pos = pos + s
+                @views cache.k[:, 1, cache_pos] .= k_combined
+                @views cache.v[:, 1, cache_pos] .= v_h
+            end
+        end
+        cache.pos = pos + seq
+
+        # 5. Compute attention scores
+        q_nope_3d = reshape(q_nope, m.qk_nope_head_dim, m.n_heads, seq)
+
+        # Allocate output buffer
+        out_all = zeros(Float32, m.v_head_dim, m.n_heads, seq)
+
+        for h in 1:m.n_heads
+            for s in 1:seq
+                q_h_nope = view(q_nope_3d, :, h, s)
+                q_h_pe = view(q_pe_3d, :, h, s)
+                q_h_combined = vcat(vec(q_h_nope), vec(q_h_pe))
+
+                scores = zeros(Float32, pos + s)
+                for p in 1:(pos + s)
+                    k_p = view(cache.k, (h-1)*k_head_dim+1:h*k_head_dim, 1, p)
+                    score = Float32(0.0)
+                    for d in 1:k_head_dim
+                        score += Float32(q_h_combined[d]) * Float32(k_p[d])
+                    end
+                    scores[p] = score * Float32(m.softmax_scale)
+                end
+
+                # Stable softmax
+                mx = maximum(scores)
+                sum_exp = Float32(0.0)
+                for p in 1:(pos + s)
+                    scores[p] = exp(scores[p] - mx)
+                    sum_exp += scores[p]
+                end
+                scores ./= sum_exp
+
+                # Weighted sum of V
+                for d in 1:m.v_head_dim
+                    val = Float32(0.0)
+                    for p in 1:(pos + s)
+                        v_p = cache.v[(h-1)*m.v_head_dim+d, 1, p]
+                        val += Float32(v_p) * scores[p]
+                    end
+                    out_all[d, h, s] = val
+                end
+            end
+        end
+
+        # 6. Output projection
+        out_tensor = oneArray(Float16.(reshape(out_all, m.v_head_dim * m.n_heads, seq)))
+        result = mat_mul(m.wo, out_tensor)
+        return result
+    end
+end
+
+function reset_states!(m::MLAttention)
+    # MLAttention has no persistent state to reset (KV cache is external)
+    return nothing
 end
 
 # --- Gated Delta Net (SSM Layer) ---
@@ -1247,10 +1462,10 @@ function free_model_gpu!(model::QwenModel)
     return nothing
 end
 
-function forward!(model::QwenModel, tokens::Vector{Int}, pos::Int, caches::Vector{<:KVCache})
+function forward!(model::QwenModel, tokens::Vector{Int}, pos::Int, caches::Vector{<:KVCache}; gc_interval::Int=0)
  try
  seq_len = length(tokens)
- 
+
  # For prefill (seq_len > 1), process tokens one at a time
  # This is needed because SSM layers have stateful buffers sized for single tokens
  if seq_len == 1
@@ -1261,7 +1476,8 @@ function forward!(model::QwenModel, tokens::Vector{Int}, pos::Int, caches::Vecto
 
  for (i, layer) in enumerate(model.layers)
  x = layer(x, pos, model.rope, caches[i])
- if i % 6 == 0
+ # Optional GC during inference (disabled by default to avoid stuttering)
+ if gc_interval > 0 && i % gc_interval == 0
  GC.gc(false)
  end
  end
@@ -1270,14 +1486,14 @@ function forward!(model::QwenModel, tokens::Vector{Int}, pos::Int, caches::Vecto
  oneAPI.synchronize() # Ensure GPU computation is complete
  x_final = collect(x_normed)
  logits = (model.lm_head') * x_final
- 
+
  # Sanitize logits - replace NaN/Inf with 0
  @inbounds for i in eachindex(logits)
  if !isfinite(logits[i])
  logits[i] = 0.0
  end
  end
- 
+
  return Float16.(logits)
  else
  # Prefill path - process tokens one at a time

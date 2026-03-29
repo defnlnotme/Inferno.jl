@@ -296,7 +296,8 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig;
 
             Model.MLAttention(q_a_proj, q_a_norm, q_b_proj, kv_a_proj_with_mqa, kv_a_norm, kv_b_proj, wo,
                 config.num_attention_heads, config.head_dim, config.q_lora_rank, config.kv_lora_rank,
-                config.qk_rope_head_dim, config.v_head_dim, T_model(1.0) / sqrt(T_model(config.head_dim)))
+                config.qk_rope_head_dim, config.v_head_dim, config.qk_nope_head_dim,
+                T_model(1.0) / sqrt(T_model(config.head_dim)), config)
         else
             wqkv = arch == :phi3 && block.attn_qkv_weight !== nothing ? get_weight(file, block.attn_qkv_weight) : nothing
             qw = arch != :phi3 && block.attn_q_weight !== nothing ? get_weight(file, block.attn_q_weight) : nothing
@@ -340,7 +341,9 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig;
     lm_head = lm_head_raw # Use native type
 
     rope_dim = Int(get(file.metadata, "$(arch).rope.dimension_count", config.head_dim))
-    rope = Model.RotaryEmbedding(rope_dim; base=config.rope_theta)
+    partial_rotary_factor = Float32(get(file.metadata, "$(arch).partial_rotary_factor", 1.0))
+    rotary_dim = round(Int, rope_dim * partial_rotary_factor)
+    rope = Model.RotaryEmbedding(rope_dim; base=config.rope_theta, rotary_dim=rotary_dim)
 
     mmproj_data = nothing
     if mmproj !== nothing
