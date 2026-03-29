@@ -374,8 +374,8 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
         vg = view(v_all, :, h)
         
         # Q/K L2 normalization
-        q_norm = sqrt(sum(abs2, qg) + Float32(1e-6))
-        k_norm = sqrt(sum(abs2, kg) + Float32(1e-6))
+  q_norm = sqrt(sum(abs2, qg) + m.ssm_norm.eps)
+  k_norm = sqrt(sum(abs2, kg) + m.ssm_norm.eps)
         
         q_normalized = qg ./ q_norm .* scale
         k_normalized = kg ./ k_norm
