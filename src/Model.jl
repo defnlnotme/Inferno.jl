@@ -661,11 +661,11 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
         q_rope = rope(q_2d, pos)
         k_rope = rope(k_2d, pos)
 
- # 4. Gating Q (numerically stable SiLU using Float32 intermediate)
+ # 4. Gating Q with sigmoid (Qwen3.5 uses sigmoid, not SiLU)
  gate_raw_cpu = Array(gate_raw)
- @. gate_raw_cpu = gate_raw_cpu * (Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_raw_cpu))))
- gate_silu = oneArray(Float16.(gate_raw_cpu))
- q_gated = q_rope .* gate_silu
+ @. gate_raw_cpu = Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_raw_cpu))) # sigmoid
+ gate_sigmoid = oneArray(Float16.(gate_raw_cpu))
+ q_gated = q_rope .* gate_sigmoid
 
     elseif m.architecture == :phi3
         # Packed QKV

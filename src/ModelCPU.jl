@@ -470,11 +470,11 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
     apply_rotary_emb!(query_states, pos, rope)
     apply_rotary_emb!(k, pos, rope)
 
-    # Apply SiLU gating to Q before attention (matches GPU implementation)
-    gate_silu = similar(gate)
-    @. gate_silu = gate * (1.0f0 / (1.0f0 + exp(-gate)))  # SiLU
-    gate_reshaped = reshape(gate_silu, attn.head_dim, attn.n_heads)
-    query_states .*= gate_reshaped
+ # Apply sigmoid gating to Q before attention (Qwen3.5 uses sigmoid, not SiLU)
+ gate_sigmoid = similar(gate)
+ @. gate_sigmoid = 1.0f0 / (1.0f0 + exp(-gate)) # sigmoid
+ gate_reshaped = reshape(gate_sigmoid, attn.head_dim, attn.n_heads)
+ query_states .*= gate_reshaped
 
     # Update KV cache
     update_kv_cache!(cache, k, v, pos)
