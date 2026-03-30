@@ -144,16 +144,16 @@ function load_model_cpu(path::String; keep_quantized::Bool=false)
         partial_rotary_factor = config.partial_rotary_factor
     )
     
-    # Load layers
-    layers = ModelCPU.DecoderLayerCPU[]
-    
-    for i in 0:(config.num_hidden_layers - 1)
-        layer = load_layer(file, i, config; keep_quantized=keep_quantized)
-        push!(layers, layer)
-        println(" Layer $i: $(layer.is_ssm ? "SSM" : "Attention")")
-    end
-    
-    # Load final norm
+ # Load layers
+ layers = ModelCPU.DecoderLayerCPU[]
+ 
+ for i in 0:(config.num_hidden_layers - 1)
+ layer = load_layer(file, i, config; keep_quantized=keep_quantized)
+ push!(layers, layer)
+ println(" Layer $i: $(layer.is_ssm ? "SSM" : "Attention")")
+ end
+ 
+ # Load final norm
     final_norm_w = Float32.(extract_tensor_cpu(file, "output_norm.weight"))
     final_norm = ModelCPU.RMSNormCPU(final_norm_w, config.rms_norm_eps)
     
@@ -165,14 +165,14 @@ function load_model_cpu(path::String; keep_quantized::Bool=false)
     end
     
     # Create RoPE with partial rotary
-    rotary_dim = round(Int, config.head_dim * config.partial_rotary_factor)
-    rope = ModelCPU.RotaryEmbeddingCPU(config.head_dim, config.rope_theta, config.max_position_embeddings; rotary_dim=rotary_dim)
-    
-    # Load tokenizer
-    tok = Tokenizer.load_tokenizer(file.metadata)
-    
-    return ModelCPU.QwenModelCPU(config, embed, lm_head, layers, final_norm, rope), tok
-end
+ rotary_dim = round(Int, config.head_dim * config.partial_rotary_factor)
+ rope = ModelCPU.RotaryEmbeddingCPU(config.head_dim, config.rope_theta, config.max_position_embeddings; rotary_dim=rotary_dim)
+ 
+ # Load tokenizer
+ tok = Tokenizer.load_tokenizer(file.metadata)
+ 
+ return ModelCPU.QwenModelCPU(config, embed, lm_head, layers, final_norm, rope), tok
+ end
 
 function get_config(file::GGUF.GGUFFile)
     arch = get(file.metadata, "general.architecture", "qwen")
@@ -220,11 +220,11 @@ function load_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenCo
         op = load_attention_layer(file, layer_idx, config)
     end
     
-    # Load MLP
-    mlp = load_mlp(file, layer_idx, config; keep_quantized=keep_quantized)
-    
-    return ModelCPU.DecoderLayerCPU(in_norm, op, post_norm, mlp, is_ssm)
-end
+ # Load MLP
+ mlp = load_mlp(file, layer_idx, config; keep_quantized=keep_quantized)
+ 
+ return ModelCPU.DecoderLayerCPU(in_norm, op, post_norm, mlp, is_ssm)
+ end
 
 function load_ssm_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU)
     prefix = "blk.$(layer_idx)"
