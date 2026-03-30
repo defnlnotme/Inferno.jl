@@ -18,7 +18,6 @@ include("LoaderCPU.jl")
 include("Engine.jl")
 include("Server.jl")
 include("Generate.jl")
-include("Chat.jl")
 
 using .QuantsData
 using .Dequant
@@ -32,7 +31,6 @@ using .LoaderCPU
 using .Engine
 using .Server
 using .Generate
-using .Chat
 
 export load_model, load_model_cpu, start_server, non_nothing_fields, stream_to_stdout, stream_to_stdout_cpu
 export LoaderCPU, ModelCPU, generate_stream_cpu, generate_cpu, softmax_sample
@@ -397,6 +395,9 @@ function stream_to_stdout(model, tok, prompt::AbstractString;
         error("Unsupported backend: $(backend). Use :cpu or :gpu.")
     end
 end
+
+include("Chat.jl")
+using .Chat
 
 function __init__()
     # Register atexit hook to ensure GPU synchronization and cleanup
