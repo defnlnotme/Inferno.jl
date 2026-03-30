@@ -9,7 +9,7 @@ struct Message
     content::String
 end
 
-Message(role::Symbol, content::String) = Message(String(role), content)
+Message(role::Symbol, content) = Message(String(role), String(content))
 
 function build_prompt(messages::Vector{Message})
     parts = String[]
