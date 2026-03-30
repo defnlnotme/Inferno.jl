@@ -451,45 +451,36 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
     qkv = attn.wq * x  # This produces n_heads * head_dim * 2 output
     k = attn.wk * x
     v = attn.wv * x
-    
+
     # Split qkv into query and gate
     # qkv has shape (n_heads * head_dim * 2,) = (n_heads * head_dim,) + (n_heads * head_dim,)
     q_size = attn.n_heads * attn.head_dim
     query_states = qkv[1:q_size]
     gate = qkv[q_size+1:end]
-    
+
     # Reshape to (head_dim, num_heads)
     query_states = reshape(query_states, attn.head_dim, attn.n_heads)
     k = reshape(k, attn.head_dim, attn.n_kv)
     v = reshape(v, attn.head_dim, attn.n_kv)
-    
- # Apply Q/K normalization (per-head)
- # query_states has shape (head_dim, n_heads), normalize each column independently
- for h in 1:attn.n_heads
-     q_h = view(query_states, :, h)
-     rmsnorm_cpu!(q_h, q_h, attn.q_norm)
- end
- for h in 1:attn.n_kv
-     k_h = view(k, :, h)
-     rmsnorm_cpu!(k_h, k_h, attn.k_norm)
- end
-    
+
+    # Apply Q/K normalization (per-head)
+    for h in 1:attn.n_heads
+        q_h = view(query_states, :, h)
+        rmsnorm_cpu!(q_h, q_h, attn.q_norm)
+    end
+    for h in 1:attn.n_kv
+        k_h = view(k, :, h)
+        rmsnorm_cpu!(k_h, k_h, attn.k_norm)
+    end
+
     # Apply RoPE
     apply_rotary_emb!(query_states, pos, rope)
     apply_rotary_emb!(k, pos, rope)
-
- # Apply sigmoid gating to Q before attention (Qwen3.5 uses sigmoid, not SiLU)
- gate_sigmoid = similar(gate)
- @. gate_sigmoid = 1.0f0 / (1.0f0 + exp(-gate)) # sigmoid
- gate_reshaped = reshape(gate_sigmoid, attn.head_dim, attn.n_heads)
- query_states .*= gate_reshaped
 
     # Update KV cache
     update_kv_cache!(cache, k, v, pos)
 
     # Compute attention scores using BLAS
-    # cache.k is (head_dim, n_kv, max_seq), cache.v is (head_dim, n_kv, max_seq)
-    # query_states is (head_dim, n_heads)
     output = zeros(Float32, attn.n_heads * attn.head_dim)
 
     gqa_ratio = div(attn.n_heads, attn.n_kv)
@@ -505,7 +496,6 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
         V_h = view(cache.v, :, kv_h, 1:seq_len)
 
         # Compute scores: K' * q = (seq_len, head_dim) * (head_dim,) = (seq_len,)
-        # Using BLAS: scores = K_h' * q_h
         scores = K_h' * q_h
         scores .*= attn.scale
 
@@ -519,7 +509,12 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
 
         output[(h-1)*attn.head_dim+1:h*attn.head_dim] .= out_h
     end
-    
+
+    # Apply sigmoid gate to attention output (gate comes from Q projection)
+    gate_sigmoid = similar(gate)
+    @. gate_sigmoid = 1.0f0 / (1.0f0 + exp(-gate))
+    output .*= gate_sigmoid
+
     # Output projection
     return attn.wo * output
 end

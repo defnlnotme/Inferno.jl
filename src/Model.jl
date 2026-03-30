@@ -661,11 +661,11 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
         q_rope = rope(q_2d, pos)
         k_rope = rope(k_2d, pos)
 
- # 4. Gating Q with sigmoid (Qwen3.5 uses sigmoid, not SiLU)
+ # 4. Gate (applied AFTER attention, not to Q)
  gate_raw_cpu = Array(gate_raw)
  @. gate_raw_cpu = Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_raw_cpu))) # sigmoid
  gate_sigmoid = oneArray(Float16.(gate_raw_cpu))
- q_gated = q_rope .* gate_sigmoid
+ q_gated = q_rope
 
     elseif m.architecture == :phi3
         # Packed QKV
@@ -733,6 +733,7 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
         end
 
         combined = m.decode_combined
+        combined .*= gate_sigmoid
         result = mat_mul!(m.decode_wo_buf, m.wo, combined)
 
  else
@@ -776,6 +777,7 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
  end
  end
  combined = oneArray(combined_all)
+ combined .*= gate_sigmoid
  result = mat_mul(m.wo, combined)
  end
 
