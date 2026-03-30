@@ -655,10 +655,14 @@ function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top
         end
     end
     
-    # Apply minimum probability floor and renormalize
+    # Apply minimum probability threshold (relative to max probability)
     if min_p > 0.0f0
-        @inbounds for i in 1:length(probs)
-            probs[i] = max(probs[i], min_p)
+        max_prob = maximum(probs)
+        threshold = max_prob * min_p
+        for i in 1:length(probs)
+            if probs[i] < threshold
+                probs[i] = 0.0f0
+            end
         end
         total = sum(probs)
         if total > 0.0f0
