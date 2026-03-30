@@ -391,19 +391,27 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
         beta_val = clamp(Float64(beta_proj[h]), -20.0, 20.0)
         beta = Float32(1.0 / (1.0 + exp(-beta_val)))
         
-        # State operations
-        state = view(m.h, :, :, h)
-        state .*= decay
-        
-        sk = state * k_normalized
-        tmp_head = beta .* (vg .- sk)
-        
-        # Outer product: state += tmp_head * k_normalized'
-        BLAS.ger!(1.0f0, tmp_head, k_normalized, state)
-        
-        # Output
-        yg = view(y_all, (h-1)*m.head_v_dim+1:h*m.head_v_dim)
-        mul!(yg, state, q_normalized)
+ # State operations
+ state = view(m.h, :, :, h)
+ state .*= decay
+ 
+ # Compute sk = sum_rows(state * k) where k is broadcast along columns
+ # In ggml: sk = sum_rows(s * k) = sum_i state[i,j] * k[i] for each j
+ # sk[j] = sum_i state[i,j] * k[i]
+ sk = k_normalized' * state  # This gives a row vector [1, S_v]
+ 
+ # d = beta * (v - sk') where sk' is [S_v, 1]
+ # In llama.cpp: d = (v - sk') * beta where v and sk' are column vectors
+ d = beta .* (vg .- vec(sk))  # sk is row vector, we need element-wise with v
+ 
+ # State update: state += k * d' where k is broadcast
+ # state[i,j] += k[i] * d[j]
+ # This is: state += k * d' (outer product with k as column, d' as row)
+ BLAS.ger!(1.0f0, k_normalized, d, state)  # state += k * d'
+ 
+ # Output: o = sum_rows(state * q) = q' * state
+ yg = view(y_all, (h-1)*m.head_v_dim+1:h*m.head_v_dim)
+ mul!(yg, state', q_normalized)  # state' * q gives correct output
     end
     
     # 8. Apply SSM norm (per-head normalization)
