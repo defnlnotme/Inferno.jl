@@ -4,39 +4,57 @@ using LinearAlgebra
 function debug_post_norm()
     model, _ = load_model_cpu("tests/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
     
-    # Check post_norm weight
-    layer = model.layers[1]
-    post_norm = layer.post_norm
+    caches = [Inferno.ModelCPU.init_kv_cache_cpu(model.config) for _ in 1:model.config.num_hidden_layers]
+    Inferno.ModelCPU.reset_states_cpu!(model)
     
-    println("=== Post norm weights ===")
-    println("Weight sample: ", post_norm.weight[1:10])
-    println("Weight mean: ", sum(post_norm.weight) / length(post_norm.weight))
-    println("Weight norm: ", sqrt(sum(abs2.(post_norm.weight))))
+    # Process first token through layers 1-6
+    tok = 761
+    pos = 0
+    x = model.embed[:, tok]
+    for i in 1:6
+        x = model.layers[i](x, pos, model.rope, caches[i])
+    end
     
-    # Create a test input with norm 1.01
-    x = randn(Float32, 1024)
-    x = x .* (1.01f0 / sqrt(sum(abs2.(x))))
+    layer = model.layers[7]
     
-    println("\n=== Test input ===")
-    println("Input norm: ", sqrt(sum(abs2.(x))))
+    # Manually compute SSM output
+    x_orig = copy(x)
+    x_norm = layer.in_norm(x)
+    ssm_out = layer.op(x_norm, pos, model.rope, caches[7])
+    
+    # Residual
+    x_after_ssm = x_orig .+ ssm_out
+    
+    println("=== Post-norm Analysis ===")
+    println("x_after_ssm norm: ", round(sqrt(sum(abs2.(x_after_ssm))), digits=3))
+    println("x_after_ssm mean: ", round(sum(x_after_ssm) / length(x_after_ssm), digits=3))
+    println("x_after_ssm std: ", round(sqrt(sum((x_after_ssm .- sum(x_after_ssm)/length(x_after_ssm)).^2) / length(x_after_ssm)), digits=3))
     
     # Apply post_norm
-    x_normed = post_norm(x)
+    x_post_norm = layer.post_norm(x_after_ssm)
     
-    println("\n=== After post_norm ===")
-    println("Output norm: ", sqrt(sum(abs2.(x_normed))))
+    println("\nx_post_norm norm: ", round(sqrt(sum(abs2.(x_post_norm))), digits=3))
+    println("x_post_norm mean: ", round(sum(x_post_norm) / length(x_post_norm), digits=3))
     
-    # Manual computation
-    ss = sum(abs2.(x))
-    m = ss / length(x)
-    scale = 1.0f0 / sqrt(m + post_norm.eps)
+    # Manual RMS norm computation
+    ss = sum(abs2, x_after_ssm)
+    m = ss / length(x_after_ssm)
+    scale = 1.0f0 / sqrt(m + layer.post_norm.eps)
     
-    println("\n=== Manual computation ===")
-    println("Sum of squares: ", ss)
-    println("Mean of squares: ", m)
-    println("RMS: ", sqrt(m))
-    println("Scale: ", scale)
-    println("Expected output norm: ", sqrt(sum(abs2.(x .* scale .* post_norm.weight))))
+    println("\nManual RMS computation:")
+    println("  sum(x^2) = ", round(ss, digits=3))
+    println("  mean(x^2) = ", round(m, digits=3))
+    println("  scale = 1/sqrt(mean + eps) = ", round(scale, digits=3))
+    input_norm = round(sqrt(sum(abs2.(x_after_ssm))), digits=3)
+    weight_mean = round(sum(layer.post_norm.weight) / length(layer.post_norm.weight), digits=3)
+    println("  expected output norm = input_norm * scale * weight_mean")
+    println("                        = $input_norm * $(round(scale, digits=3)) * $weight_mean")
+    println("                        = ", round(input_norm * scale * weight_mean, digits=3))
+    
+    # Check if there's an issue with the computation
+    println("\nActual vs expected:")
+    println("  Actual norm: ", round(sqrt(sum(abs2.(x_post_norm))), digits=3))
+    println("  Expected (if uniform): ", round(sqrt(sum(abs2.(x_after_ssm))) * scale * sum(layer.post_norm.weight) / length(layer.post_norm.weight), digits=3))
 end
 
 debug_post_norm()

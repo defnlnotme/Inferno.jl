@@ -49,7 +49,7 @@ function chat!(model, tok;
     ╚═══════════════════════════════════════════════════╝
     """
     
-    printlnstyled(banner, color=:cyan, bold=true)
+    printstyled(banner, color=:cyan, bold=true)
     println()
     
     while true

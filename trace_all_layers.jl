@@ -7,48 +7,26 @@ function trace_all_layers()
     caches = [Inferno.ModelCPU.init_kv_cache_cpu(model.config) for _ in 1:model.config.num_hidden_layers]
     Inferno.ModelCPU.reset_states_cpu!(model)
     
-    x = model.embed[:, 761]  # "The"
+    tok = 761
     pos = 0
+    x = model.embed[:, tok]
     
-    println("=== Layer-by-layer norm progression ===")
-    println("Layer | Type | InNorm | OpOut | Res1 | PostNorm | MLP | Final")
-    println("------|------|--------|-------|------|----------|-----|------")
+    println("Layer-by-layer norm trace:")
+    println("Embedding: norm = ", round(sqrt(sum(abs2.(x))), digits=3))
     
-    for (i, layer) in enumerate(model.layers)
-        x_orig = copy(x)
+    for i in 1:model.config.num_hidden_layers
+        x_before = copy(x)
+        x = model.layers[i](x, pos, model.rope, caches[i])
         
-        # Step 1: Input norm
-        x_norm = layer.in_norm(x)
-        in_norm_val = sqrt(sum(abs2.(x_norm)))
-        
-        # Step 2: Op (SSM or Attention)
-        op_out = layer.op(x_norm, pos, model.rope, caches[i])
-        op_norm = sqrt(sum(abs2.(op_out)))
-        
-        # Step 3: First residual
-        x_after_op = x_orig .+ op_out
-        res1_norm = sqrt(sum(abs2.(x_after_op)))
-        
-        # Step 4: Post norm
-        x_norm2 = layer.post_norm(x_after_op)
-        post_norm_val = sqrt(sum(abs2.(x_norm2)))
-        
-        # Step 5: MLP
-        mlp_out = layer.mlp(x_norm2)
-        mlp_norm = sqrt(sum(abs2.(mlp_out)))
-        
-        # Step 6: Final residual
-        x_final = x_after_op .+ mlp_out
-        final_norm = sqrt(sum(abs2.(x_final)))
-        
-        layer_type = layer.is_ssm ? "SSM" : "Attn"
-        println("$i | $layer_type | $(round(in_norm_val, digits=1)) | $(round(op_norm, digits=2)) | $(round(res1_norm, digits=2)) | $(round(post_norm_val, digits=1)) | $(round(mlp_norm, digits=2)) | $(round(final_norm, digits=2))")
-        
-        # Update x for next layer
-        x = x_final
+        layer_type = model.layers[i].is_ssm ? "SSM" : "Attn"
+        println("Layer $i ($layer_type): norm = ", round(sqrt(sum(abs2.(x))), digits=3), 
+                " (delta = ", round(sqrt(sum(abs2.(x))) - sqrt(sum(abs2.(x_before))), digits=3), ")")
     end
     
-    println("\nFinal hidden norm: ", sqrt(sum(abs2.(x))))
+    println("\nFinal norm: ", round(sqrt(sum(abs2.(x))), digits=3))
+    
+    # Compare with llama.cpp expected behavior
+    # For a well-trained model, the norm should stay relatively stable
 end
 
 trace_all_layers()
