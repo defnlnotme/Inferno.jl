@@ -235,9 +235,10 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig;
 
     layers = Model.DecoderLayer[]
     blocks = extract_sorted_blocks(file.tensors)
+    total_blocks = length(blocks)
 
-    for block in blocks
-        print(".")
+    for (idx, block) in enumerate(blocks)
+        print("\e[36mLoading layers: $idx/$total_blocks\e[0m\r")
         flush(stdout)
 
         i = block.index
@@ -332,6 +333,7 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig;
 
         push!(layers, Model.DecoderLayer(in_norm, op, post_norm, mlp, is_ssm))
     end
+    println()
 
     final_norm_w = get_bias_or_norm(file, "output_norm.weight")
     final_norm = Model.RMSNorm(final_norm_w, config.rms_norm_eps)
