@@ -61,11 +61,11 @@ function chat!(model, tok;
         end
         
         if line == "/quit" || line == "/exit"
-            printlnstyled("Goodbye!", color=:cyan)
+            printstyled("Goodbye!\n", color=:cyan)
             break
         elseif line == "/clear"
             messages = [Message(:system, system_prompt)]
-            printlnstyled("Conversation cleared.", color=:yellow)
+            printstyled("Conversation cleared.\n", color=:yellow)
             continue
         elseif line == "/system"
             printstyled("New system prompt: ", color=:magenta)
@@ -73,11 +73,11 @@ function chat!(model, tok;
             if !isempty(new_system)
                 system_prompt = new_system
                 messages = [Message(:system, system_prompt)]
-                printlnstyled("System prompt updated!", color=:green)
+                printstyled("System prompt updated!\n", color=:green)
             end
             continue
         elseif startswith(line, "/")
-            printlnstyled("Unknown command: $(line)", color=:red)
+            printstyled("Unknown command: $(line)\n", color=:red)
             continue
         end
         
@@ -85,7 +85,7 @@ function chat!(model, tok;
         
         prompt = build_prompt(messages)
         
-        printlnstyled("\nAssistant> ", color=:blue, bold=true)
+        printstyled("\nAssistant> ", color=:blue, bold=true)
         
         response = stream_to_stdout(model, tok, prompt; stop_token=tok.eos_id, kwargs...)
         
