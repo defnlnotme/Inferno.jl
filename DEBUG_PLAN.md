@@ -157,6 +157,48 @@ Actions:
 
 ---
 
+## Step 8: Deep Dive - Compare with llama.cpp
+Status: COMPLETED
+
+Key finding: llama.cpp produces different intermediate tensor norms than our implementation.
+
+Actions:
+- [x] Created dump-tensors tool for llama.cpp
+- [x] Compared layer output norms
+
+CRITICAL FINDING:
+- llama.cpp final layer output norm: 10.46
+- Our implementation final norm: 27.89
+- Ratio: 2.67x larger in our implementation
+
+llama.cpp layer norms (first 5 tokens):
+- l_out-0: 2.73 (SSM)
+- l_out-3: 4.73 (first attention)
+- l_out-6: 13.30 (attention - big jump)
+- l_out-23: 10.46 (final)
+
+Our implementation:
+- Layer 1: 1.01 (SSM)
+- Layer 4: 3.90 (first attention)
+- Layer 24: 27.89 (final)
+
+The norms diverge significantly, especially in later layers.
+This causes wrong logits and predictions.
+
+---
+
+## Step 9: Identify Norm Divergence Point
+Status: IN PROGRESS
+
+Need to identify where exactly the norms diverge.
+
+Actions:
+- [ ] Compare embedding layer output
+- [ ] Compare first SSM layer output in detail
+- [ ] Check if the issue is in SSM, attention, or MLP
+
+---
+
 ## Notes
 
 ### Key Observations
