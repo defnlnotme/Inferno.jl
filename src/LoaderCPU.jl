@@ -236,12 +236,16 @@ function load_ssm_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.Qw
  # Conv1d - stored as (kernel_size, out_features) in GGUF for Qwen3.5
  # We need (conv_kernel, conv_channels) for the convolution
  ssm_conv1d_raw = Float32.(extract_tensor_cpu(file, "$(prefix).ssm_conv1d.weight"))
- # GGUF stores as (kernel, channels), we keep it that way
+ # GGUF stores as (kernel, channels) = (conv_kernel, conv_channels)
+ # This is already the correct shape for our convolution
  ssm_conv1d = ssm_conv1d_raw
-    
-    # Alpha/beta weights
-    ssm_alpha_weight = Float32.(extract_tensor_cpu(file, "$(prefix).ssm_alpha.weight"))'
-    ssm_beta_weight = Float32.(extract_tensor_cpu(file, "$(prefix).ssm_beta.weight"))'
+ 
+ # Alpha/beta weights
+ # GGUF stores as (num_v_heads, hidden_size) in row-major
+ # Julia reads this as (hidden_size, num_v_heads) due to column-major reshape
+ # We need to transpose back to (num_v_heads, hidden_size) for the matmul
+ ssm_alpha_weight = permutedims(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_alpha.weight")))
+ ssm_beta_weight = permutedims(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_beta.weight")))
     
     # SSM parameters - ssm_a is a tensor, not a bias
     ssm_a = Float32.(vec(extract_tensor_cpu(file, "$(prefix).ssm_a")))
@@ -262,7 +266,7 @@ function load_ssm_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.Qw
     
  # conv_channels = d_inner + 2 * num_k_heads * head_k_dim
  conv_channels = size(in_proj, 1)
- conv_kernel = size(ssm_conv1d, 1)  # First dimension is kernel size
+ conv_kernel = size(ssm_conv1d, 1) # After transpose: (kernel, channels)
     
     # Recompute head_k_dim from conv_channels
     # conv_channels = d_inner + 2 * num_k_heads * head_k_dim
