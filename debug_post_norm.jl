@@ -7,54 +7,76 @@ function debug_post_norm()
     caches = [Inferno.ModelCPU.init_kv_cache_cpu(model.config) for _ in 1:model.config.num_hidden_layers]
     Inferno.ModelCPU.reset_states_cpu!(model)
     
-    # Process first token through layers 1-6
     tok = 761
     pos = 0
     x = model.embed[:, tok]
-    for i in 1:6
+    
+    # Process through first 5 layers
+    for i in 1:5
         x = model.layers[i](x, pos, model.rope, caches[i])
     end
     
-    layer = model.layers[7]
+    layer = model.layers[6]
     
-    # Manually compute SSM output
-    x_orig = copy(x)
+    # Process SSM
+    x_before = copy(x)
     x_norm = layer.in_norm(x)
-    ssm_out = layer.op(x_norm, pos, model.rope, caches[7])
+    ssm_output = layer.op(x_norm, pos, model.rope, caches[6])
+    x_after_ssm = x_before .+ ssm_output
     
-    # Residual
-    x_after_ssm = x_orig .+ ssm_out
-    
-    println("=== Post-norm Analysis ===")
-    println("x_after_ssm norm: ", round(sqrt(sum(abs2.(x_after_ssm))), digits=3))
-    println("x_after_ssm mean: ", round(sum(x_after_ssm) / length(x_after_ssm), digits=3))
-    println("x_after_ssm std: ", round(sqrt(sum((x_after_ssm .- sum(x_after_ssm)/length(x_after_ssm)).^2) / length(x_after_ssm)), digits=3))
-    
-    # Apply post_norm
-    x_post_norm = layer.post_norm(x_after_ssm)
-    
-    println("\nx_post_norm norm: ", round(sqrt(sum(abs2.(x_post_norm))), digits=3))
-    println("x_post_norm mean: ", round(sum(x_post_norm) / length(x_post_norm), digits=3))
+    println("=== RMS Norm Debug ===")
+    println("\nInput to post_norm (x_after_ssm):")
+    println("  norm: ", round(sqrt(sum(abs2.(x_after_ssm))), digits=3))
+    println("  size: ", length(x_after_ssm))
     
     # Manual RMS norm computation
     ss = sum(abs2, x_after_ssm)
-    m = ss / length(x_after_ssm)
-    scale = 1.0f0 / sqrt(m + layer.post_norm.eps)
+    mean_sq = ss / length(x_after_ssm)
+    rms = sqrt(mean_sq)
+    scale = 1.0f0 / (rms + 1e-6)  # RMS norm with epsilon
     
-    println("\nManual RMS computation:")
+    println("\nRMS norm computation (manual):")
     println("  sum(x^2) = ", round(ss, digits=3))
-    println("  mean(x^2) = ", round(m, digits=3))
-    println("  scale = 1/sqrt(mean + eps) = ", round(scale, digits=3))
-    input_norm = round(sqrt(sum(abs2.(x_after_ssm))), digits=3)
-    weight_mean = round(sum(layer.post_norm.weight) / length(layer.post_norm.weight), digits=3)
-    println("  expected output norm = input_norm * scale * weight_mean")
-    println("                        = $input_norm * $(round(scale, digits=3)) * $weight_mean")
-    println("                        = ", round(input_norm * scale * weight_mean, digits=3))
+    println("  mean(x^2) = ", round(mean_sq, digits=6))
+    println("  sqrt(mean) = ", round(rms, digits=6))
+    println("  scale = 1/(sqrt(mean) + eps) = ", round(scale, digits=3))
     
-    # Check if there's an issue with the computation
-    println("\nActual vs expected:")
-    println("  Actual norm: ", round(sqrt(sum(abs2.(x_post_norm))), digits=3))
-    println("  Expected (if uniform): ", round(sqrt(sum(abs2.(x_after_ssm))) * scale * sum(layer.post_norm.weight) / length(layer.post_norm.weight), digits=3))
+    # Apply scale
+    x_scaled = x_after_ssm .* scale
+    println("\nAfter scaling:")
+    println("  x_scaled norm: ", round(sqrt(sum(abs2.(x_scaled))), digits=3))
+    
+    # Apply weight
+    println("\nPost-norm weight:")
+    println("  mean: ", round(sum(layer.post_norm.weight) / length(layer.post_norm.weight), digits=3))
+    println("  norm: ", round(sqrt(sum(abs2.(layer.post_norm.weight))), digits=3))
+    
+    x_post_manual = x_scaled .* layer.post_norm.weight
+    println("\nAfter weight multiplication (manual):")
+    println("  x_post norm: ", round(sqrt(sum(abs2.(x_post_manual))), digits=3))
+    
+    # Compare with actual
+    x_post_actual = layer.post_norm(x_after_ssm)
+    println("\nActual post_norm output:")
+    println("  x_post norm: ", round(sqrt(sum(abs2.(x_post_actual))), digits=3))
+    
+    # Check if they match
+    println("\nDifference between manual and actual: ", round(sqrt(sum(abs2.(x_post_manual - x_post_actual))), digits=6))
+    
+    # Check llama.cpp expected values
+    println("\n=== llama.cpp Comparison ===")
+    println("llama.cpp:")
+    println("  attn_residual-5: 2.80")
+    println("  ffn_gate-5: 35.623 (gate projection)")
+    println("  ffn_up-5: 14.513 (up projection)")
+    println("")
+    println("Expected behavior:")
+    println("  norm(ffn_gate) / norm(gate_weight) ≈ norm(ffn_up) / norm(up_weight)")
+    println("  35.623 / 27.936 = ", round(35.623 / 27.936, digits=3))
+    println("  14.513 / 15.874 = ", round(14.513 / 15.874, digits=3))
+    println("")
+    println("These should be similar if the input to FFN is the same!")
+    println("But 1.275 ≠ 0.914, so there's something wrong.")
 end
 
 debug_post_norm()
