@@ -1,42 +1,56 @@
 using Inferno
 using LinearAlgebra
 
-function trace_attention()
-    model, tokenizer = Inferno.load_model_cpu("tests/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
+function trace_attention_layer()
+    model, tokenizer = load_model_cpu("tests/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
     
     # Initialize caches
     caches = [Inferno.ModelCPU.init_kv_cache_cpu(model.config) for _ in 1:model.config.num_hidden_layers]
     Inferno.ModelCPU.reset_states_cpu!(model)
     
-    # Prompt tokens
-    tokens = [761, 6512, 315, 9339, 370]  # "The capital of France is"
+    # Process first token "The"
+    x = model.embed[:, 761]
+    pos = 0
     
-    # Process all prompt tokens
-    for (pos, tok) in enumerate(tokens)
-        x = model.embed[:, tok]
-        for (i, layer) in enumerate(model.layers)
-            x = layer(x, pos-1, model.rope, caches[i])
-        end
+    # Process through first 3 SSM layers
+    for i in 1:3
+        x = model.layers[i](x, pos, model.rope, caches[i])
     end
     
-    # Check KV cache for attention layers
-    println("KV cache after prompt:")
-    attn_layers = [i for (i, layer) in enumerate(model.layers) if !layer.is_ssm]
+    println("=== After 3 SSM layers ===")
+    println("Hidden norm: ", sqrt(sum(abs2.(x))))
+    println("Sample: ", x[1:5])
     
-    for i in attn_layers
-        layer = model.layers[i]
-        cache = caches[i]
-        println("\nLayer $i (Attention):")
-        println("  K shape: ", size(cache.k))
-        println("  V shape: ", size(cache.v))
-        
-        # Check norms at each position
-        for p in 1:5
-            k_norm = sqrt(sum(abs2.(cache.k[:, :, p])))
-            v_norm = sqrt(sum(abs2.(cache.v[:, :, p])))
-            println("  Position $p K norm: ", k_norm, ", V norm: ", v_norm)
-        end
-    end
+    # Process through attention layer (layer 4)
+    println("\n=== Processing Attention Layer (layer 4) ===")
+    attn = model.layers[4].op
+    
+    println("wq shape: ", size(attn.wq))
+    println("wk shape: ", size(attn.wk))
+    println("wv shape: ", size(attn.wv))
+    println("wo shape: ", size(attn.wo))
+    
+    # Apply input norm
+    x_normed = model.layers[4].in_norm(x)
+    println("\nAfter input norm: ", sqrt(sum(abs2.(x_normed))))
+    
+    # Project Q, K, V
+    q = attn.wq * x_normed
+    k = attn.wk * x_normed
+    v = attn.wv * x_normed
+    
+    println("\nQ norm: ", sqrt(sum(abs2.(q))))
+    println("K norm: ", sqrt(sum(abs2.(k))))
+    println("V norm: ", sqrt(sum(abs2.(v))))
+    
+    # Apply RoPE
+    freqs = model.rope(pos)
+    q_rotated = Inferno.ModelCPU.apply_rope_cpu(q, freqs, model.config)
+    k_rotated = Inferno.ModelCPU.apply_rope_cpu(k, freqs, model.config)
+    
+    println("\nAfter RoPE:")
+    println("Q norm: ", sqrt(sum(abs2.(q_rotated))))
+    println("K norm: ", sqrt(sum(abs2.(k_rotated))))
 end
 
-trace_attention()
+trace_attention_layer()

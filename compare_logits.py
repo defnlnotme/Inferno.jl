@@ -2,7 +2,7 @@ from llama_cpp import Llama
 import numpy as np
 
 llm = Llama(
-    model_path="/home/fra/dev/inferno/tests/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf",
+    model_path="tests/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf",
     n_ctx=512,
     logits=True,
     verbose=False
