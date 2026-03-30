@@ -1,6 +1,7 @@
 module Chat
 
 using REPL
+using ..Inferno: stream_to_stdout
 
 export chat, chat!, start_chat, Message, build_prompt
 
