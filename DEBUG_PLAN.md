@@ -86,14 +86,21 @@ Actions:
 ---
 
 ## Step 5: Check Final Normalization and Logits
-Status: IN PROGRESS
+Status: COMPLETED
 
 Final norm weights are unusually large (3-4x).
 
 Actions:
-- [ ] Verify final_norm weight values match GGUF
-- [ ] Check if there's a temperature/scaling applied to logits
-- [ ] Compare final logits distribution with llama.cpp
+- [x] Verify final_norm weight values match GGUF - MATCHES (mean 4.31)
+- [x] Check if there's a temperature/scaling applied to logits - NO TEMPERATURE
+- [x] Compare final logits distribution with llama.cpp - DIFFERENT
+
+Findings:
+- Our model predicts ' th' (logit 18.5) as top token
+- Expected: '[' (logit 11.1) for "[Start thinking]"
+- Hidden state norm 27.89 -> final norm 126.08
+- Logits range: -19 to 18.5 (reasonable spread)
+- Issue: wrong token has highest logit
 
 ---
 
@@ -107,6 +114,46 @@ Actions:
 - [ ] Check all MLP weights (gate, up, down)
 - [ ] Check all norm weights (input_norm, post_norm)
 - [ ] Check embedding and LM head
+
+---
+
+## Step 7: Identify the Core Issue
+Status: COMPLETED
+
+After verifying all components, the model still predicts incorrectly.
+Need to identify what's causing the wrong predictions.
+
+Actions:
+- [x] Check if SSM state is being accumulated correctly across tokens - CORRECT
+- [x] Compare hidden state after each token with expected values - State grows correctly
+- [x] Check if there's an issue with the attention KV cache - Appears correct
+- [x] Verify RoPE frequencies are correct - CORRECT (theta=1e7, dim=64)
+- [x] Check tokenizer encoding/decoding - CORRECT
+
+Findings:
+- All components appear to be implemented correctly
+- Tokenizer encodes/decodes correctly
+- SSM state accumulates properly (norm 0 -> 5.89 over 5 tokens)
+- RoPE frequencies match config (theta=1e7)
+- Adding <|im_start|> token doesn't change predictions
+
+Hypothesis:
+The model predictions are wrong due to a subtle numerical issue or
+a mismatch in how the weights are being used. The hidden state norm
+(27.89) leads to amplified logits (max 18.5) but wrong token predictions.
+
+---
+
+## Step 8: Deep Dive - Compare with llama.cpp
+Status: PENDING
+
+Need to compare exact intermediate values with llama.cpp to identify
+where the computation diverges.
+
+Actions:
+- [ ] Extract hidden states from llama.cpp after each layer
+- [ ] Compare with our implementation
+- [ ] Identify the layer where values diverge
 
 ---
 
