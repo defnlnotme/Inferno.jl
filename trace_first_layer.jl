@@ -1,49 +1,70 @@
 using Inferno
 using LinearAlgebra
 
-function trace_first_layer()
-    model, tokenizer = load_model_cpu("tests/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
+function trace_first_layer_detailed()
+    model, _ = load_model_cpu("tests/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
     
-    # Initialize caches and reset states
     caches = [Inferno.ModelCPU.init_kv_cache_cpu(model.config) for _ in 1:model.config.num_hidden_layers]
     Inferno.ModelCPU.reset_states_cpu!(model)
     
-    # Process first token "The"
-    x = model.embed[:, 761]
-    println("=== First token \"The\" ===")
-    println("Embedding norm: ", sqrt(sum(abs2.(x))))
-    println("Embedding sample: ", x[1:5])
+    # Process first token "The" (token 761)
+    tok = 761
+    x = model.embed[:, tok]
+    pos = 0
     
-    # Apply input norm
-    layer1 = model.layers[1]
-    x_normed = layer1.in_norm(x)
-    println("\nAfter input norm:")
-    println("Norm: ", sqrt(sum(abs2.(x_normed))))
-    println("Sample: ", x_normed[1:5])
+    println("=== Embedding ===")
+    println("Token $tok embedding norm: ", sqrt(sum(abs2.(x))))
+    println("Embedding sample values: ", x[1:5])
     
-    # Process through SSM
-    ssm = layer1.op
-    println("\n=== SSM Layer 1 ===")
-    println("in_proj shape: ", size(ssm.in_proj))
-    println("gate_proj shape: ", size(ssm.gate_proj))
-    println("ssm_out shape: ", size(ssm.ssm_out))
+    # Process through first layer manually
+    layer = model.layers[1]
     
-    # Project to QKV
-    qkv = ssm.in_proj * x_normed
-    println("\nQKV projection:")
-    println("Shape: ", size(qkv))
-    println("Sample: ", qkv[1:5])
+    println("\n=== First Layer (SSM) ===")
+    println("Layer is SSM: ", layer.is_ssm)
     
-    # Apply gate
-    gate = ssm.gate_proj * x_normed
-    println("\nGate projection:")
-    println("Shape: ", size(gate))
-    println("Sample: ", gate[1:5])
+    # Step 1: Input norm
+    x_norm = layer.in_norm(x)
+    println("\nAfter in_norm:")
+    println("  Norm: ", sqrt(sum(abs2.(x_norm))))
+    println("  Sample: ", x_norm[1:5])
     
-    # Apply sigmoid to gate
-    gate_sigmoid = Infra.sigmoid.(gate)
-    println("\nAfter sigmoid:")
-    println("Sample: ", gate_sigmoid[1:5])
+    # Check in_norm weights
+    println("\nIn_norm weight sample: ", layer.in_norm.weight[1:5])
+    println("In_norm weight mean: ", sum(layer.in_norm.weight) / length(layer.in_norm.weight))
+    
+    # Step 2: SSM
+    ssm_out = layer.op(x_norm, pos, model.rope, caches[1])
+    println("\nSSM output:")
+    println("  Norm: ", sqrt(sum(abs2.(ssm_out))))
+    println("  Sample: ", ssm_out[1:5])
+    
+    # Step 3: Residual
+    x_after_ssm = x .+ ssm_out
+    println("\nAfter SSM residual (x + ssm_out):")
+    println("  Norm: ", sqrt(sum(abs2.(x_after_ssm))))
+    
+    # Step 4: Post norm
+    x_norm2 = layer.post_norm(x_after_ssm)
+    println("\nAfter post_norm:")
+    println("  Norm: ", sqrt(sum(abs2.(x_norm2))))
+    println("  Post_norm weight mean: ", sum(layer.post_norm.weight) / length(layer.post_norm.weight))
+    
+    # Step 5: MLP
+    mlp_out = layer.mlp(x_norm2)
+    println("\nMLP output:")
+    println("  Norm: ", sqrt(sum(abs2.(mlp_out))))
+    println("  Sample: ", mlp_out[1:5])
+    
+    # Step 6: Final residual
+    x_final = x_after_ssm .+ mlp_out
+    println("\n=== Final layer 1 output ===")
+    println("Norm: ", sqrt(sum(abs2.(x_final))))
+    println("Sample: ", x_final[1:5])
+    
+    # Compare with direct layer call
+    Inferno.ModelCPU.reset_states_cpu!(model)
+    x_direct = layer(model.embed[:, tok], pos, model.rope, caches[1])
+    println("\nDirect layer call norm: ", sqrt(sum(abs2.(x_direct))))
 end
 
-trace_first_layer()
+trace_first_layer_detailed()
