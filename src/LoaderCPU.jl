@@ -86,11 +86,13 @@ function extract_tensor_cpu(file::GGUF.GGUFFile, info::GGUF.TensorInfo; keep_qua
         zeros(Float32, num_elements)
     end
 
-    if length(dims) > 2
-        return reshape(data, dims)
-    else
-        return reshape(data, inner, outer)
-    end
+ if length(dims) > 2
+ return reshape(data, dims)
+ else
+ # GGUF stores data in row-major order, Julia uses column-major
+ # So we need to reshape with dimensions reversed, then transpose
+ return reshape(data, outer, inner)'
+ end
 end
 
 function extract_tensor_cpu(file::GGUF.GGUFFile, name::String)
@@ -336,13 +338,15 @@ function load_mlp(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConf
         up_weight = extract_tensor_cpu(file, up_info; keep_quantized=true)
         down_weight = extract_tensor_cpu(file, down_info; keep_quantized=true)
         return ModelCPU.MLPCPU(gate_weight, up_weight, down_weight)
-    else
-        # Dequantize to Float32 and transpose, then convert to Matrix
-        gate_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_gate.weight"))')
-        up_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_up.weight"))')
-        down_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_down.weight"))')
-        return ModelCPU.MLPCPU(gate_weight, up_weight, down_weight)
-    end
+ else
+ # Dequantize to Float32 and transpose for FFN multiplication
+ # extract_tensor_cpu returns (hidden, intermediate) for gate/up, (intermediate, hidden) for down
+ # We need (intermediate, hidden) for gate/up, (hidden, intermediate) for down
+ gate_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_gate.weight"))')
+ up_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_up.weight"))')
+ down_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_down.weight"))')
+ return ModelCPU.MLPCPU(gate_weight, up_weight, down_weight)
+ end
 end
 
 end # module
