@@ -573,7 +573,7 @@ function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
  if full_logits
  all_logits = zeros(Float32, model.config.vocab_size, seq_len)
  for t in 1:seq_len
- tok = tokens[t] + 1 # Convert 0-indexed token to 1-indexed Julia array index
+ tok = tokens[t] # Already 1-indexed from encode()
  curr_pos = pos + t - 1
  x = view(model.embed, :, tok)
  for (i, layer) in enumerate(model.layers)
@@ -587,7 +587,7 @@ function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
  # Only compute LM head for the last position
  last_logits = Vector{Float32}(undef, model.config.vocab_size)
  for t in 1:seq_len
- tok = tokens[t] + 1 # Convert 0-indexed token to 1-indexed Julia array index
+ tok = tokens[t] # Already 1-indexed from encode()
  curr_pos = pos + t - 1
  x = view(model.embed, :, tok)
  for (i, layer) in enumerate(model.layers)
