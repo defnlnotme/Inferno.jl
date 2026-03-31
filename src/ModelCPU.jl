@@ -496,14 +496,22 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
         K_h = view(cache.k, :, kv_h, 1:seq_len)
         V_h = view(cache.v, :, kv_h, 1:seq_len)
 
-        # Compute scores: K' * q = (seq_len, head_dim) * (head_dim,) = (seq_len,)
-        scores = K_h' * q_h
-        scores .*= attn.scale
+ # Compute scores: K' * q = (seq_len, head_dim) * (head_dim,) = (seq_len,)
+ scores = K_h' * q_h
+ scores .*= attn.scale
 
-        # Softmax
-        max_score = maximum(scores)
-        scores = exp.(scores .- max_score)
-        scores ./= sum(scores)
+ # Mask out positions with zero K (uninitialized cache positions)
+ # For hybrid models, positions processed by SSM layers have zero K/V
+ for i in 1:length(scores)
+ if all(iszero, view(K_h, :, i))
+ scores[i] = -Float32(1e9)  # Large negative for softmax masking
+ end
+ end
+
+ # Softmax
+ max_score = maximum(scores)
+ scores = exp.(scores .- max_score)
+ scores ./= sum(scores)
 
         # Weighted sum: V * scores = (head_dim, seq_len) * (seq_len,) = (head_dim,)
         out_h = V_h * scores
