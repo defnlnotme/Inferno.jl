@@ -80,9 +80,10 @@ struct RotaryEmbeddingCPU
 end
 
 function RotaryEmbeddingCPU(head_dim::Int, theta::Float32 = 10000.0f0, max_seq_len::Int = 4096; rotary_dim::Int = head_dim)
-    # Only compute inv_freq for the rotary dimensions
-    inv_freq = Float32[1.0 / (theta ^ (2(i-1)/head_dim)) for i in 1:div(rotary_dim, 2)]
-    return RotaryEmbeddingCPU(inv_freq, max_seq_len, rotary_dim)
+ # Only compute inv_freq for the rotary dimensions
+ # Formula: inv_freq[i] = 1.0 / (theta ^ (2i / rotary_dim))
+ inv_freq = Float32[1.0 / (theta ^ (2(i-1)/rotary_dim)) for i in 1:div(rotary_dim, 2)]
+ return RotaryEmbeddingCPU(inv_freq, max_seq_len, rotary_dim)
 end
 
 function apply_rotary_emb!(x::Matrix{Float32}, pos::Int, rope::RotaryEmbeddingCPU)
@@ -559,12 +560,12 @@ struct QwenModelCPU
 end
 
 function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches::Vector{KVCacheCPU}; full_logits::Bool=false)
-    seq_len = length(tokens)
+ seq_len = length(tokens)
 
  if full_logits
  all_logits = zeros(Float32, model.config.vocab_size, seq_len)
  for t in 1:seq_len
- tok = tokens[t] + 1  # Convert 0-indexed token to 1-indexed Julia array index
+ tok = tokens[t] + 1 # Convert 0-indexed token to 1-indexed Julia array index
  curr_pos = pos + t - 1
  x = view(model.embed, :, tok)
  for (i, layer) in enumerate(model.layers)
@@ -578,7 +579,7 @@ function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
  # Only compute LM head for the last position
  last_logits = Vector{Float32}(undef, model.config.vocab_size)
  for t in 1:seq_len
- tok = tokens[t] + 1  # Convert 0-indexed token to 1-indexed Julia array index
+ tok = tokens[t] + 1 # Convert 0-indexed token to 1-indexed Julia array index
  curr_pos = pos + t - 1
  x = view(model.embed, :, tok)
  for (i, layer) in enumerate(model.layers)
