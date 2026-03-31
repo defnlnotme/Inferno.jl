@@ -57,16 +57,16 @@ function extract_tensor(file::GGUF.GGUFFile, info::GGUF.TensorInfo)
 
     dims = Tuple(Int.(info.dimensions))
 
-    # Handle multi-dimensional tensors (e.g., 4D vision transformers in mmproj)
-    if length(dims) > 2
-        # For tensors with >2 dimensions, keep all dimensions
-        return reshape(data, dims)
-    else
-        # Standard 2D matrix case (inner, outer)
-        inner = dims[1]
-        outer = length(dims) > 1 ? dims[2] : 1
-        return reshape(data, inner, outer)
-    end
+ # Handle multi-dimensional tensors (e.g., 4D vision transformers in mmproj)
+ if length(dims) > 2
+ return reshape(data, dims)
+ else
+ # GGUF stores data in row-major order, Julia uses column-major
+ # So we need to reshape with dimensions reversed, then transpose
+ inner = dims[1]
+ outer = length(dims) > 1 ? dims[2] : 1
+ return reshape(data, outer, inner)'
+ end
 end
 
 function extract_tensor(file::GGUF.GGUFFile, name::String)
