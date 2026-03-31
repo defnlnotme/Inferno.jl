@@ -561,36 +561,36 @@ end
 function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches::Vector{KVCacheCPU}; full_logits::Bool=false)
     seq_len = length(tokens)
 
-    if full_logits
-        all_logits = zeros(Float32, model.config.vocab_size, seq_len)
-        for t in 1:seq_len
-            tok = tokens[t]
-            curr_pos = pos + t - 1
-            x = view(model.embed, :, tok)
-            for (i, layer) in enumerate(model.layers)
-                x = layer(x, curr_pos, model.rope, caches[i])
-            end
-            x = model.final_norm(x)
-            all_logits[:, t] = model.lm_head * x
-        end
-        return all_logits
-    else
-        # Only compute LM head for the last position
-        last_logits = Vector{Float32}(undef, model.config.vocab_size)
-        for t in 1:seq_len
-            tok = tokens[t]
-            curr_pos = pos + t - 1
-            x = view(model.embed, :, tok)
-            for (i, layer) in enumerate(model.layers)
-                x = layer(x, curr_pos, model.rope, caches[i])
-            end
-            x = model.final_norm(x)
-            if t == seq_len
-                last_logits .= model.lm_head * x
-            end
-        end
-        return reshape(last_logits, model.config.vocab_size, 1)
-    end
+ if full_logits
+ all_logits = zeros(Float32, model.config.vocab_size, seq_len)
+ for t in 1:seq_len
+ tok = tokens[t] + 1  # Convert 0-indexed token to 1-indexed Julia array index
+ curr_pos = pos + t - 1
+ x = view(model.embed, :, tok)
+ for (i, layer) in enumerate(model.layers)
+ x = layer(x, curr_pos, model.rope, caches[i])
+ end
+ x = model.final_norm(x)
+ all_logits[:, t] = model.lm_head * x
+ end
+ return all_logits
+ else
+ # Only compute LM head for the last position
+ last_logits = Vector{Float32}(undef, model.config.vocab_size)
+ for t in 1:seq_len
+ tok = tokens[t] + 1  # Convert 0-indexed token to 1-indexed Julia array index
+ curr_pos = pos + t - 1
+ x = view(model.embed, :, tok)
+ for (i, layer) in enumerate(model.layers)
+ x = layer(x, curr_pos, model.rope, caches[i])
+ end
+ x = model.final_norm(x)
+ if t == seq_len
+ last_logits .= model.lm_head * x
+ end
+ end
+ return reshape(last_logits, model.config.vocab_size, 1)
+ end
 end
 
 function reset_states_cpu!(model::QwenModelCPU)

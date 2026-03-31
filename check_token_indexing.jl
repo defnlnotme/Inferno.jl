@@ -1,21 +1,28 @@
 using Inferno
 
-_, tokenizer = load_model_cpu("tests/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
+model, tok = load_model_cpu("tests/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
 
 # Check token indexing
-println("=== Token indexing check ===")
+prompt = "The"
+tokens = Inferno.Tokenizer.encode(tok, prompt)
+println("Tokens from encode: ", tokens)
+println("Type: ", typeof(tokens))
 
-# Token 272 in 0-indexed = token 273 in 1-indexed
-# Let's check both
-println("Token 272 (0-indexed): \"", escape_string(Inferno.Tokenizer.decode(tokenizer, [272])), "\"")
-println("Token 271 (0-indexed): \"", escape_string(Inferno.Tokenizer.decode(tokenizer, [271])), "\"")
+# Check embedding matrix size
+println("\nEmbedding matrix size: ", size(model.embed))
+println("Expected: (hidden_size, vocab_size) = (1024, vocab)")
 
-# Check what the model's vocab size is
-println("\nVocab size from tokenizer: ", length(tokenizer.id_to_token))
-println("Embedding shape: (1024, 248320)")
+# Check if we're indexing correctly
+# If tokens are 1-indexed, we should use them directly
+# If tokens are 0-indexed, we need to add 1
 
-# The model has vocab_size = 248320, which includes special tokens
-# Let's check the special tokens
-println("\nSpecial tokens:")
-println("  EOS: ", tokenizer.eos_id)
-println("  BOS: ", tokenizer.bos_id)
+# The forward_cpu! uses: x = view(model.embed, :, tok)
+# This means it expects tok to be the column index
+
+# Let's test
+tok = tokens[1]
+println("\nToken value: ", tok)
+println("Embedding column $tok norm: ", round(sqrt(sum(model.embed[:, tok].^2)), digits=5))
+
+# Compare with tok+1
+println("Embedding column $(tok+1) norm: ", round(sqrt(sum(model.embed[:, tok+1].^2)), digits=5))
