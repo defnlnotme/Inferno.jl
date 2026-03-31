@@ -235,12 +235,19 @@ function load_ssm_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.Qw
     gate_proj = Float32.(extract_tensor_cpu(file, "$(prefix).attn_gate.weight"))'
     ssm_out = Float32.(extract_tensor_cpu(file, "$(prefix).ssm_out.weight"))'
     
- # Conv1d - stored as (kernel_size, out_features) in GGUF for Qwen3.5
- # We need (conv_kernel, conv_channels) for the convolution
- ssm_conv1d_raw = Float32.(extract_tensor_cpu(file, "$(prefix).ssm_conv1d.weight"))
- # GGUF stores as (kernel, channels) = (conv_kernel, conv_channels)
- # This is already the correct shape for our convolution
- ssm_conv1d = ssm_conv1d_raw
+# Conv1d - stored as (kernel_size, out_features) in GGUF for Qwen3.5
+# We need (conv_kernel, conv_channels) for the convolution
+# NOTE: Conv1d kernel is special - it's NOT transposed like weight matrices
+# because we want the kernel dimension (position 0=oldest, position 3=newest) to be preserved
+# GGUF stores as (d_conv, d_inner) in row-major order
+# We want the same shape in Julia, so we read it directly without the standard transpose
+conv_info = file.tensors["$(prefix).ssm_conv1d.weight"]
+conv_dims = Int.(conv_info.dimensions)
+conv_start = Int(file.data_offset + conv_info.offset) + 1
+conv_num_elements = Int(prod(conv_dims))
+conv_data = reinterpret(Float32, @view file.tensor_data[conv_start:conv_start+conv_num_elements*4-1]) |> collect
+# For conv1d, we do NOT transpose - just reshape to (d_conv, d_inner)
+ssm_conv1d = reshape(conv_data, conv_dims[1], conv_dims[2])
  
  # Alpha/beta weights
  # GGUF stores as (num_v_heads, hidden_size) in row-major
