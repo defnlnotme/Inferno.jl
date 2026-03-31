@@ -7,6 +7,7 @@ module ModelCPU
 using LinearAlgebra
 using Statistics
 using ..QuantsCPU
+using Printf
 
 export QwenConfigCPU, QwenModelCPU, KVCacheCPU, forward_cpu!, RMSNormCPU, MLPCPU, GatedDeltaNetCPU, FullAttentionCPU, DecoderLayerCPU, RotaryEmbeddingCPU
 export init_kv_cache_cpu, reset_states_cpu!, softmax_sample, generate_cpu, generate_stream_cpu, stream_to_stdout_cpu
@@ -849,6 +850,7 @@ function stream_to_stdout_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, d
     presence_penalty::Float32=0.0f0,
     min_p::Float32=0.0f0,
     stop_tokens::Set{Int}=Set{Int}(),
+    show_tps::Bool=false,
     io::IO=stdout)
     
     stream = generate_stream_cpu(model, prompt_tokens, decode_fn;
@@ -856,18 +858,37 @@ function stream_to_stdout_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, d
     
     generated_text = IOBuffer()
     try
+        if show_tps
+            t0 = time()
+            token_count = 0
+        end
         for token in stream
             print(io, token)
             flush(io)
             print(generated_text, token)
+            if show_tps
+                token_count += 1
+            end
         end
         println(io)
         flush(io)
+        if show_tps
+            elapsed = time() - t0
+            tps = elapsed > 0 ? token_count / elapsed : 0.0
+            @printf(io, "[t/s] %.2f tokens/s — %d tokens in %.3fs\n", tps, token_count, elapsed)
+            flush(io)
+        end
         return String(take!(generated_text))
     catch e
         if e isa InterruptException
             println(io)
             flush(io)
+            if show_tps
+                elapsed = time() - t0
+                tps = elapsed > 0 ? token_count / elapsed : 0.0
+                @printf(io, "[t/s] %.2f tokens/s — %d tokens in %.3fs\n", tps, token_count, elapsed)
+                flush(io)
+            end
             return String(take!(generated_text))
         else
             rethrow(e)

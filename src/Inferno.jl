@@ -1,5 +1,7 @@
 module Inferno
 
+using Printf
+
 # GPU backend (optional)
 try
     using oneAPI
@@ -321,6 +323,7 @@ function stream_to_stdout(model, tok, prompt::AbstractString;
     repetition_penalty=1.0,
     min_p=0.0,
     stop_token::Union{Int,Nothing}=nothing,
+    show_tps::Bool=false,
     io::IO=stdout)
     
     # Auto-select backend when not specified, prefer model type
@@ -353,13 +356,26 @@ function stream_to_stdout(model, tok, prompt::AbstractString;
 
         generated_text = IOBuffer()
         try
+            if show_tps
+                t0 = time()
+                token_count = 0
+            end
             for token in stream
                 print(io, token)
                 flush(io)
                 print(generated_text, token)
+                if show_tps
+                    token_count += 1
+                end
             end
             println(io)
             flush(io)
+            if show_tps
+                elapsed = time() - t0
+                tps = elapsed > 0 ? token_count / elapsed : 0.0
+                @printf(io, "[t/s] %.2f tokens/s — %d tokens in %.3fs\n", tps, token_count, elapsed)
+                flush(io)
+            end
             return String(take!(generated_text))
         catch e
             if e isa InterruptException
@@ -370,6 +386,12 @@ function stream_to_stdout(model, tok, prompt::AbstractString;
                 end
                 println(io)
                 flush(io)
+                if show_tps
+                    elapsed = time() - t0
+                    tps = elapsed > 0 ? token_count / elapsed : 0.0
+                    @printf(io, "[t/s] %.2f tokens/s — %d tokens in %.3fs\n", tps, token_count, elapsed)
+                    flush(io)
+                end
                 return String(take!(generated_text))
             else
                 rethrow(e)
@@ -390,7 +412,7 @@ function stream_to_stdout(model, tok, prompt::AbstractString;
         stop_tokens = stop_token === nothing ? Set{Int}() : Set([stop_token])
         return ModelCPU.stream_to_stdout_cpu(model, tok, prompt;
             max_tokens=max_tokens, temperature=temp_f32, top_p=top_p_f32, top_k=top_k,
-            presence_penalty=penalty_f32, repetition_penalty=rep_f32, min_p=min_p_f32, stop_tokens=stop_tokens, io=io)
+            presence_penalty=penalty_f32, repetition_penalty=rep_f32, min_p=min_p_f32, stop_tokens=stop_tokens, show_tps=show_tps, io=io)
     else
         error("Unsupported backend: $(backend). Use :cpu or :gpu.")
     end
