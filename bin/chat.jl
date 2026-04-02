@@ -114,11 +114,24 @@ function main()
                                               top_p=Float32(args["top-p"]))
         
         full_response = ""
+        is_tty = isa(stdout, Base.TTY)
+        if is_tty
+            print("\e[2m...\e[0m")
+            flush(stdout)
+        end
+        first_token = true
         try
             for token_text in stream
+                if first_token && is_tty
+                    print("\b\b\b\e[K")
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
+            end
+            if first_token && is_tty
+                print("\b\b\b\e[K")
             end
             println()
         catch e
@@ -197,11 +210,24 @@ function main()
                                               top_p=Float32(args["top-p"]))
                                               
         full_response = ""
+        is_tty = isa(stdout, Base.TTY)
+        if is_tty
+            print("\e[2m...\e[0m")
+            flush(stdout)
+        end
+        first_token = true
         try
             for token_text in stream
+                if first_token && is_tty
+                    print("\b\b\b\e[K")
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
+            end
+            if first_token && is_tty
+                print("\b\b\b\e[K")
             end
             println()
         catch e
