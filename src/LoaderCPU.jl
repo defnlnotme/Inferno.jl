@@ -145,11 +145,18 @@ function load_model_cpu(path::String; keep_quantized::Bool=false)
     # Load layers
     layers = ModelCPU.DecoderLayerCPU[]
     
+    is_tty = isa(stdout, Base.TTY)
     for i in 0:(config.num_hidden_layers - 1)
         layer = load_layer(file, i, config; keep_quantized=keep_quantized)
         push!(layers, layer)
-        println(" Layer $i: $(layer.is_ssm ? "SSM" : "Attention")")
+        if is_tty
+            print("\e[2m.\e[0m")
+        else
+            print(".")
+        end
+        flush(stdout)
     end
+    println()
     
     # Load final norm
     final_norm_w = Float32.(extract_tensor_cpu(file, "output_norm.weight"))
