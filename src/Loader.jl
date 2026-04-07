@@ -237,7 +237,7 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig;
     blocks = extract_sorted_blocks(file.tensors)
 
     for block in blocks
-        print(".")
+        print("\e[2m.\e[0m")
         flush(stdout)
 
         i = block.index

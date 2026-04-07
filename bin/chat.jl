@@ -101,12 +101,17 @@ function main()
     
     messages = Pair{String, String}[]
     
+    is_stdout_tty = isa(stdout, Base.TTY)
+
     # If initial prompt is given, process it first
     if args["prompt"] !== nothing
         push!(messages, "user" => args["prompt"])
         prompt_text = format_messages(args["system-prompt"], messages)
         
         print("\n\e[1;32mAssistant:\e[0m ")
+        if is_stdout_tty
+            print("\e[2m...\e[0m")
+        end
         flush(stdout)
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
                                               max_tokens=args["max-tokens"], 
@@ -114,8 +119,13 @@ function main()
                                               top_p=Float32(args["top-p"]))
         
         full_response = ""
+        is_first_token = true
         try
             for token_text in stream
+                if is_first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                    is_first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
@@ -137,6 +147,8 @@ function main()
     
     is_tty = isa(stdin, Base.TTY)
     
+    is_stdout_tty = isa(stdout, Base.TTY)
+
     # Interactive loop
     while true
         print("\e[1;36mUser:\e[0m ")
@@ -189,6 +201,9 @@ function main()
         prompt_text = format_messages(args["system-prompt"], messages)
         
         print("\e[1;32mAssistant:\e[0m ")
+        if is_stdout_tty
+            print("\e[2m...\e[0m")
+        end
         flush(stdout)
         
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
@@ -197,8 +212,13 @@ function main()
                                               top_p=Float32(args["top-p"]))
                                               
         full_response = ""
+        is_first_token = true
         try
             for token_text in stream
+                if is_first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                    is_first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
