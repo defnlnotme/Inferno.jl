@@ -141,107 +141,103 @@ end
 # Writes probabilities back into `probs[1:len, 1]`
 # Uses Float32 for exp() to prevent overflow
 function softmax_kernel!(probs, scores, len, scale)
- # Copy to CPU for computation (avoids scalar indexing on GPU)
- probs_cpu = Array(probs)
- scores_cpu = Array(scores)
+    # Use GPU-native vectorized operations to avoid CPU-GPU roundtrips
+    # Use 1D indexing to be robust to both 1D and 2D views
+    sc_view = view(scores, 1:len)
+    pr_view = view(probs, 1:len)
 
- # Compute max in Float32 for stability
- mx = Float32(maximum(scores_cpu[1:len, 1]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:len
- v = exp(Float32(scores_cpu[i, 1] * scale) - mx)
- probs_cpu[i, 1] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:len
- probs_cpu[i, 1] *= inv_s
- end
+    # Compute max in Float32 for stability (GPU reduction)
+    mx = Float32(maximum(sc_view)) * Float32(scale)
 
- # Copy back to GPU
- copyto!(probs, Float16.(probs_cpu))
- return nothing
+    # Compute exp(x - mx) on GPU
+    @. pr_view = Float16(exp(Float32(sc_view) * Float32(scale) - mx))
+
+    # Compute sum and normalize (GPU reduction)
+    s = Float32(sum(pr_view))
+    inv_s = Float16(1.0f0 / s)
+
+    @. pr_view *= inv_s
+    return nothing
 end
 
 function batched_softmax_kernel!(probs, scores, total_len, n_heads, scale)
- # Copy to CPU for computation (avoids scalar indexing on GPU)
- probs_cpu = Array(probs)
- scores_cpu = Array(scores)
+    # Use GPU-native batched operations
+    sc_view = view(scores, 1:total_len, 1:n_heads)
+    pr_view = view(probs, 1:total_len, 1:n_heads)
 
- for h in 1:n_heads
- mx = Float32(maximum(scores_cpu[1:total_len, h]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:total_len
- v = exp(Float32(scores_cpu[i, h] * scale) - mx)
- probs_cpu[i, h] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:total_len
- probs_cpu[i, h] *= inv_s
- end
- end
+    # Batch maximum (dim=1) - GPU reduction
+    mxs = maximum(sc_view, dims=1)
 
- # Copy back to GPU
- copyto!(probs, Float16.(probs_cpu))
- return nothing
+    # exp(x - mx) - GPU broadcasting
+    @. pr_view = Float16(exp(Float32(sc_view) * Float32(scale) - Float32(mxs)))
+
+    # Batch sum (dim=1) - GPU reduction
+    sums = sum(pr_view, dims=1)
+
+    # Normalize - GPU broadcasting
+    @. pr_view /= Float16(sums)
+
+    return nothing
 end
 
 # Numerically stable sigmoid using Float32 intermediate computation
 # Float16 exp() overflows/underflows for |x| > 6.5
 function sigmoid_kernel!(out, x, N)
- for i in 1:N
- # Use Float32 for exp() to avoid overflow/underflow
- x_f32 = Float32(x[i])
- sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-x_f32))
- out[i] = Float16(sigmoid_f32)
- end
- return nothing
+    # Use GPU-native vectorized broadcasting
+    o_view = view(out, 1:N)
+    x_view = view(x, 1:N)
+    @. o_view = Float16(1.0f0 / (1.0f0 + exp(-Float32(x_view))))
+    return nothing
 end
 
 # Numerically stable softplus using Float32 intermediate computation
 function softplus_kernel!(out, x, bias, N)
- for i in 1:N
- # Use Float32 for exp() to avoid overflow/underflow
- x_f32 = Float32(x[i] + bias[i])
- # Use softplus identity: log(1 + exp(x)) ≈ max(x, 0) + log(1 + exp(-|x|))
- # This is numerically stable for all x
- if x_f32 > 20.0f0
- # For large x, log(1 + exp(x)) ≈ x
- softplus_f32 = x_f32
- elseif x_f32 < -20.0f0
- # For large negative x, log(1 + exp(x)) ≈ 0
- softplus_f32 = 0.0f0
- else
- softplus_f32 = log(1.0f0 + exp(x_f32))
- end
- out[i] = Float16(softplus_f32)
- end
- return nothing
+    # Use GPU-native vectorized broadcasting
+    o_view = view(out, 1:N)
+    x_view = view(x, 1:N)
+    b_view = view(bias, 1:N)
+
+    # Numerical stability: use softplus identity log(1 + exp(x)) ≈ max(x, 0) + log(1 + exp(-|x|))
+    # Or for simplicity here with broadcasting:
+    @. o_view = Float16(begin
+        val = Float32(x_view + b_view)
+        if val > 20.0f0
+            val
+        elseif val < -20.0f0
+            0.0f0
+        else
+            log(1.0f0 + exp(val))
+        end
+    end)
+    return nothing
 end
 
 # Numerically stable SiLU (Swish) using Float32 intermediate computation
 # SiLU(x) = x * sigmoid(x)
 function silu_kernel!(out, x, N)
- for i in 1:N
- x_f32 = Float32(x[i])
- sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-x_f32))
- silu_f32 = x_f32 * sigmoid_f32
- out[i] = Float16(silu_f32)
- end
- return nothing
+    # Use GPU-native vectorized broadcasting
+    o_view = view(out, 1:N)
+    x_view = view(x, 1:N)
+    @. o_view = Float16(begin
+        v = Float32(x_view)
+        v * (1.0f0 / (1.0f0 + exp(-v)))
+    end)
+    return nothing
 end
 
 # Numerically stable SiLU gating with Float32 intermediate computation
 # SiLU_gating(z, normed) = z * sigmoid(z) * normed
 function silu_gating_kernel!(out, z, normed, N)
- for i in 1:N
- z_f32 = Float32(z[i])
- sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-z_f32))
- silu_f32 = z_f32 * sigmoid_f32 * Float32(normed[i])
- out[i] = Float16(silu_f32)
- end
- return nothing
+    # Use GPU-native vectorized broadcasting
+    o_view = view(out, 1:N)
+    z_view = view(z, 1:N)
+    n_view = view(normed, 1:N)
+    @. o_view = Float16(begin
+        v = Float32(z_view)
+        sig = 1.0f0 / (1.0f0 + exp(-v))
+        v * sig * Float32(n_view)
+    end)
+    return nothing
 end
 
 # --- SiLU ---
@@ -438,34 +434,25 @@ function MLP(index::Int, gate_weight, up_weight, down_weight)
 end
 
 function (m::MLP)(x::oneMatrix{Float16}, cache::KVCache)
- # GPU path - use numerically stable SiLU with Float32 intermediate
- mul!(cache.mlp_gate, m.gate_weight, x)
- mul!(cache.mlp_up, m.up_weight, x)
- 
- # Numerically stable SiLU: gate * sigmoid(gate)
- # Use Float32 for exp() to avoid overflow/underflow
- gate_cpu = Array(cache.mlp_gate)
- up_cpu = Array(cache.mlp_up)
- 
- # Apply SiLU in Float32 for numerical stability
- @. gate_cpu = gate_cpu * (Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_cpu))))
- gate_cpu .*= up_cpu
- 
- # Copy back to GPU
- copyto!(cache.mlp_gate, Float16.(gate_cpu))
- mul!(cache.branch_out, m.down_weight, cache.mlp_gate)
+    # GPU path - use numerically stable SiLU with Float32 intermediate
+    mul!(cache.mlp_gate, m.gate_weight, x)
+    mul!(cache.mlp_up, m.up_weight, x)
 
- return cache.branch_out
+    # Numerically stable SiLU: gate * sigmoid(gate) * up
+    # Use Float32 for exp() to avoid overflow/underflow, all on GPU
+    @. cache.mlp_gate = Float16(Float32(cache.mlp_gate) * (1.0f0 / (1.0f0 + exp(-Float32(cache.mlp_gate)))) * Float32(cache.mlp_up))
+
+    mul!(cache.branch_out, m.down_weight, cache.mlp_gate)
+    return cache.branch_out
 end
 
 function (m::MLP)(x::oneMatrix{Float16})
- # Numerically stable SiLU using Float32 intermediate
- g = Array(mat_mul(m.gate_weight, x))
- u = Array(mat_mul(m.up_weight, x))
- # SiLU: g * sigmoid(g) in Float32
- @. g = g * (Float32(1.0) / (Float32(1.0) + exp(-Float32(g))))
- g .*= u
- return mat_mul(m.down_weight, oneArray(Float16.(g)))
+    # Numerically stable SiLU using Float32 intermediate, all on GPU
+    g = mat_mul(m.gate_weight, x)
+    u = mat_mul(m.up_weight, x)
+    # SiLU: g * sigmoid(g) * u in Float32
+    @. g = Float16(Float32(g) * (1.0f0 / (1.0f0 + exp(-Float32(g)))) * Float32(u))
+    return mat_mul(m.down_weight, g)
 end
 
 function reset_states!(m::MLP)
@@ -661,11 +648,10 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
         q_rope = rope(q_2d, pos)
         k_rope = rope(k_2d, pos)
 
- # 4. Gate (applied AFTER attention, not to Q)
- gate_raw_cpu = Array(gate_raw)
- @. gate_raw_cpu = Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_raw_cpu))) # sigmoid
- gate_sigmoid = oneArray(Float16.(gate_raw_cpu))
- q_gated = q_rope
+        # 4. Gate (applied AFTER attention, not to Q)
+        # Apply sigmoid on GPU in Float32 for numerical stability
+        gate_sigmoid = @. Float16(1.0f0 / (1.0f0 + exp(-Float32(gate_raw))))
+        q_gated = q_rope
 
     elseif m.architecture == :phi3
         # Packed QKV
@@ -736,50 +722,42 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
         combined .*= gate_sigmoid
         result = mat_mul!(m.decode_wo_buf, m.wo, combined)
 
- else
- # Prefill path
- q_final = reshape(q_gated, hd, m.n_heads, seq)
- combined_all = zeros(T, hd * m.n_heads, seq)
+    else
+        # Prefill path
+        q_final = reshape(q_gated, hd, m.n_heads, seq)
 
- for h in 1:m.n_heads
- kh = div(h - 1, gqa_ratio) + 1
- for s in 1:seq
- q_v = @view q_final[:, h, s]
- K_v = @view K_cache[:, kh, 1:(pos+s)]
- V_v = @view V_cache[:, kh, 1:(pos+s)]
+        # Vectorized prefill path on GPU
+        # NOTE: This still uses a loop over heads and positions for simplicity,
+        # but we use GPU-native operations inside.
+        combined = oneArray{T}(undef, hd * m.n_heads, seq)
+        fill!(combined, zero(T))
 
- # Use Float32 for attention scores to prevent overflow
- scores = zeros(Float32, pos + s)
- for i in 1:(pos+s)
- dot = Float32(0.0)
- for d in 1:hd
- dot += Float32(K_v[d, i]) * Float32(q_v[d])
- end
- scores[i] = dot * scale
- end
+        for h in 1:m.n_heads
+            kh = div(h - 1, gqa_ratio) + 1
+            for s in 1:seq
+                q_v = view(q_final, :, h, s)
+                K_v = view(K_cache, :, kh, 1:(pos+s))
+                V_v = view(V_cache, :, kh, 1:(pos+s))
 
- # Stable softmax in Float32
- mx = maximum(scores)
- sum_exp = Float32(0.0)
- for i in 1:(pos+s)
- scores[i] = exp(scores[i] - mx)
- sum_exp += scores[i]
- end
- scores ./= sum_exp
+                # Use Float32 for attention scores to prevent overflow (GPU dot products)
+                # This is still O(seq^2) but kept on GPU
+                sc_v = view(m.prefill_scores, 1:(pos+s), h)
+                mat_mul_AT_B!(reshape(sc_v, :, 1), K_v, reshape(q_v, :, 1))
+                sc_v .*= scale
 
- for d in 1:hd
- val = T(0.0)
- for i in 1:(pos+s)
- val += V_v[d, i] * T(scores[i])
- end
- combined_all[(h-1)*hd+d, s] = val
- end
- end
- end
- combined = oneArray(combined_all)
- combined .*= gate_sigmoid
- result = mat_mul(m.wo, combined)
- end
+                # Stable softmax on GPU
+                pb_v = view(m.prefill_pb, 1:(pos+s), h)
+                softmax_kernel!(pb_v, sc_v, pos + s, T(1.0))
+
+                # Weighted sum of V on GPU
+                out_v = view(combined, (h-1)*hd+1:h*hd, s:s)
+                mul!(out_v, V_v, pb_v)
+            end
+        end
+
+        combined .*= gate_sigmoid
+        result = mat_mul(m.wo, combined)
+    end
 
  return result
 end
