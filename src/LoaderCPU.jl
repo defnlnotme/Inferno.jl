@@ -8,19 +8,75 @@ using ..GGUF
 using ..Dequant
 using ..QuantsCPU
 using ..Tokenizer
+using ..Safetensors: load_safetensors_model
 
-export load_model_cpu
+export load_model_cpu, detect_model_format
 
 # Union type for weight matrices (either Float32 or quantized)
 const WeightMatrix = Union{Matrix{Float32}, Q4_K_Matrix, Q5_K_Matrix, Q6_K_Matrix, Q8_0_Matrix}
+
+"""
+ detect_model_format(path) -> Symbol
+
+Detect whether the path points to a GGUF file, safetensors directory, or safetensors file.
+Returns :gguf, :safetensors, or :unknown.
+"""
+function detect_model_format(path::String)
+ if isfile(path)
+ # It's a file - check extension
+ _, ext = splitext(path)
+ if lowercase(ext) == ".gguf"
+ return :gguf
+ elseif occursin("safetensors", lowercase(path))
+ return :safetensors
+ else
+ return :unknown
+ end
+ elseif isdir(path)
+ # It's a directory - check for safetensors files or GGUF files
+ files = readdir(path)
+ safetensors_files = filter(f -> occursin("safetensors", lowercase(f)) && endswith(lowercase(f), ".safetensors"), files)
+ gguf_files = filter(f -> endswith(lowercase(f), ".gguf"), files)
+ 
+ if !isempty(safetensors_files)
+ return :safetensors
+ elseif !isempty(gguf_files)
+ return :gguf
+ else
+ # Check for config.json (indicates HuggingFace format)
+ if any(f -> lowercase(f) == "config.json", files)
+ return :safetensors
+ end
+ return :unknown
+ end
+ else
+ return :unknown
+ end
+end
+
+# Helper to get outer dimension of weight matrix (works for both Float32 and quantized)
+weight_outer_dim(w::Matrix{Float32}) = size(w, 1)
+weight_outer_dim(w::Q4_K_Matrix) = w.outer_dim
+weight_outer_dim(w::Q5_K_Matrix) = w.outer_dim
+weight_outer_dim(w::Q6_K_Matrix) = w.outer_dim
+weight_outer_dim(w::Q8_0_Matrix) = w.outer_dim
+
+weight_inner_dim(w::Matrix{Float32}) = size(w, 2)
+weight_inner_dim(w::Q4_K_Matrix) = w.inner_dim
+weight_inner_dim(w::Q5_K_Matrix) = w.inner_dim
+weight_inner_dim(w::Q6_K_Matrix) = w.inner_dim
+weight_inner_dim(w::Q8_0_Matrix) = w.inner_dim
 
 """
 Extract tensor data, optionally keeping quantized format.
 Set `keep_quantized=true` to preserve quantized weights.
 """
 function extract_tensor_cpu(file::GGUF.GGUFFile, info::GGUF.TensorInfo; keep_quantized::Bool=false)
-    num_elements = Int(prod(info.dimensions))
-    start = Int(file.data_offset + info.offset) + 1
+ num_elements = Int(prod(info.dimensions))
+ # NOTE: file.tensor_data starts at byte file.data_offset in the GGUF file
+ # The tensor offset is relative to the data section start
+ # So: tensor_data[info.offset+1] = file byte file.data_offset + info.offset
+ start = Int(file.data_offset + info.offset) + 1
     
     dims = Tuple(Int.(info.dimensions))
     inner = dims[1]
@@ -79,8 +135,10 @@ function extract_tensor_cpu(file::GGUF.GGUFFile, info::GGUF.TensorInfo; keep_qua
         Dequant.dequantize_q2_k(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_Q3_K
         Dequant.dequantize_q3_k(@view(file.tensor_data[start:end]), num_elements)
-    elseif info.type == GGUF.GGML_TYPE_Q6_K
-        Dequant.dequantize_q6_k(@view(file.tensor_data[start:end]), num_elements)
+  elseif info.type == GGUF.GGML_TYPE_Q6_K
+ num_blocks = num_elements ÷ 256
+ data_size = num_blocks * QuantsCPU.Q6_K_BLOCK_SIZE
+ Dequant.dequantize_q6_k(collect(@view file.tensor_data[start:start+data_size-1]), num_elements)
     else
         @warn "Unhandled type, zeroing" type = info.type
         zeros(Float32, num_elements)
@@ -89,9 +147,17 @@ function extract_tensor_cpu(file::GGUF.GGUFFile, info::GGUF.TensorInfo; keep_qua
  if length(dims) > 2
  return reshape(data, dims)
  else
- # GGUF stores data in row-major order, Julia uses column-major
- # So we need to reshape with dimensions reversed, then transpose
- return reshape(data, outer, inner)'
+ # GGUF stores data as [inner][outer] where inner varies fastest
+ # For weight matrices, we typically want (outer, inner) for mat-vec mul
+ # But embeddings and norms should stay as (inner, outer)
+ # Check if this looks like a weight matrix (usually has names like "weight")
+ # Embedding matrices and special tensors should not be transposed
+ if length(dims) == 2
+ # For now, try without transpose and see what breaks
+ return reshape(data, inner, outer)
+ else
+ return reshape(data, dims)
+ end
  end
 end
 
@@ -105,8 +171,45 @@ function extract_tensor_cpu(file::GGUF.GGUFFile, name::String)
 end
 
 function load_model_cpu(path::String; keep_quantized::Bool=false)
-    # Load GGUF file
-    file = GGUF.read_gguf(path)
+ # Detect format
+ fmt = detect_model_format(path)
+ 
+ if fmt == :safetensors
+ # Load from safetensors
+ return load_safetensors_model(path)
+ elseif fmt == :gguf
+ # If path is a directory, find the GGUF file
+ original_path = path
+ if isdir(path)
+ files = readdir(path)
+ gguf_files = filter(f -> endswith(lowercase(f), ".gguf"), files)
+ if isempty(gguf_files)
+ error("No GGUF files found in directory: $path")
+ end
+ # Prefer F32 or F16 over quantized versions
+ preferred = ["F32.gguf", "F16.gguf", "BF16.gguf"]
+ selected_file = nothing
+ for pref in preferred
+ matches = filter(f -> occursin(pref, f), gguf_files)
+ if !isempty(matches)
+ selected_file = matches[1]
+ break
+ end
+ end
+ if selected_file === nothing
+ # Use first GGUF file
+ selected_file = gguf_files[1]
+ end
+ path = joinpath(original_path, selected_file)
+ end
+ else
+ error("Unknown model format for path: $path")
+ end
+ 
+ println("Loading GGUF: $path")
+ 
+ # Load GGUF file
+ file = GGUF.read_gguf(path)
     
     # Get config
     config = get_config(file)
@@ -211,14 +314,14 @@ function load_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenCo
     post_norm_w = Float32.(extract_tensor_cpu(file, "$(prefix).post_attention_norm.weight"))
     post_norm = ModelCPU.RMSNormCPU(post_norm_w, config.rms_norm_eps)
     
-    # Check if SSM layer - it has ssm_a tensor
-    is_ssm = haskey(file.tensors, "$(prefix).ssm_a")
-    
-    if is_ssm
-        op = load_ssm_layer(file, layer_idx, config)
-    else
-        op = load_attention_layer(file, layer_idx, config)
-    end
+ # Check if SSM layer - it has ssm_a tensor
+ is_ssm = haskey(file.tensors, "$(prefix).ssm_a")
+ 
+ if is_ssm
+ op = load_ssm_layer(file, layer_idx, config; keep_quantized=keep_quantized)
+ else
+ op = load_attention_layer(file, layer_idx, config)
+ end
     
  # Load MLP
  mlp = load_mlp(file, layer_idx, config; keep_quantized=keep_quantized)
@@ -226,35 +329,45 @@ function load_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenCo
  return ModelCPU.DecoderLayerCPU(in_norm, op, post_norm, mlp, is_ssm)
  end
 
-function load_ssm_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU)
-    prefix = "blk.$(layer_idx)"
-    
-    # Load weights - note: GGUF stores as (out_features, in_features), we need to transpose
-    # attn_qkv.weight is the combined Q,K,V projection (also used as input projection for SSM)
-    in_proj = Float32.(extract_tensor_cpu(file, "$(prefix).attn_qkv.weight"))'
-    gate_proj = Float32.(extract_tensor_cpu(file, "$(prefix).attn_gate.weight"))'
-    ssm_out = Float32.(extract_tensor_cpu(file, "$(prefix).ssm_out.weight"))'
-    
-# Conv1d - stored as (kernel_size, out_features) in GGUF for Qwen3.5
-# We need (conv_kernel, conv_channels) for the convolution
-# NOTE: Conv1d kernel is special - it's NOT transposed like weight matrices
-# because we want the kernel dimension (position 0=oldest, position 3=newest) to be preserved
-# GGUF stores as (d_conv, d_inner) in row-major order
-# We want the same shape in Julia, so we read it directly without the standard transpose
-conv_info = file.tensors["$(prefix).ssm_conv1d.weight"]
-conv_dims = Int.(conv_info.dimensions)
-conv_start = Int(file.data_offset + conv_info.offset) + 1
-conv_num_elements = Int(prod(conv_dims))
-conv_data = reinterpret(Float32, @view file.tensor_data[conv_start:conv_start+conv_num_elements*4-1]) |> collect
-# For conv1d, we do NOT transpose - just reshape to (d_conv, d_inner)
-ssm_conv1d = reshape(conv_data, conv_dims[1], conv_dims[2])
+function load_ssm_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU; keep_quantized::Bool=false)
+ prefix = "blk.$(layer_idx)"
  
- # Alpha/beta weights
- # GGUF stores as (num_v_heads, hidden_size) in row-major
- # Julia reads this as (hidden_size, num_v_heads) due to column-major reshape
- # We need to transpose back to (num_v_heads, hidden_size) for the matmul
- ssm_alpha_weight = permutedims(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_alpha.weight")))
- ssm_beta_weight = permutedims(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_beta.weight")))
+ # Get tensor info for weight type checking
+ in_proj_info = file.tensors["$(prefix).attn_qkv.weight"]
+ gate_info = file.tensors["$(prefix).attn_gate.weight"]
+ ssm_out_info = file.tensors["$(prefix).ssm_out.weight"]
+ 
+ # Load weights - note: GGUF stores as (out_features, in_features), we need to transpose
+ # For quantized weights, we keep them quantized and handle transpose in multiplication
+ 
+ if keep_quantized && in_proj_info.type in (GGUF.GGML_TYPE_Q4_K, GGUF.GGML_TYPE_Q5_K, 
+ GGUF.GGML_TYPE_Q6_K, GGUF.GGML_TYPE_Q8_0)
+ # Load quantized weights - no transpose needed, handled in multiplication
+ in_proj = extract_tensor_cpu(file, in_proj_info; keep_quantized=true)
+ gate_proj = extract_tensor_cpu(file, gate_info; keep_quantized=true)
+ ssm_out = extract_tensor_cpu(file, ssm_out_info; keep_quantized=true)
+    else
+        # Dequantize and transpose
+        in_proj = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).attn_qkv.weight"))')
+        gate_proj = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).attn_gate.weight"))')
+        ssm_out = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_out.weight"))')
+    end
+    
+# Conv1d - GGUF stores as (K, C) = (4, 6144) row-major
+# Python uses (C, K) = (6144, 4) for access as [:, k]
+# We need transpose to match: Julia ssm_conv1d' should give (C, K)
+ssm_conv1d_raw = extract_tensor_cpu(file, "$(prefix).ssm_conv1d.weight")
+# After extract_tensor_cpu, raw is (K, C) = (4, 6144)
+# We need to transpose to (C, K) = (6144, 4) to match Python
+ssm_conv1d = Matrix{Float32}(ssm_conv1d_raw')  # Transpose to (6144, 4) = (C, K)
+ 
+# Alpha/beta weights
+# GGUF stores as (num_v_heads, hidden_size) in row-major
+# Julia reads as (hidden_size, num_v_heads) due to column-major - this is what we want
+# Forward pass expects (hidden, heads) for: ssm_alpha_weight' * x -> (heads,)
+ssm_alpha_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_alpha.weight")))
+# Keep as (hidden, heads) - no transpose needed
+ssm_beta_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_beta.weight")))
     
     # SSM parameters - ssm_a is a tensor, not a bias
     ssm_a = Float32.(vec(extract_tensor_cpu(file, "$(prefix).ssm_a")))
@@ -263,28 +376,30 @@ ssm_conv1d = reshape(conv_data, conv_dims[1], conv_dims[2])
     # SSM norm
     ssm_norm_w = Float32.(extract_tensor_cpu(file, "$(prefix).ssm_norm.weight"))
     ssm_norm = ModelCPU.RMSNormCPU(ssm_norm_w, config.rms_norm_eps)
-    
-    # Dimensions - need to get from model
-    # For Qwen3.5-0.8B: d_inner = 2048, num_v_heads = 16, num_k_heads = 16
-    # head_k_dim = 128, head_v_dim = 128
-    num_v_heads = length(ssm_a)
-    num_k_heads = num_v_heads  # same for Qwen3.5
-    d_inner = size(gate_proj, 1)
-    head_v_dim = d_inner ÷ num_v_heads
-    head_k_dim = size(ssm_alpha_weight, 1) ÷ num_k_heads  # Actually need to check this
-    
- # conv_channels = d_inner + 2 * num_k_heads * head_k_dim
- conv_channels = size(in_proj, 1)
- conv_kernel = size(ssm_conv1d, 1) # After transpose: (kernel, channels)
+ 
+ # Dimensions - need to get from model
+ # For Qwen3.5-0.8B: d_inner = 2048, num_v_heads = 16, num_k_heads = 16
+ # head_k_dim = 128, head_v_dim = 128
+ num_v_heads = length(ssm_a)
+ num_k_heads = num_v_heads # same for Qwen3.5
+ 
+ # Get dimensions - handle both Float32 and quantized weights
+ d_inner = weight_outer_dim(gate_proj)
+ head_v_dim = d_inner ÷ num_v_heads
+ head_k_dim = size(ssm_alpha_weight, 1) ÷ num_k_heads # Actually need to check this
+ 
+# conv_channels = d_inner + 2 * num_k_heads * head_k_dim
+    conv_channels = weight_outer_dim(in_proj) # 6144 (C)
+    conv_kernel = size(ssm_conv1d, 2) # 4 (K)
     
     # Recompute head_k_dim from conv_channels
     # conv_channels = d_inner + 2 * num_k_heads * head_k_dim
     # head_k_dim = (conv_channels - d_inner) / (2 * num_k_heads)
     head_k_dim = (conv_channels - d_inner) ÷ (2 * num_k_heads)
     
-    # State buffers
-    conv_state = zeros(Float32, conv_channels, conv_kernel)
-    h = zeros(Float32, head_v_dim, head_k_dim, num_v_heads)
+ # State buffers
+ conv_state = zeros(Float32, conv_channels, conv_kernel)
+ h = zeros(Float32, head_v_dim, head_k_dim, num_v_heads) # Per-group states
     
     return ModelCPU.GatedDeltaNetCPU(
         layer_idx + 1,

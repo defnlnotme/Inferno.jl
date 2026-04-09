@@ -66,11 +66,11 @@ function (norm::RMSNormCPU)(x::AbstractArray{Float32})
 end
 
 function rmsnorm_cpu!(out::AbstractArray{Float32}, x::AbstractArray{Float32}, norm::RMSNormCPU)
- ss = mapreduce(abs2, +, x)
- m = ss / length(x)
- scale = 1.0f0 / sqrt(m + norm.eps)
- out .= x .* scale .* norm.weight
- return out
+    # Using sum(abs2, x) is generally faster and more stable in Julia for this size
+    ss = sum(abs2, x)
+    scale = 1.0f0 / sqrt(ss / length(x) + norm.eps)
+    out .= x .* scale .* norm.weight
+    return out
 end
 
 # --- Rotary Position Embedding ---
@@ -138,20 +138,9 @@ struct MLPCPU
     down_weight::QuantOrFloat32  # (intermediate, hidden)
 end
 
-# MLP call for Float32 weights
-function (mlp::MLPCPU)(x::Vector{Float32}) where {T<:Matrix{Float32}}
-    # Gate with SiLU
-    gate = mlp.gate_weight * x
-    @. gate = gate * (1.0f0 / (1.0f0 + exp(-gate))) # SiLU
-    
-    # Up projection
-    up = mlp.up_weight * x
-    
-    # Element-wise multiply
-    hidden = gate .* up
-    
-    # Down projection
-    return mlp.down_weight * hidden
+# MLP call - uses generic forward that handles both Float32 and quantized weights
+function (mlp::MLPCPU)(x::Vector{Float32})
+ return mlp_forward(mlp, x)
 end
 
 # Helper: multiply quantized matrix by vector (row-wise)
@@ -296,13 +285,13 @@ end
 
 # --- GatedDeltaNet (SSM) ---
 struct GatedDeltaNetCPU
-    index::Int
-    
-    # Weight matrices (GGUF stores (out, in) row-major; reshape+transpose → Julia (in, out))
-    in_proj::Matrix{Float32}     # (hidden, conv_channels)   — projects to Q+K+V
-    gate_proj::Matrix{Float32}   # (hidden, d_inner)         — SiLU gate
-    ssm_out::Matrix{Float32}     # (d_inner, hidden)         — output projection
-    ssm_conv1d::Matrix{Float32}  # (conv_kernel, conv_channels) — no transpose, stored as-is
+ index::Int
+ 
+ # Weight matrices (can be Float32 or quantized)
+ in_proj::QuantOrFloat32 # (hidden, conv_channels) — projects to Q+K+V
+ gate_proj::QuantOrFloat32 # (hidden, d_inner) — SiLU gate
+ ssm_out::QuantOrFloat32 # (d_inner, hidden) — output projection
+    ssm_conv1d::Matrix{Float32} # (conv_kernel, conv_channels) — transpose for column access
     
     # Alpha/beta projections (GGUF (heads, hidden) → Julia (hidden, heads) after reshape)
     ssm_alpha_weight::Matrix{Float32}  # (hidden, num_v_heads)
@@ -318,25 +307,25 @@ struct GatedDeltaNetCPU
     num_k_heads::Int
     head_k_dim::Int
     head_v_dim::Int
-    d_inner::Int
-    conv_channels::Int
-    conv_kernel::Int
-    
-    # State buffers
-    conv_state::Matrix{Float32}
-    h::Array{Float32,3}
+ d_inner::Int
+ conv_channels::Int
+ conv_kernel::Int
+ 
+ # State buffers
+ conv_state::Matrix{Float32}
+ h::Array{Float32,3}  # Per-group states: (head_v_dim, head_k_dim, num_v_heads)
 end
 
 function reset_states_cpu!(m::GatedDeltaNetCPU)
-    fill!(m.conv_state, 0.0f0)
-    fill!(m.h, 0.0f0)
-    return nothing
+ fill!(m.conv_state, 0.0f0)
+ fill!(m.h, 0.0f0)
+ return nothing
 end
 
 function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddingCPU, cache::KVCacheCPU)
-    # 1. Input projections
-    qkv = m.in_proj * x
-    z = m.gate_proj * x
+ # 1. Input projections (supports both Float32 and quantized weights)
+ qkv = ssm_mat_vec_mul(m.in_proj, x)
+ z = ssm_mat_vec_mul(m.gate_proj, x)
     
     # 2. Update conv state (ring buffer)
     if m.conv_kernel > 1
@@ -344,12 +333,16 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
     end
     m.conv_state[:, m.conv_kernel] .= qkv
     
-    # 3. Compute convolution - x_conv[c] = sum_k conv_state[c,k] * ssm_conv1d[k,c]
-    # Using BLAS dot product for each channel (diagonal of matrix product)
-    x_conv = Vector{Float32}(undef, m.conv_channels)
-    for c in 1:m.conv_channels
-        x_conv[c] = dot(view(m.conv_state, c, :), view(m.ssm_conv1d, :, c))
-    end
+ # 3. Compute convolution - x_conv[c] = sum_k conv_state[c,k] * ssm_conv1d[c,k]
+ # ssm_conv1d is stored as (conv_channels, conv_kernel) = (C, K)
+ # conv_state is (conv_channels, conv_kernel) = (C, K)
+ x_conv = Vector{Float32}(undef, m.conv_channels)
+ for c in 1:m.conv_channels
+ # Dot product of the channel's history and the kernel's weights for that channel
+ # conv_state[c, :] is (conv_kernel,) - the history for channel c
+ # ssm_conv1d[c, :] is (conv_kernel,) - the conv kernel weights for channel c
+ x_conv[c] = dot(view(m.conv_state, c, :), view(m.ssm_conv1d, c, :))
+ end
     
     # 4. SiLU activation
     @. x_conv = x_conv * (1.0f0 / (1.0f0 + exp(-x_conv)))
@@ -360,77 +353,114 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
     k_all = reshape(view(x_conv, qk_size+1:2*qk_size), m.head_k_dim, m.num_k_heads)
     v_all = reshape(view(x_conv, 2*qk_size+1:2*qk_size+m.d_inner), m.head_v_dim, m.num_v_heads)
     
-    # 6. Alpha/beta projections
-    alpha_proj = m.ssm_alpha_weight * x
-    beta_proj = m.ssm_beta_weight * x
+ # 6. Alpha/beta projections
+ # ssm_alpha_weight is (hidden, num_v_heads), need transpose for mat-vec mul
+ alpha_proj = m.ssm_alpha_weight' * x
+ beta_proj = m.ssm_beta_weight' * x
     
-    # 7. Process each head (delta net)
-    y_all = zeros(Float32, m.d_inner)
-    scale = 1.0f0 / sqrt(Float32(m.head_k_dim))
-    
-    for h in 1:m.num_v_heads
-        g = ((h - 1) % m.num_k_heads) + 1
-        
-        qg = view(q_all, :, g)
-        kg = view(k_all, :, g)
-        vg = view(v_all, :, h)
-        
-        # Q/K L2 normalization
-  q_norm = sqrt(sum(abs2, qg) + m.ssm_norm.eps)
-  k_norm = sqrt(sum(abs2, kg) + m.ssm_norm.eps)
-        
-        q_normalized = qg ./ q_norm .* scale
-        k_normalized = kg ./ k_norm
-        
-        # Gate values with numerical stability
-        alpha_val = clamp(Float64(alpha_proj[h]) + Float64(m.ssm_dt_bias[h]), -20.0, 20.0)
-        softplus_alpha = log(1.0 + exp(alpha_val))
-        softplus_alpha = clamp(softplus_alpha, -10.0, 10.0)
-        
-        decay = Float32(exp(softplus_alpha * Float64(m.ssm_a[h])))
-        decay = clamp(decay, 0.0f0, 1.0f0)
-        
-        beta_val = clamp(Float64(beta_proj[h]), -20.0, 20.0)
-        beta = Float32(1.0 / (1.0 + exp(-beta_val)))
-        
- # State operations
+# 7. Process each head (delta net) - per-group states
+y_all = zeros(Float32, m.d_inner)
+
+eps = 1.0f-6
+
+for h in 1:m.num_v_heads
+ g = ((h - 1) % m.num_k_heads) + 1
+
+ qg = view(q_all, :, g)
+ kg = view(k_all, :, g)
+ vg = view(v_all, :, h)
+
+ # Apply scale factor (llama.cpp uses 1/sqrt(head_k_dim))
+ scale = 1.0f0 / sqrt(Float32(m.head_k_dim))
+
+ # L2 normalize q and k (as per llama.cpp ggml_l2_norm)
+ q_norm = Float32(norm(qg))
+ k_norm = Float32(norm(kg))
+ q_normalized = qg ./ (q_norm + eps) .* scale
+ k_normalized = kg ./ (k_norm + eps)
+
+ # Gate values
+ alpha_val = clamp(Float64(alpha_proj[h]) + Float64(m.ssm_dt_bias[h]), -20.0, 20.0)
+ softplus_alpha = log(1.0 + exp(alpha_val))
+ decay = Float32(exp(softplus_alpha * Float64(m.ssm_a[h])))
+ # Note: llama.cpp does NOT clamp decay to [0,1], it uses exp(gate) directly
+
+ beta_val = clamp(Float64(beta_proj[h]), -20.0, 20.0)
+ beta_gate = Float32(1.0 / (1.0 + exp(-beta_val)))
+
+ # State operations (DeltaNet autoregressive)
+ # state: [head_v_dim, head_v_dim] = [128, 128]
  state = view(m.h, :, :, h)
+ 
+ # Decay: state *= exp(gate)
  state .*= decay
  
- # Compute sk = sum_rows(state * k) where k is broadcast along columns
- # In ggml: sk = sum_rows(s * k) = sum_i state[i,j] * k[i] for each j
- # sk[j] = sum_i state[i,j] * k[i]
- sk = k_normalized' * state  # This gives a row vector [1, S_v]
+ # sk = sum_rows(state * k)
+ # In Julia: state is [S_v, S_v], k is [S_k,]
+ # We compute: sk_j = sum_i(state[i,j] * k[i])
+ # This is: state' * k (transpose state, then multiply)
+ sk = state' * k_normalized  # [S_v, S_v]' * [S_v,] = [S_v,]
  
- # d = beta * (v - sk') where sk' is [S_v, 1]
- # In llama.cpp: d = (v - sk') * beta where v and sk' are column vectors
- d = beta .* (vg .- vec(sk))  # sk is row vector, we need element-wise with v
+ # d = beta * (v - sk)
+ d = beta_gate .* (vg .- sk)
  
- # State update: state += k * d' where k is broadcast
- # state[i,j] += k[i] * d[j]
- # This is: state += k * d' (outer product with k as column, d' as row)
- BLAS.ger!(1.0f0, k_normalized, d, state)  # state += k * d'
+ # State update: S = S + k * d'
+ # This adds outer product of k and d to state
+ state .+= k_normalized .* d'  # Broadcasting: [S_v, 1] .* [1, S_v] = [S_v, S_v]
  
- # Output: o = sum_rows(state * q) = q' * state
+ # Output: y = sum_rows(state * q)
+ # In Julia: sum_i(state[i,j] * q[i]) for each j = state' * q
+ y_h = state' * q_normalized  # [S_v, S_v]' * [S_v,] = [S_v,]
  yg = view(y_all, (h-1)*m.head_v_dim+1:h*m.head_v_dim)
- mul!(yg, state', q_normalized)  # state' * q gives correct output
-    end
-    
-    # 8. Apply SSM norm (per-head normalization)
-    # y_all has shape (d_inner,) = (head_v_dim * num_v_heads,)
-    # norm is applied per-head
-    for h in 1:m.num_v_heads
-    y_h = view(y_all, (h-1)*m.head_v_dim+1:h*m.head_v_dim)
-    rmsnorm_cpu!(y_h, y_h, m.ssm_norm)
-    end
+ yg .= y_h
+end
+# End of loop
 
-    # 9. SiLU gate on z
-    # silu(z) = z * sigmoid(z) = z / (1 + exp(-z))
-    # Output: norm(y_all) * silu(z)
-    @. y_all = y_all * z * (1.0f0 / (1.0f0 + exp(-z)))
+    
+# 8. Apply SSM norm (per-head normalization)
+# y_all has shape (d_inner,) = (head_v_dim * num_v_heads,)
+# norm is applied per-head
+for h in 1:m.num_v_heads
+ y_h = view(y_all, (h-1)*m.head_v_dim+1:h*m.head_v_dim)
+ rmsnorm_cpu!(y_h, y_h, m.ssm_norm)
+end
+
+# 9. SiLU gate on z
+# silu(z) = z * sigmoid(z) = z / (1 + exp(-z))
+# Output: norm(y_all) * silu(z)
+@. y_all = y_all * z * (1.0f0 / (1.0f0 + exp(-z)))
+# Removed variance scaling as it caused looping/instability
+# y_all .*= 1.0f0 / sqrt(Float32(m.head_v_dim))
  
-    # 10. Output projection
-    return m.ssm_out * y_all
+ # 10. Output projection (supports both Float32 and quantized weights)
+ return ssm_mat_vec_mul(m.ssm_out, y_all)
+end
+
+# --- SSM Matrix-Vector Multiplication Helpers ---
+# These functions handle both Float32 and quantized weight matrices
+
+function ssm_mat_vec_mul(weight::Matrix{Float32}, x::Vector{Float32})
+ return weight * x
+end
+
+function ssm_mat_vec_mul(weight::Q4_K_Matrix, x::Vector{Float32})
+ out = Vector{Float32}(undef, weight.outer_dim)
+ return mul_quant_mat_vec(weight, x, out)
+end
+
+function ssm_mat_vec_mul(weight::Q5_K_Matrix, x::Vector{Float32})
+ out = Vector{Float32}(undef, weight.outer_dim)
+ return mul_quant_mat_vec(weight, x, out)
+end
+
+function ssm_mat_vec_mul(weight::Q6_K_Matrix, x::Vector{Float32})
+ out = Vector{Float32}(undef, weight.outer_dim)
+ return mul_quant_mat_vec(weight, x, out)
+end
+
+function ssm_mat_vec_mul(weight::Q8_0_Matrix, x::Vector{Float32})
+ out = Vector{Float32}(undef, weight.outer_dim)
+ return mul_quant_mat_vec(weight, x, out)
 end
 
 # --- Full Attention ---
@@ -465,68 +495,60 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
     k = reshape(k, attn.head_dim, attn.n_kv)
     v = reshape(v, attn.head_dim, attn.n_kv)
 
-    # Apply Q/K normalization (per-head)
-    for h in 1:attn.n_heads
-        q_h = view(query_states, :, h)
-        rmsnorm_cpu!(q_h, q_h, attn.q_norm)
-    end
-    for h in 1:attn.n_kv
-        k_h = view(k, :, h)
-        rmsnorm_cpu!(k_h, k_h, attn.k_norm)
-    end
+ # Apply Q/K normalization (per-head)
+ for h in 1:attn.n_heads
+ q_h = view(query_states, :, h)
+ rmsnorm_cpu!(q_h, q_h, attn.q_norm)
+ end
+ for h in 1:attn.n_kv
+ k_h = view(k, :, h)
+ rmsnorm_cpu!(k_h, k_h, attn.k_norm)
+ end
 
-    # Apply RoPE
-    apply_rotary_emb!(query_states, pos, rope)
-    apply_rotary_emb!(k, pos, rope)
+ # Apply RoPE
+ apply_rotary_emb!(query_states, pos, rope)
+ apply_rotary_emb!(k, pos, rope)
 
-    # Update KV cache
-    update_kv_cache!(cache, k, v, pos)
+ # Update KV cache
+ update_kv_cache!(cache, k, v, pos)
 
-    # Compute attention scores using BLAS
-    output = zeros(Float32, attn.n_heads * attn.head_dim)
+ # Compute attention scores using BLAS
+ output = zeros(Float32, attn.n_heads * attn.head_dim)
 
-    gqa_ratio = div(attn.n_heads, attn.n_kv)
-    seq_len = pos + 1
+ gqa_ratio = div(attn.n_heads, attn.n_kv)
+ seq_len = pos + 1
 
-    for h in 1:attn.n_heads
-        kv_h = div(h - 1, gqa_ratio) + 1
+ for h in 1:attn.n_heads
+ kv_h = div(h - 1, gqa_ratio) + 1
 
-        q_h = query_states[:, h]
+ q_h = query_states[:, h]
 
-        # Extract K and V for this KV head: (head_dim, seq_len)
-        K_h = view(cache.k, :, kv_h, 1:seq_len)
-        V_h = view(cache.v, :, kv_h, 1:seq_len)
+ # Extract K and V for this KV head: (head_dim, seq_len)
+ K_h = view(cache.k, :, kv_h, 1:seq_len)
+ V_h = view(cache.v, :, kv_h, 1:seq_len)
 
  # Compute scores: K' * q = (seq_len, head_dim) * (head_dim,) = (seq_len,)
  scores = K_h' * q_h
  scores .*= attn.scale
-
- # Mask out positions with zero K (uninitialized cache positions)
- # For hybrid models, positions processed by SSM layers have zero K/V
- for i in 1:length(scores)
- if all(iszero, view(K_h, :, i))
- scores[i] = -Float32(1e9)  # Large negative for softmax masking
- end
- end
 
  # Softmax
  max_score = maximum(scores)
  scores = exp.(scores .- max_score)
  scores ./= sum(scores)
 
-        # Weighted sum: V * scores = (head_dim, seq_len) * (seq_len,) = (head_dim,)
-        out_h = V_h * scores
+ # Weighted sum: V * scores = (head_dim, seq_len) * (seq_len,) = (head_dim,)
+ out_h = V_h * scores
 
-        output[(h-1)*attn.head_dim+1:h*attn.head_dim] .= out_h
-    end
+ output[(h-1)*attn.head_dim+1:h*attn.head_dim] .= out_h
+ end
 
-    # Apply sigmoid gate to attention output (gate comes from Q projection)
-    gate_sigmoid = similar(gate)
-    @. gate_sigmoid = 1.0f0 / (1.0f0 + exp(-gate))
-    output .*= gate_sigmoid
+ # Apply sigmoid gate to output (gate comes from Q projection)
+ # gate has shape (n_heads * head_dim,) = (q_size,)
+ gate_sigmoid = 1.0f0 ./ (1.0f0 .+ exp.(-gate)) # sigmoid
+ output .*= gate_sigmoid
 
-    # Output projection
-    return attn.wo * output
+ # Output projection
+ return attn.wo * output
 end
 
 # --- Decoder Layer ---
@@ -760,21 +782,22 @@ end
 ```
 """
 function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, decode_fn::Function;
-    max_tokens::Int=512,
-    temperature::Float32=1.0f0,
-    top_p::Float32=0.95f0,
-    top_k::Int=0,
-    repetition_penalty::Float32=1.0f0,
-    presence_penalty::Float32=0.0f0,
-    min_p::Float32=0.0f0,
-    stop_tokens::Set{Int}=Set{Int}())
-    
-    return Channel{String}(32) do chan
-        try
-            # Initialize caches and states using model's max position embeddings
-            cache_size = model.config.max_position_embeddings
-            caches = [init_kv_cache_cpu(model.config, cache_size) for _ in 1:model.config.num_hidden_layers]
-            reset_states_cpu!(model)
+ max_tokens::Int=512,
+ temperature::Float32=1.0f0,
+ top_p::Float32=0.95f0,
+ top_k::Int=0,
+ repetition_penalty::Float32=1.0f0,
+ presence_penalty::Float32=0.0f0,
+ min_p::Float32=0.0f0,
+ stop_tokens::Set{Int}=Set{Int}(),
+ max_context::Int=8192) # Maximum context length for KV cache
+ 
+ return Channel{String}(32) do chan
+ try
+ # Initialize caches with reasonable max_seq to avoid OOM
+ max_cache_seq = min(model.config.max_position_embeddings, max_context)
+ caches = [init_kv_cache_cpu(model.config, max_cache_seq) for _ in 1:model.config.num_hidden_layers]
+ reset_states_cpu!(model)
             
             # Track token counts for repetition/presence penalty
             token_counts = Dict{Int,Int}()
@@ -782,24 +805,32 @@ function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, de
                 token_counts[t] = get(token_counts, t, 0) + 1
             end
             
-            # Process prompt tokens
-            curr_pos = 0
-            if !isempty(prompt_tokens)
-                _ = forward_cpu!(model, prompt_tokens[1:end-1], 0, caches)
-                curr_pos = length(prompt_tokens) - 1
-                
-                # Generate first token from prompt context
-                next_token, _ = generate_cpu(model, [prompt_tokens[end]], curr_pos, caches;
-                    temperature=temperature, top_p=top_p, top_k=top_k, repetition_penalty=repetition_penalty, token_counts=token_counts, presence_penalty=presence_penalty, min_p=min_p)
-                
-                curr_pos += 1
-                token_counts[next_token] = get(token_counts, next_token, 0) + 1
-                
-                # Decode and yield
-                token_str = decode_fn([next_token])
-                put!(chan, token_str)
-                
-                last_token = next_token
+# Process prompt tokens
+curr_pos = 0
+if !isempty(prompt_tokens)
+    # Process all prompt tokens together to properly update states
+    # logits has shape (vocab_size, length(prompt_tokens))
+    logits = forward_cpu!(model, prompt_tokens, 0, caches)
+    curr_pos = length(prompt_tokens)
+
+    # The logits for the first generated token are the logits of the last prompt token
+    first_logits_vec = vec(logits[:, end])
+
+    # Apply penalties to the first token's logits
+    apply_presence_penalty!(first_logits_vec, token_counts, presence_penalty)
+    apply_repetition_penalty!(first_logits_vec, token_counts, repetition_penalty)
+
+    # Sample the first token
+    next_token = softmax_sample(first_logits_vec; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
+
+    curr_pos += 1
+    token_counts[next_token] = get(token_counts, next_token, 0) + 1
+
+    # Decode and yield
+    token_str = decode_fn([next_token])
+    put!(chan, token_str)
+
+    last_token = next_token
                 
                 # Generate remaining tokens
                 for _ in 2:max_tokens
@@ -842,19 +873,22 @@ Generate tokens and print them to stdout as they are produced.
 Returns the complete generated text as a String.
 """
 function stream_to_stdout_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, decode_fn::Function;
-    max_tokens::Int=100,
-    temperature::Float32=0.7f0,
-    top_p::Float32=0.95f0,
-    top_k::Int=20,
-    repetition_penalty::Float32=1.0f0,
-    presence_penalty::Float32=0.0f0,
-    min_p::Float32=0.0f0,
-    stop_tokens::Set{Int}=Set{Int}(),
-    show_tps::Bool=false,
-    io::IO=stdout)
-    
-    stream = generate_stream_cpu(model, prompt_tokens, decode_fn;
-        max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p, stop_tokens=stop_tokens)
+ max_tokens::Int=100,
+ temperature::Float32=0.7f0,
+ top_p::Float32=0.95f0,
+ top_k::Int=20,
+ repetition_penalty::Float32=1.0f0,
+ presence_penalty::Float32=0.0f0,
+ min_p::Float32=0.0f0,
+ stop_tokens::Set{Int}=Set{Int}(),
+ show_tps::Bool=false,
+ io::IO=stdout,
+ max_context::Int=8192)
+ 
+ stream = generate_stream_cpu(model, prompt_tokens, decode_fn;
+ max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, 
+ repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, 
+ min_p=min_p, stop_tokens=stop_tokens, max_context=max_context)
     
     generated_text = IOBuffer()
     try
