@@ -190,10 +190,14 @@ function load_safetensors_model(model_path::String)
  end
  end
  end
- if in_norm_w === nothing
+if in_norm_w === nothing
  in_norm_w = ones(Float32, model_config.hidden_size)
- end
- in_norm = ModelCPU.RMSNormCPU(vec(Float32.(in_norm_w)), model_config.rms_norm_eps)
+else
+ # HuggingFace stores RMSNorm weights as (w-1), need to add 1
+ # (llama.cpp converter does this: data_torch = data_torch + 1)
+ in_norm_w = in_norm_w .+ 1.0f0
+end
+in_norm = ModelCPU.RMSNormCPU(vec(Float32.(in_norm_w)), model_config.rms_norm_eps)
  
  # Load post attention norm
  post_norm_w = nothing
@@ -205,10 +209,13 @@ function load_safetensors_model(model_path::String)
  end
  end
  end
- if post_norm_w === nothing
+if post_norm_w === nothing
  post_norm_w = ones(Float32, model_config.hidden_size)
- end
- post_norm = ModelCPU.RMSNormCPU(vec(Float32.(post_norm_w)), model_config.rms_norm_eps)
+else
+ # HuggingFace stores RMSNorm weights as (w-1), need to add 1
+ post_norm_w = post_norm_w .+ 1.0f0
+end
+post_norm = ModelCPU.RMSNormCPU(vec(Float32.(post_norm_w)), model_config.rms_norm_eps)
         
         if is_ssm
             # Load SSM/linear attention layer
@@ -230,10 +237,13 @@ function load_safetensors_model(model_path::String)
             break
         end
     end
-    if final_norm_w === nothing
-        final_norm_w = ones(Float32, model_config.hidden_size)
-    end
-    final_norm = ModelCPU.RMSNormCPU(vec(Float32.(final_norm_w)), model_config.rms_norm_eps)
+if final_norm_w === nothing
+ final_norm_w = ones(Float32, model_config.hidden_size)
+else
+ # HuggingFace stores RMSNorm weights as (w-1), need to add 1
+ final_norm_w = final_norm_w .+ 1.0f0
+end
+final_norm = ModelCPU.RMSNormCPU(vec(Float32.(final_norm_w)), model_config.rms_norm_eps)
     
     println("\nFinal norm weight mean: ", sum(final_norm.weight) / length(final_norm.weight))
     
