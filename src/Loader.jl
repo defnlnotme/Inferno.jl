@@ -236,8 +236,13 @@ function load_weights(file::GGUF.GGUFFile, config::Model.QwenConfig;
     layers = Model.DecoderLayer[]
     blocks = extract_sorted_blocks(file.tensors)
 
+    is_stdout_tty = isa(stdout, Base.TTY)
     for block in blocks
-        print(".")
+        if is_stdout_tty
+            print("\e[2m.\e[0m")
+        else
+            print(".")
+        end
         flush(stdout)
 
         i = block.index
