@@ -50,7 +50,11 @@ Base.@kwdef struct QwenConfig
 end
 
 abstract type QuantMatrix end
-struct IQ2XXSMatrix <: QuantMatrix end
+struct IQ2XXSMatrix <: QuantMatrix
+    data::oneVector{UInt8}
+    inner::Int
+    outer::Int
+end
 
 function free_gpu_tables!()
 end
@@ -139,52 +143,30 @@ end
 # --- GPU Softmax Kernel ---
 # Stable softmax on a 1D slice of length `len` stored in `scores[1:len, 1]`
 # Writes probabilities back into `probs[1:len, 1]`
-# Uses Float32 for exp() to prevent overflow
+# Uses GPU-native reductions and Float32 intermediate for exp() to prevent overflow
 function softmax_kernel!(probs, scores, len, scale)
- # Copy to CPU for computation (avoids scalar indexing on GPU)
- probs_cpu = Array(probs)
- scores_cpu = Array(scores)
-
- # Compute max in Float32 for stability
- mx = Float32(maximum(scores_cpu[1:len, 1]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:len
- v = exp(Float32(scores_cpu[i, 1] * scale) - mx)
- probs_cpu[i, 1] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:len
- probs_cpu[i, 1] *= inv_s
- end
-
- # Copy back to GPU
- copyto!(probs, Float16.(probs_cpu))
- return nothing
+    sc_view = view(scores, 1:len, 1)
+    pr_view = view(probs, 1:len, 1)
+    # Use GPU-native reduction with dims=1 to keep result on device and avoid host-sync
+    mx = maximum(sc_view, dims=1)
+    # Broadcast in Float32 for numerical stability
+    @. pr_view = Float16(exp(Float32(sc_view) * Float32(scale) - Float32(mx) * Float32(scale)))
+    # Sum in Float32 for better precision
+    s = mapreduce(v -> Float32(v), +, pr_view, dims=1)
+    @. pr_view = Float16(Float32(pr_view) / Float32(s))
+    return nothing
 end
 
 function batched_softmax_kernel!(probs, scores, total_len, n_heads, scale)
- # Copy to CPU for computation (avoids scalar indexing on GPU)
- probs_cpu = Array(probs)
- scores_cpu = Array(scores)
-
- for h in 1:n_heads
- mx = Float32(maximum(scores_cpu[1:total_len, h]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:total_len
- v = exp(Float32(scores_cpu[i, h] * scale) - mx)
- probs_cpu[i, h] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:total_len
- probs_cpu[i, h] *= inv_s
- end
- end
-
- # Copy back to GPU
- copyto!(probs, Float16.(probs_cpu))
- return nothing
+    sc_view = view(scores, 1:total_len, 1:n_heads)
+    pr_view = view(probs, 1:total_len, 1:n_heads)
+    # Multi-head reduction stays on GPU
+    mx = maximum(sc_view, dims=1)
+    @. pr_view = Float16(exp(Float32(sc_view) * Float32(scale) - Float32(mx) * Float32(scale)))
+    # Sum in Float32 for better precision
+    s = mapreduce(v -> Float32(v), +, pr_view, dims=1)
+    @. pr_view = Float16(Float32(pr_view) / Float32(s))
+    return nothing
 end
 
 # Numerically stable sigmoid using Float32 intermediate computation
@@ -438,34 +420,25 @@ function MLP(index::Int, gate_weight, up_weight, down_weight)
 end
 
 function (m::MLP)(x::oneMatrix{Float16}, cache::KVCache)
- # GPU path - use numerically stable SiLU with Float32 intermediate
- mul!(cache.mlp_gate, m.gate_weight, x)
- mul!(cache.mlp_up, m.up_weight, x)
- 
- # Numerically stable SiLU: gate * sigmoid(gate)
- # Use Float32 for exp() to avoid overflow/underflow
- gate_cpu = Array(cache.mlp_gate)
- up_cpu = Array(cache.mlp_up)
- 
- # Apply SiLU in Float32 for numerical stability
- @. gate_cpu = gate_cpu * (Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_cpu))))
- gate_cpu .*= up_cpu
- 
- # Copy back to GPU
- copyto!(cache.mlp_gate, Float16.(gate_cpu))
- mul!(cache.branch_out, m.down_weight, cache.mlp_gate)
+    # GPU path - use numerically stable SiLU with Float32 intermediate
+    mul!(cache.mlp_gate, m.gate_weight, x)
+    mul!(cache.mlp_up, m.up_weight, x)
 
- return cache.branch_out
+    # Numerically stable SiLU on GPU: gate * sigmoid(gate) * up
+    # Use Float32 intermediate for exp() to avoid overflow/underflow
+    @. cache.mlp_gate = Float16(Float32(cache.mlp_gate) * (1.0f0 / (1.0f0 + exp(-Float32(cache.mlp_gate)))) * Float32(cache.mlp_up))
+
+    mul!(cache.branch_out, m.down_weight, cache.mlp_gate)
+    return cache.branch_out
 end
 
 function (m::MLP)(x::oneMatrix{Float16})
- # Numerically stable SiLU using Float32 intermediate
- g = Array(mat_mul(m.gate_weight, x))
- u = Array(mat_mul(m.up_weight, x))
- # SiLU: g * sigmoid(g) in Float32
- @. g = g * (Float32(1.0) / (Float32(1.0) + exp(-Float32(g))))
- g .*= u
- return mat_mul(m.down_weight, oneArray(Float16.(g)))
+    # Numerically stable SiLU using Float32 intermediate on GPU
+    g = mat_mul(m.gate_weight, x)
+    u = mat_mul(m.up_weight, x)
+    # SiLU: g * sigmoid(g) * u
+    @. g = Float16(Float32(g) * (1.0f0 / (1.0f0 + exp(-Float32(g)))) * Float32(u))
+    return mat_mul(m.down_weight, g)
 end
 
 function reset_states!(m::MLP)
@@ -661,11 +634,10 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
         q_rope = rope(q_2d, pos)
         k_rope = rope(k_2d, pos)
 
- # 4. Gate (applied AFTER attention, not to Q)
- gate_raw_cpu = Array(gate_raw)
- @. gate_raw_cpu = Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_raw_cpu))) # sigmoid
- gate_sigmoid = oneArray(Float16.(gate_raw_cpu))
- q_gated = q_rope
+        # 4. Gate (applied AFTER attention, not to Q)
+        # Numerically stable sigmoid on GPU using Float32 intermediate
+        gate_sigmoid = @. Float16(1.0f0 / (1.0f0 + exp(-Float32(gate_raw))))
+        q_gated = q_rope
 
     elseif m.architecture == :phi3
         # Packed QKV
