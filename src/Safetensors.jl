@@ -37,14 +37,23 @@ function parse_safetensors(path::String)
     
     for (name_sym, info) in header
         name = String(name_sym)  # Convert Symbol to String
-        if name == "__metadata__"
-            continue
-        end
-        
-        # Get tensor properties
-        dtype = get(info, :data_type, 1)  # 1 = F32, 2 = F16
-        shape = Int.(get(info, :shape, []))
-        offsets = Int.(get(info, :data_offsets, [0, 0]))
+ if name == "__metadata__"
+ continue
+ end
+ 
+ # Get tensor properties
+ dtype_str = get(info, :dtype, "F32")
+ dtype = if dtype_str == "F32"
+ 1
+ elseif dtype_str == "F16"
+ 2
+ elseif dtype_str == "BF16"
+ 3 # BF16
+ else
+ 1 # Default to F32
+ end
+ shape = Int.(get(info, :shape, []))
+ offsets = Int.(get(info, :data_offsets, [0, 0]))
         
         # Store offset relative to data section (add 1 for Julia 1-indexing)
         # The offsets in JSON are 0-indexed relative to data section start
@@ -60,26 +69,35 @@ end
 Get tensor data from safetensors file.
 """
 function get_tensor(safetensors::SafetensorsFile, name::String)
-    if !haskey(safetensors.tensors, name)
-        return nothing
-    end
-    
-    offset, dtype, shape = safetensors.tensors[name]
-    num_elements = prod(shape)
-    
-    if dtype == 1  # F32
-        bytes = safetensors.data[offset:offset + num_elements * 4 - 1]
-        data = reinterpret(Float32, bytes)
-        # Materialize the array before reshape
-        return copy(reshape(Vector{Float32}(data), shape...))
-    elseif dtype == 2  # F16
-        bytes = safetensors.data[offset:offset + num_elements * 2 - 1]
-        data16 = reinterpret(Float16, bytes)
-        data = Float32.(Vector{Float16}(data16))
-        return reshape(data, shape...)
-    else
-        error("Unsupported dtype: $dtype")
-    end
+ if !haskey(safetensors.tensors, name)
+ return nothing
+ end
+ 
+ offset, dtype, shape = safetensors.tensors[name]
+ num_elements = prod(shape)
+ 
+ if dtype == 1 # F32
+ bytes = safetensors.data[offset:offset + num_elements * 4 - 1]
+ data = reinterpret(Float32, bytes)
+ # Materialize the array before reshape
+ return copy(reshape(Vector{Float32}(data), shape...))
+ elseif dtype == 2 # F16
+ bytes = safetensors.data[offset:offset + num_elements * 2 - 1]
+ data16 = reinterpret(Float16, bytes)
+ data = Float32.(Vector{Float16}(data16))
+ return reshape(data, shape...)
+ elseif dtype == 3 # BF16
+ bytes = safetensors.data[offset:offset + num_elements * 2 - 1]
+ # BF16 is stored as 16-bit values, need to convert to Float32
+ # BF16 has same exponent format as F32, just truncated mantissa
+ # To convert: reinterpret as UInt16, shift left 16 bits, reinterpret as Float32
+ data_bf16 = reinterpret(UInt16, bytes)
+ # Each BF16 value needs to become a Float32
+ data_f32 = [reinterpret(Float32, UInt32(x) << 16) for x in data_bf16]
+ return copy(reshape(data_f32, shape...))
+ else
+ error("Unsupported dtype: $dtype")
+ end
 end
 
 """
@@ -192,12 +210,10 @@ function load_safetensors_model(model_path::String)
  end
 if in_norm_w === nothing
  in_norm_w = ones(Float32, model_config.hidden_size)
-else
- # HuggingFace stores RMSNorm weights as (w-1), need to add 1
- # (llama.cpp converter does this: data_torch = data_torch + 1)
- in_norm_w = in_norm_w .+ 1.0f0
 end
-in_norm = ModelCPU.RMSNormCPU(vec(Float32.(in_norm_w)), model_config.rms_norm_eps)
+# Qwen uses standard RMSNorm: weight directly multiplies (no +1 transform)
+# HuggingFace weights are stored as-is, not as (w-1)
+in_norm = ModelCPU.RMSNormCPU(vec(Float32.(in_norm_w) .+ 1.0f0), model_config.rms_norm_eps)
  
  # Load post attention norm
  post_norm_w = nothing
@@ -211,11 +227,9 @@ in_norm = ModelCPU.RMSNormCPU(vec(Float32.(in_norm_w)), model_config.rms_norm_ep
  end
 if post_norm_w === nothing
  post_norm_w = ones(Float32, model_config.hidden_size)
-else
- # HuggingFace stores RMSNorm weights as (w-1), need to add 1
- post_norm_w = post_norm_w .+ 1.0f0
 end
-post_norm = ModelCPU.RMSNormCPU(vec(Float32.(post_norm_w)), model_config.rms_norm_eps)
+# ModelCPU expects +1 (layernorm1p convention) - add 1 to match GGUF format
+post_norm = ModelCPU.RMSNormCPU(vec(Float32.(post_norm_w) .+ 1.0f0), model_config.rms_norm_eps)
         
         if is_ssm
             # Load SSM/linear attention layer
@@ -239,11 +253,9 @@ post_norm = ModelCPU.RMSNormCPU(vec(Float32.(post_norm_w)), model_config.rms_nor
     end
 if final_norm_w === nothing
  final_norm_w = ones(Float32, model_config.hidden_size)
-else
- # HuggingFace stores RMSNorm weights as (w-1), need to add 1
- final_norm_w = final_norm_w .+ 1.0f0
 end
-final_norm = ModelCPU.RMSNormCPU(vec(Float32.(final_norm_w)), model_config.rms_norm_eps)
+# ModelCPU expects +1 (layernorm1p convention) - add 1 to match GGUF format
+final_norm = ModelCPU.RMSNormCPU(vec(Float32.(final_norm_w) .+ 1.0f0), model_config.rms_norm_eps)
     
     println("\nFinal norm weight mean: ", sum(final_norm.weight) / length(final_norm.weight))
     
@@ -412,25 +424,26 @@ function load_ssm_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, config:
         elseif occursin("linear_attn.in_proj_z", name)
             tensor = get_tensor(sf, name)
             gate_proj = Matrix{Float32}(tensor)  # (2048, 1024) - no transpose needed
-        elseif occursin("linear_attn.in_proj_a", name)
-            tensor = get_tensor(sf, name)
-            # Safetensors stores as (num_v_heads, hidden_size) = (16, 1024)
-            # GGUF expects (hidden_size, num_v_heads) = (1024, 16)
-            # We need to transpose
-            alpha_weight = Matrix(Float32.(tensor'))  # Transpose to (hidden_size, num_v_heads)
-        elseif occursin("linear_attn.in_proj_b", name)
-            tensor = get_tensor(sf, name)
-            # Same as alpha - transpose from (num_v_heads, hidden_size) to (hidden_size, num_v_heads)
-            beta_weight = Matrix(Float32.(tensor'))
+ elseif occursin("linear_attn.in_proj_a", name)
+ tensor = get_tensor(sf, name)
+ # Safetensors stores as (num_v_heads, hidden_size) = (16, 1024)
+ # ModelCPU expects (hidden_size, num_v_heads) = (1024, 16) for: weight' * x
+ # Need to transpose
+ alpha_weight = Matrix{Float32}(tensor') # Transpose to (1024, 16)
+ elseif occursin("linear_attn.in_proj_b", name)
+ tensor = get_tensor(sf, name)
+ # Same as alpha - transpose to match ModelCPU expectation
+ beta_weight = Matrix{Float32}(tensor') # Transpose to (1024, 16)
         elseif occursin("linear_attn.out_proj", name)
             tensor = get_tensor(sf, name)
             ssm_out = Matrix{Float32}(tensor)  # (1024, 2048) - no transpose needed
  elseif occursin("linear_attn.conv1d", name)
  tensor = get_tensor(sf, name)
  # conv1d is [6144, 1, 4] in safetensors = (channels, 1, kernel_size)
- # Forward pass expects (C, K) = (channels, kernel_size) = (6144, 4)
+ # Safetensors stores as [channels, kernel_size] = [6144, 4] after squeeze
+ # ModelCPU.jl expects (channels, kernel_size) for: view(ssm_conv1d, c, :) -> (kernel_size,)
  squeezed = squeeze_middle(tensor) # (6144, 4) = (channels, kernel_size)
- ssm_conv1d = Matrix{Float32}(squeezed) # Keep as (C, K) = (6144, 4)
+ ssm_conv1d = Matrix{Float32}(squeezed) # Keep as (6144, 4) = (C, K)
         elseif occursin("linear_attn.A_log", name)
             data = get_tensor(sf, name)
             ssm_a = -exp.(Float32.(vec(data)))  # A_log stores log(-A), need -exp(A_log) = A
@@ -454,8 +467,8 @@ function load_ssm_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, config:
  head_v_dim = d_inner ÷ num_v_heads # 2048 / 16 = 128
  head_k_dim = ssm_norm_w !== nothing ? length(ssm_norm_w) : 128
  
- # Conv kernel - ssm_conv1d is (channels, kernel_size) = (6144, 4)
- conv_kernel = size(ssm_conv1d, 2) # 4
+ # Conv kernel - ssm_conv1d is (channels, kernel_size) = (6144, 4) after fix
+ conv_kernel = size(ssm_conv1d, 2) # 4 (kernel_size)
     
     # Create state buffers
     conv_state = zeros(Float32, conv_channels, conv_kernel)

@@ -395,22 +395,21 @@ for h in 1:m.num_v_heads
  # Decay: state *= exp(gate)
  state .*= decay
  
- # sk = sum_rows(state * k)
- # In Julia: state is [S_v, S_v], k is [S_k,]
- # We compute: sk_j = sum_i(state[i,j] * k[i])
- # This is: state' * k (transpose state, then multiply)
- sk = state' * k_normalized  # [S_v, S_v]' * [S_v,] = [S_v,]
+ # sk = state * k (matrix-vector multiply)
+ # state is [V, K], k is [K,], result is [V,]
+ # This computes: for each v, sum_k state[v,k] * k[k]
+ sk = state * k_normalized # [V, K] * [K,] = [V,]
  
  # d = beta * (v - sk)
  d = beta_gate .* (vg .- sk)
  
- # State update: S = S + k * d'
- # This adds outer product of k and d to state
- state .+= k_normalized .* d'  # Broadcasting: [S_v, 1] .* [1, S_v] = [S_v, S_v]
+ # State update: S = S + d * k'
+ # This adds outer product of d (V,) and k (K,) to state (V, K)
+ state .+= d .* k_normalized' # Broadcasting: [V,] .* [K,]' = [V, K]
  
- # Output: y = sum_rows(state * q)
- # In Julia: sum_i(state[i,j] * q[i]) for each j = state' * q
- y_h = state' * q_normalized  # [S_v, S_v]' * [S_v,] = [S_v,]
+ # Output: y = state * q
+ # state is [V, K], q is [K,], result is [V,]
+ y_h = state * q_normalized # [V, K] * [K,] = [V,]
  yg = view(y_all, (h-1)*m.head_v_dim+1:h*m.head_v_dim)
  yg .= y_h
 end
