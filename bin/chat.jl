@@ -76,6 +76,8 @@ end
 
 function main()
     args = parse_commandline()
+    is_stdout_tty = isa(stdout, Base.TTY)
+    is_stdin_tty = isa(stdin, Base.TTY)
     
     device_arg = args["device"] == -1 ? nothing : args["device"]
     println("\e[1;35m🔥 Inferno Chat Interface 🔥\e[0m")
@@ -107,6 +109,9 @@ function main()
         prompt_text = format_messages(args["system-prompt"], messages)
         
         print("\n\e[1;32mAssistant:\e[0m ")
+        if is_stdout_tty
+            print("\e[2m...\e[0m")
+        end
         flush(stdout)
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
                                               max_tokens=args["max-tokens"], 
@@ -114,11 +119,19 @@ function main()
                                               top_p=Float32(args["top-p"]))
         
         full_response = ""
+        first_token = true
         try
             for token_text in stream
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
+            end
+            if first_token && is_stdout_tty
+                print("\b\b\b\e[K")
             end
             println()
         catch e
@@ -134,8 +147,6 @@ function main()
     end
     
     println("\nType \e[33m/help\e[0m for commands, or just chat away!")
-    
-    is_tty = isa(stdin, Base.TTY)
     
     # Interactive loop
     while true
@@ -164,7 +175,7 @@ function main()
             continue
         end
 
-        if !is_tty
+        if !is_stdin_tty
             println(user_input)
         end
 
@@ -189,6 +200,9 @@ function main()
         prompt_text = format_messages(args["system-prompt"], messages)
         
         print("\e[1;32mAssistant:\e[0m ")
+        if is_stdout_tty
+            print("\e[2m...\e[0m")
+        end
         flush(stdout)
         
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
@@ -197,11 +211,19 @@ function main()
                                               top_p=Float32(args["top-p"]))
                                               
         full_response = ""
+        first_token = true
         try
             for token_text in stream
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
+            end
+            if first_token && is_stdout_tty
+                print("\b\b\b\e[K")
             end
             println()
         catch e
