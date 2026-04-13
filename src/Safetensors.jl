@@ -80,12 +80,23 @@ function get_tensor(safetensors::SafetensorsFile, name::String)
  bytes = safetensors.data[offset:offset + num_elements * 4 - 1]
  data = reinterpret(Float32, bytes)
  # Materialize the array before reshape
- return copy(reshape(Vector{Float32}(data), shape...))
+ data_vec = Vector{Float32}(data)
+ # Safetensors stores row-major, Julia is column-major
+ if length(shape) == 2
+     return copy(reshape(data_vec, shape[2], shape[1])')
+ else
+     return copy(reshape(data_vec, shape...))
+ end
  elseif dtype == 2 # F16
  bytes = safetensors.data[offset:offset + num_elements * 2 - 1]
  data16 = reinterpret(Float16, bytes)
  data = Float32.(Vector{Float16}(data16))
- return reshape(data, shape...)
+ # Safetensors stores row-major, Julia is column-major
+ if length(shape) == 2
+     return copy(reshape(data, shape[2], shape[1])')
+ else
+     return copy(reshape(data, shape...))
+ end
  elseif dtype == 3 # BF16
  bytes = safetensors.data[offset:offset + num_elements * 2 - 1]
  # BF16 is stored as 16-bit values, need to convert to Float32
@@ -94,7 +105,15 @@ function get_tensor(safetensors::SafetensorsFile, name::String)
  data_bf16 = reinterpret(UInt16, bytes)
  # Each BF16 value needs to become a Float32
  data_f32 = [reinterpret(Float32, UInt32(x) << 16) for x in data_bf16]
- return copy(reshape(data_f32, shape...))
+ # Safetensors stores data in row-major order, but Julia uses column-major.
+ # We need to reshape and then transpose to get correct ordering.
+ # For a 2D tensor with shape [rows, cols], the data is stored row-by-row.
+ # In Julia, reshape(data, cols, rows)' gives the correct matrix.
+ if length(shape) == 2
+     return copy(reshape(data_f32, shape[2], shape[1])')
+ else
+     return copy(reshape(data_f32, shape...))
+ end
  else
  error("Unsupported dtype: $dtype")
  end
@@ -178,14 +197,16 @@ function load_safetensors_model(model_path::String)
         println("  $name")
     end
     
-    # Load embedding
-    embed = get_tensor(sf, "model.language_model.embed_tokens.weight")
-    if embed === nothing
-        error("Could not find embed_tokens.weight")
-    end
-    embed = Matrix(Float32.(embed'))
-    
-    println("\nEmbedding shape: ", size(embed))
+ # Load embedding
+ embed = get_tensor(sf, "model.language_model.embed_tokens.weight")
+ if embed === nothing
+ error("Could not find embed_tokens.weight")
+ end
+ # get_tensor already returns correctly shaped matrix (vocab_size, hidden_size)
+ # We need (hidden_size, vocab_size) for our model, so transpose
+ embed = Matrix(Float32.(embed'))
+ 
+ println("\\nEmbedding shape: ", size(embed))
     
     # Load layers
     layers = ModelCPU.DecoderLayerCPU[]
