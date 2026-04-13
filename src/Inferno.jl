@@ -11,11 +11,13 @@ end
 include("QuantsData.jl")
 include("Dequant.jl")
 include("QuantsCPU.jl")
+include("QuantMV.jl")
 include("GGUF.jl")
 include("Model.jl")
 include("ModelCPU.jl")
 include("Tokenizer.jl")
 include("Loader.jl")
+include("Safetensors.jl")
 include("LoaderCPU.jl")
 include("Engine.jl")
 include("Server.jl")
@@ -24,12 +26,14 @@ include("Generate.jl")
 using .QuantsData
 using .Dequant
 using .QuantsCPU
+using .QuantMV
 using .GGUF
 using .Model
 using .ModelCPU
 using .Tokenizer
 using .Loader
 using .LoaderCPU
+using .Safetensors
 using .Engine
 using .Server
 using .Generate
@@ -38,6 +42,7 @@ export load_model, load_model_cpu, start_server, non_nothing_fields, stream_to_s
 export LoaderCPU, ModelCPU, generate_stream_cpu, generate_cpu, softmax_sample
 export generate_text, chat
 export chat!, start_chat, Message, build_prompt
+export load_safetensors_model, Safetensors, detect_model_format
 
 """
     non_nothing_fields(obj) -> NamedTuple
@@ -146,13 +151,26 @@ function find_related_file(model_path::String, pattern::String)
 end
 
 function load_model(path::String; device::Union{Int, Nothing}=nothing,
-    mmproj::Union{String, Nothing}=nothing,
-    backend::Symbol=:auto)
-    
-    # Handle backend selection
-    if backend == :cpu
-        return load_model_cpu(path)
-    end
+ mmproj::Union{String, Nothing}=nothing,
+ backend::Symbol=:auto)
+ 
+ # Detect model format
+ fmt = LoaderCPU.detect_model_format(path)
+ 
+ # Handle backend selection
+ if backend == :cpu
+ if fmt == :safetensors
+ return Safetensors.load_safetensors_model(path)
+ else
+ return LoaderCPU.load_model_cpu(path)
+ end
+ end
+ 
+ # For GPU backend, only GGUF is supported currently
+ if fmt == :safetensors
+ @warn "Safetensors format only supports CPU backend. Use backend=:cpu for safetensors models."
+ return Safetensors.load_safetensors_model(path)
+ end
 
     model = nothing
     tok = nothing

@@ -48,8 +48,10 @@ function extract_tensor(file::GGUF.GGUFFile, info::GGUF.TensorInfo)
         dequantize_q2_k(@view(file.tensor_data[start:end]), num_elements)
     elseif info.type == GGUF.GGML_TYPE_Q3_K
         dequantize_q3_k(@view(file.tensor_data[start:end]), num_elements)
-    elseif info.type == GGUF.GGML_TYPE_Q6_K
-        dequantize_q6_k(@view(file.tensor_data[start:end]), num_elements)
+ elseif info.type == GGUF.GGML_TYPE_Q6_K
+ num_blocks = num_elements ÷ 256
+ data_size = num_blocks * 210
+ dequantize_q6_k(collect(@view file.tensor_data[start:start+data_size-1]), num_elements)
     else
         @warn "Unhandled type, zeroing" type = info.type
         zeros(Float16, num_elements)
@@ -57,15 +59,15 @@ function extract_tensor(file::GGUF.GGUFFile, info::GGUF.TensorInfo)
 
     dims = Tuple(Int.(info.dimensions))
 
- # Handle multi-dimensional tensors (e.g., 4D vision transformers in mmproj)
  if length(dims) > 2
  return reshape(data, dims)
  else
- # GGUF stores data in row-major order, Julia uses column-major
- # So we need to reshape with dimensions reversed, then transpose
+ # GGUF stores data as [inner][outer] where inner varies fastest
+ # Julia is column-major, so dequantized data is in the right order
+ # Just reshape to (inner, outer) without transpose
  inner = dims[1]
  outer = length(dims) > 1 ? dims[2] : 1
- return reshape(data, outer, inner)'
+ return reshape(data, inner, outer)
  end
 end
 

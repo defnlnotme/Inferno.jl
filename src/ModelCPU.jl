@@ -382,8 +382,15 @@ for h in 1:m.num_v_heads
  # Gate values
  alpha_val = clamp(Float64(alpha_proj[h]) + Float64(m.ssm_dt_bias[h]), -20.0, 20.0)
  softplus_alpha = log(1.0 + exp(alpha_val))
- decay = Float32(exp(softplus_alpha * Float64(m.ssm_a[h])))
- # Note: llama.cpp does NOT clamp decay to [0,1], it uses exp(gate) directly
+ # HF formula: g = ssm_a * softplus(a + dt_bias)
+ # ssm_a is already -exp(A_log), so we just multiply
+ decay = Float32(m.ssm_a[h] * softplus_alpha)
+ # Note: decay should be negative (from -exp(A_log)), and state *= exp(decay) = state * exp(g)
+ # But we want to apply exp(g) to the state, so:
+ # state .*= exp(decay) where decay = g = ssm_a * softplus_alpha
+ # Actually, HF computes g and then the update is: state = state * exp(g) + ...
+ # So we need: decay_to_apply = exp(g) = exp(ssm_a * softplus_alpha)
+ decay_to_apply = Float32(exp(decay))
 
  beta_val = clamp(Float64(beta_proj[h]), -20.0, 20.0)
  beta_gate = Float32(1.0 / (1.0 + exp(-beta_val)))
@@ -392,8 +399,8 @@ for h in 1:m.num_v_heads
  # state: [head_v_dim, head_v_dim] = [128, 128]
  state = view(m.h, :, :, h)
  
- # Decay: state *= exp(gate)
- state .*= decay
+ # Decay: state *= exp(g) where g = ssm_a * softplus_alpha
+ state .*= decay_to_apply
  
  # sk = state * k (matrix-vector multiply)
  # state is [V, K], k is [K,], result is [V,]
@@ -478,21 +485,32 @@ struct FullAttentionCPU
 end
 
 function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddingCPU, cache::KVCacheCPU)
-    # Q, K, V projections
-    qkv = attn.wq * x  # This produces n_heads * head_dim * 2 output
-    k = attn.wk * x
-    v = attn.wv * x
+ # Q, K, V projections
+ qkv = attn.wq * x # This produces n_heads * head_dim * 2 output
+ k = attn.wk * x
+ v = attn.wv * x
 
-    # Split qkv into query and gate
-    # qkv has shape (n_heads * head_dim * 2,) = (n_heads * head_dim,) + (n_heads * head_dim,)
-    q_size = attn.n_heads * attn.head_dim
-    query_states = qkv[1:q_size]
-    gate = qkv[q_size+1:end]
+ # Split qkv into query and gate
+ # HF layout: for each head, [query (head_dim), gate (head_dim)]
+ # So qkv is: [q0, g0, q1, g1, ..., q7, g7] where each qi, gi is head_dim elements
+ # Total: n_heads * (head_dim + head_dim) = n_heads * head_dim * 2
+ # We need to extract query and gate for each head separately
+ q_size = attn.n_heads * attn.head_dim
+ query_states = zeros(Float32, q_size)
+ gate = zeros(Float32, q_size)
+ 
+ for h in 1:attn.n_heads
+     # For each head, query is at [head_idx * (2*head_dim) : head_idx * (2*head_dim) + head_dim]
+     # and gate is at [head_idx * (2*head_dim) + head_dim : (head_idx+1) * (2*head_dim)]
+     base = (h - 1) * (2 * attn.head_dim)
+     query_states[(h-1)*attn.head_dim+1:h*attn.head_dim] .= qkv[base+1:base+attn.head_dim]
+     gate[(h-1)*attn.head_dim+1:h*attn.head_dim] .= qkv[base+attn.head_dim+1:base+2*attn.head_dim]
+ end
 
-    # Reshape to (head_dim, num_heads)
-    query_states = reshape(query_states, attn.head_dim, attn.n_heads)
-    k = reshape(k, attn.head_dim, attn.n_kv)
-    v = reshape(v, attn.head_dim, attn.n_kv)
+ # Reshape to (head_dim, num_heads)
+ query_states = reshape(query_states, attn.head_dim, attn.n_heads)
+ k = reshape(k, attn.head_dim, attn.n_kv)
+ v = reshape(v, attn.head_dim, attn.n_kv)
 
  # Apply Q/K normalization (per-head)
  for h in 1:attn.n_heads
