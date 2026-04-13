@@ -1,110 +1,73 @@
-# Qwen3.5-0.8B SSM/Attention CPU Inference Debug Summary
+# Safetensors CPU Inference Status
 
-## Status: MULTI-TOKEN GENERATION NOW WORKING (Apr 2026)
+## Status: WORKING ✓
 
-**BREAKTHROUGH**: The SSM state accumulation bug has been fixed!
+Safetensors inference for Qwen3.5-0.8B-VL now produces correct output.
 
-### The Fix
-The issue was improper KV cache management during multi-token generation.
-
-**WRONG** (caused garbage output):
-```julia
-# Reset and reinitialize inside the loop - WRONG!
-for i in 1:64
-    Inferno.ModelCPU.reset_states_cpu!(model)
-    caches = [Inferno.ModelCPU.init_kv_cache_cpu(model.config) for _ in 1:model.config.num_hidden_layers]
-    logits = Inferno.ModelCPU.forward_cpu!(model, [next_token], 0, caches)
-end
+### Test Output
 ```
+Prompt: What is 2 + 2 ?
+Output:
 
-**CORRECT** (produces coherent text):
-```julia
-# Initialize caches ONCE outside the loop, accumulate state
-Inferno.ModelCPU.reset_states_cpu!(model)
-caches = [Inferno.ModelCPU.init_kv_cache_cpu(model.config) for _ in 1:model.config.num_hidden_layers]
-
-# Process prompt first
-logits = Inferno.ModelCPU.forward_cpu!(model, prompt_tokens, 0, caches)
-
-for i in 1:64
-    next_token = argmax(logits[:, end])
-    # Forward with accumulated state - pass current_pos and existing caches
-    logits = Inferno.ModelCPU.forward_cpu!(model, [next_token], current_pos, caches)
-    current_pos += 1
-end
-```
-
-### Verified Output
-
-**Test 1**: "What is 2 + 2 ?"
-```
 2 + 2 = 4
+
 What is 2 + 3 ?
+
 2 + 3 = 5
-What is 2 + 4 ?
-2 + 4 = 6
-...
 ```
 
-**Test 2**: "The capital of France is"
-```
-Paris.
-The capital of France is Paris.
-...
-```
+This matches HuggingFace reference output exactly.
 
-Both tests show coherent, contextually appropriate completions!
+## Bugs Fixed
 
----
+### 1. Layer Index Substring Matching
+**Problem:** `"layers.$layer_idx"` matched unintended layers.
+- `"layers.1"` matched layers 1, 10, 11, 12, ..., 19
+- Layer 1+ weights were garbage (mix of multiple layers)
 
-## Previously Fixed Bugs
+**Fix:** Use regex `r"layers\.$layer_idx\."` for exact matching.
 
-### 1. SSM State Storage (V, K) vs (K, V)
-- SSM state is stored as (V, K) in Julia, transposed from HF's (K, V)
-- Correct ops: `sk = state * k`, `state .+= d .* k'`, `y = state * q`
-- NOT: `sk = state' * k`, `state .+= k .* d'`, `y = state' * q`
+### 2. Attention q_norm/k_norm Missing +1
+**Problem:** Qwen uses layernorm1p convention (weight + 1).
+- GGUF loader applied +1, safetensors loader didn't
+- GGUF mean: 1.4268848, SF mean: 0.42688477 (diff = 1.0)
 
-### 2. RMSNorm +1 Convention
-- RMSNorm weights need +1 (layernorm1p convention) for layer norms
-- SSM norms do NOT use +1
+**Fix:** Add `.+ 1.0f0` when loading q_norm/k_norm weights.
 
-### 3. Decay Formula
-- Was: `exp(softplus*ssm_a)` 
-- Should be: `exp(ssm_a * softplus(a+dt_bias))`
-- Decay: `g = ssm_a * softplus(a + dt_bias)`, then `exp(g)`
+### 3. 3D Conv1d Tensor Handling
+**Problem:** Conv1d weights stored as [C, 1, K] in safetensors.
+- Previous code didn't handle 3D tensors correctly
+- Resulted in wrong weight layout
 
-### 4. Conv1d Weight Transpose
-- GGUF stores (C, K) but kernel expects (K, C) - transpose needed
+**Fix:** In `get_tensor()`, detect 3D tensors with shape[2]==1
+and apply correct reshape: `reshape(data, shape[3], shape[1])'`
 
-### 5. Float Literal syntax
-- `1e-6f0` should be `1.0f-6` in Julia
+### 4. Position Calculation in Generation Loop
+**Problem:** Wrong position passed to forward_cpu!.
+- Prompt processed at positions 7-14 instead of 0-7
+- Caused garbage output despite correct weights
 
-### 6. L2 Norm on Q/K
-- Qwen3.5 uses L2 norm on Q/K (not RMSNorm!) - critical for attention
+**Fix:** Process prompt at position 0, subsequent tokens at
+position `length(tokens) + i - 2`.
 
-### 7. Gated Norm
-- Output: `norm(output) * silu(z)` at end of SSM block
+## Weight Verification
 
-### 8. Matrix Convention
-- GGUF stores (out, in), Julia needs (in, out) after transform
+All weights now match between GGUF and safetensors:
+- Embeddings: ✓
+- Layer norms: ✓
+- SSM weights (in_proj, gate_proj, out_proj, conv1d, etc.): ✓
+- Attention weights (wq, wk, wv, wo, q_norm, k_norm): ✓
+- MLP weights: ✓
+- Final norm: ✓
 
-### 9. Safetensors BF16
-- BF16 dtype=3, need `UInt16 -> UInt32<<16 -> Float32`
+## Model Details
 
----
+- Architecture: Qwen3.5ForConditionalGeneration (VL model)
+- Safetensors file includes visual encoder (not used for text inference)
+- Weight tying: lm_head tied with embed_tokens
 
-## Key Lessons
+## Next Steps
 
-1. **Single-token tests are insufficient** - They can pass while multi-token fails
-2. **State accumulation is critical** - Must preserve KV cache across tokens
-3. **Position matters** - Each forward call needs correct position offset
-4. **Compare against HF reference** - Transformers implementation is ground truth
-
----
-
-## Test Files
-
-- `tests/reference/julia/test_multitoken_v3.jl` - Working multi-token test
-- `tests/reference/julia/test_france.jl` - Capital of France test
-- `tests/reference/test_ssm_against_hf.py` - SSM ops comparison
-- `tests/reference/test_attention_against_hf.py` - Attention ops comparison
+1. Performance optimizations (Phase 2)
+2. Quantization support (Phase 3)
+3. Additional model architectures (Phase 4)
