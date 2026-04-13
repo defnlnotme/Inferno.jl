@@ -28,3 +28,8 @@ docs/
 examples/dequant_ref/
 *.npz
 src/QuantMV.jl
+
+# Debug artifacts
+dump_tensors.cpp
+*.npz
+hermes_conversation_*.json
