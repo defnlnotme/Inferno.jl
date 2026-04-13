@@ -83,9 +83,14 @@ function get_tensor(safetensors::SafetensorsFile, name::String)
  data_vec = Vector{Float32}(data)
  # Safetensors stores row-major, Julia is column-major
  if length(shape) == 2
-     return copy(reshape(data_vec, shape[2], shape[1])')
+ return copy(reshape(data_vec, shape[2], shape[1])')
+ elseif length(shape) == 3 && shape[2] == 1
+ # 3D tensor with shape [C, 1, K] (like conv1d)
+ # Safetensors stores as [C, K] in row-major
+ # Need: reshape to (K, C) then transpose to (C, K)
+ return copy(reshape(data_vec, shape[3], shape[1])')
  else
-     return copy(reshape(data_vec, shape...))
+ return copy(reshape(data_vec, shape...))
  end
  elseif dtype == 2 # F16
  bytes = safetensors.data[offset:offset + num_elements * 2 - 1]
@@ -93,9 +98,12 @@ function get_tensor(safetensors::SafetensorsFile, name::String)
  data = Float32.(Vector{Float16}(data16))
  # Safetensors stores row-major, Julia is column-major
  if length(shape) == 2
-     return copy(reshape(data, shape[2], shape[1])')
+ return copy(reshape(data, shape[2], shape[1])')
+ elseif length(shape) == 3 && shape[2] == 1
+ # 3D tensor with shape [C, 1, K] (like conv1d)
+ return copy(reshape(data, shape[3], shape[1])')
  else
-     return copy(reshape(data, shape...))
+ return copy(reshape(data, shape...))
  end
  elseif dtype == 3 # BF16
  bytes = safetensors.data[offset:offset + num_elements * 2 - 1]
@@ -110,9 +118,14 @@ function get_tensor(safetensors::SafetensorsFile, name::String)
  # For a 2D tensor with shape [rows, cols], the data is stored row-by-row.
  # In Julia, reshape(data, cols, rows)' gives the correct matrix.
  if length(shape) == 2
-     return copy(reshape(data_f32, shape[2], shape[1])')
+ return copy(reshape(data_f32, shape[2], shape[1])')
+ elseif length(shape) == 3 && shape[2] == 1
+ # 3D tensor with shape [C, 1, K] (like conv1d)
+ # Safetensors stores as [C, K] in row-major
+ # Need: reshape to (K, C) then transpose to (C, K)
+ return copy(reshape(data_f32, shape[3], shape[1])')
  else
-     return copy(reshape(data_f32, shape...))
+ return copy(reshape(data_f32, shape...))
  end
  else
  error("Unsupported dtype: $dtype")
@@ -222,7 +235,8 @@ function load_safetensors_model(model_path::String)
  # Filter out mtp layers - we want model.language_model.layers.X
  in_norm_w = nothing
  for name in keys(sf.tensors)
- if occursin("layers.$layer_idx", name) && !occursin("mtp", name)
+ # Use regex with dot after layer number to avoid layers.1 matching layers.10
+ if occursin(Regex("layers\\.$layer_idx\\."), name) && !occursin("mtp", name)
  if occursin("input_layernorm", name) || occursin("attention_norm", name)
  in_norm_w = get_tensor(sf, name)
  break
@@ -239,7 +253,8 @@ in_norm = ModelCPU.RMSNormCPU(vec(Float32.(in_norm_w) .+ 1.0f0), model_config.rm
  # Load post attention norm
  post_norm_w = nothing
  for name in keys(sf.tensors)
- if occursin("layers.$layer_idx", name) && !occursin("mtp", name)
+ # Use regex with dot after layer number to avoid layers.1 matching layers.10
+ if occursin(Regex("layers\\.$layer_idx\\."), name) && !occursin("mtp", name)
  if occursin("post_attention", name) || occursin("post_attention_norm", name)
  post_norm_w = get_tensor(sf, name)
  break
@@ -432,14 +447,15 @@ function load_ssm_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, config:
     ssm_dt_bias = nothing
     ssm_norm_w = nothing
     alpha_weight = nothing  # in_proj_a in safetensors
-    beta_weight = nothing   # in_proj_b in safetensors
-    
+ beta_weight = nothing # in_proj_b in safetensors
+ 
  for name in keys(sf.tensors)
- if !occursin("layers.$layer_idx", name) || occursin("mtp", name)
+ # Must match exact layer number - use regex with word boundary to avoid layers.1 matching layers.10
+ if !occursin(Regex("layers\\.$layer_idx\\."), name) || occursin("mtp", name)
  continue
  end
-        
-        if occursin("linear_attn.in_proj_qkv", name)
+ 
+ if occursin("linear_attn.in_proj_qkv", name)
             tensor = get_tensor(sf, name)
             in_proj = Matrix{Float32}(tensor)  # (6144, 1024) - no transpose needed
         elseif occursin("linear_attn.in_proj_z", name)
@@ -461,10 +477,9 @@ function load_ssm_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, config:
  elseif occursin("linear_attn.conv1d", name)
  tensor = get_tensor(sf, name)
  # conv1d is [6144, 1, 4] in safetensors = (channels, 1, kernel_size)
- # Safetensors stores as [channels, kernel_size] = [6144, 4] after squeeze
- # ModelCPU.jl expects (channels, kernel_size) for: view(ssm_conv1d, c, :) -> (kernel_size,)
- squeezed = squeeze_middle(tensor) # (6144, 4) = (channels, kernel_size)
- ssm_conv1d = Matrix{Float32}(squeezed) # Keep as (6144, 4) = (C, K)
+ # get_tensor handles the 3D -> 2D conversion for us
+ # Result is (6144, 4) = (channels, kernel_size)
+ ssm_conv1d = Matrix{Float32}(tensor)
         elseif occursin("linear_attn.A_log", name)
             data = get_tensor(sf, name)
             ssm_a = -exp.(Float32.(vec(data)))  # A_log stores log(-A), need -exp(A_log) = A
@@ -552,14 +567,15 @@ function load_attention_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, c
     wk = nothing
     wv = nothing
     wo = nothing
-    q_norm_w = nothing
-    k_norm_w = nothing
-    
+ q_norm_w = nothing
+ k_norm_w = nothing
+ 
  for name in keys(sf.tensors)
- if !occursin("layers.$layer_idx", name) || occursin("mtp", name)
+ # Use regex with dot after layer number to avoid layers.1 matching layers.10
+ if !occursin(Regex("layers\\.$layer_idx\\."), name) || occursin("mtp", name)
  continue
  end
-        
+ 
  if occursin("self_attn.q_proj", name) && occursin("weight", name)
  tensor = get_tensor(sf, name)
  # q_proj outputs [num_heads * head_dim * 2, hidden] = [2048 * 2, 1024] = [4096, 1024]
@@ -571,26 +587,28 @@ function load_attention_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, c
         elseif occursin("self_attn.v_proj", name) && occursin("weight", name)
             tensor = get_tensor(sf, name)
             wv = Matrix{Float32}(tensor)  # (n_kv * head_dim, hidden)
-        elseif occursin("self_attn.o_proj", name) && occursin("weight", name)
-            tensor = get_tensor(sf, name)
-            wo = Matrix{Float32}(tensor)  # (hidden, n_heads * head_dim)
-        elseif occursin("q_norm", name)
-            q_norm_w = vec(Float32.(get_tensor(sf, name)))
-        elseif occursin("k_norm", name)
-            k_norm_w = vec(Float32.(get_tensor(sf, name)))
-        end
-    end
-    
-    # Default norms
-    if q_norm_w === nothing
-        q_norm_w = ones(Float32, config.head_dim)
-    end
-    if k_norm_w === nothing
-        k_norm_w = ones(Float32, config.head_dim)
-    end
-    
-    q_norm = ModelCPU.RMSNormCPU(q_norm_w, config.rms_norm_eps)
-    k_norm = ModelCPU.RMSNormCPU(k_norm_w, config.rms_norm_eps)
+ elseif occursin("self_attn.o_proj", name) && occursin("weight", name)
+ tensor = get_tensor(sf, name)
+ wo = Matrix{Float32}(tensor) # (hidden, n_heads * head_dim)
+ elseif occursin("q_norm", name)
+ # Qwen uses layernorm1p convention for attention norms - add 1
+ q_norm_w = vec(Float32.(get_tensor(sf, name))) .+ 1.0f0
+ elseif occursin("k_norm", name)
+ # Qwen uses layernorm1p convention for attention norms - add 1
+ k_norm_w = vec(Float32.(get_tensor(sf, name))) .+ 1.0f0
+ end
+ end
+ 
+ # Default norms
+ if q_norm_w === nothing
+ q_norm_w = ones(Float32, config.head_dim) .+ 1.0f0  # Also apply +1 for defaults
+ end
+ if k_norm_w === nothing
+ k_norm_w = ones(Float32, config.head_dim) .+ 1.0f0  # Also apply +1 for defaults
+ end
+ 
+ q_norm = ModelCPU.RMSNormCPU(q_norm_w, config.rms_norm_eps)
+ k_norm = ModelCPU.RMSNormCPU(k_norm_w, config.rms_norm_eps)
     
     if wq === nothing || wk === nothing || wv === nothing || wo === nothing
         error("Missing attention tensors for layer $layer_idx")
@@ -608,16 +626,17 @@ function load_attention_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, c
 end
 
 function load_mlp_safetensors(sf::SafetensorsFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU)
-    gate_proj = nothing
-    up_proj = nothing
-    down_proj = nothing
-    
+ gate_proj = nothing
+ up_proj = nothing
+ down_proj = nothing
+ 
  for name in keys(sf.tensors)
- if !occursin("layers.$layer_idx", name) || occursin("mtp", name)
+ # Use regex with dot after layer number to avoid layers.1 matching layers.10
+ if !occursin(Regex("layers\\.$layer_idx\\."), name) || occursin("mtp", name)
  continue
  end
-        
-        if occursin("mlp.gate_proj", name) && occursin("weight", name)
+ 
+ if occursin("mlp.gate_proj", name) && occursin("weight", name)
             tensor = get_tensor(sf, name)
             # Safetensors stores as (intermediate, hidden) which is correct for weight * x
             gate_proj = Matrix{Float32}(tensor)
