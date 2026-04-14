@@ -336,6 +336,10 @@ struct GatedDeltaNetCPU
  qkv_buf::Vector{Float32}      # in_proj * x output
  z_buf::Vector{Float32}        # gate_proj * x output
  out_buf::Vector{Float32}      # ssm_out * y_all output
+ # Per-head loop buffers
+ sk_buf::Vector{Float32}       # state * k output (head_v_dim)
+ d_buf::Vector{Float32}        # beta * (v - sk) output (head_v_dim)
+ y_h_buf::Vector{Float32}      # state * q output (head_v_dim)
  # Per-head normalization buffers
  q_norm_buf::Vector{Float32}
  k_norm_buf::Vector{Float32}
@@ -439,11 +443,14 @@ for h in 1:m.num_v_heads
  
  # sk = state * k (matrix-vector multiply)
  # state is [V, K], k is [K,], result is [V,]
- # This computes: for each v, sum_k state[v,k] * k[k]
- sk = state * k_normalized # [V, K] * [K,] = [V,]
+ # Use pre-allocated buffer
+ sk = m.sk_buf
+ mul!(sk, state, k_normalized)
  
  # d = beta * (v - sk)
- d = beta_gate .* (vg .- sk)
+ # Use pre-allocated buffer
+ d = m.d_buf
+ @. d = beta_gate * (vg - sk)
  
  # State update: S = S + d * k'
  # This adds outer product of d (V,) and k (K,) to state (V, K)
@@ -451,7 +458,9 @@ for h in 1:m.num_v_heads
  
  # Output: y = state * q
  # state is [V, K], q is [K,], result is [V,]
- y_h = state * q_normalized # [V, K] * [K,] = [V,]
+ # Use pre-allocated buffer
+ y_h = m.y_h_buf
+ mul!(y_h, state, q_normalized)
  yg = view(y_all, (h-1)*m.head_v_dim+1:h*m.head_v_dim)
  yg .= y_h
 end
