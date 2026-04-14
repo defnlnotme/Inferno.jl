@@ -669,11 +669,17 @@ function load_mlp_safetensors(sf::SafetensorsFile, layer_idx::Int, config::Model
         end
     end
     
-    if gate_proj === nothing || up_proj === nothing || down_proj === nothing
-        error("Missing MLP tensors for layer $layer_idx")
-    end
-    
-    return ModelCPU.MLPCPU(gate_proj, up_proj, down_proj)
+ if gate_proj === nothing || up_proj === nothing || down_proj === nothing
+ error("Missing MLP tensors for layer $layer_idx")
+ end
+ 
+ # Pre-allocated work buffers
+ gate_buf = Vector{Float32}(undef, config.intermediate_size)
+ up_buf = Vector{Float32}(undef, config.intermediate_size)
+ hidden_buf = Vector{Float32}(undef, config.intermediate_size)
+ output_buf = Vector{Float32}(undef, config.hidden_size)
+ 
+ return ModelCPU.MLPCPU(gate_proj, up_proj, down_proj, gate_buf, up_buf, hidden_buf, output_buf)
 end
 
 end # module

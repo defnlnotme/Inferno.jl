@@ -133,9 +133,14 @@ end
 const QuantOrFloat32 = Union{Matrix{Float32}, Q4_K_Matrix, Q5_K_Matrix, Q6_K_Matrix, Q8_0_Matrix}
 
 struct MLPCPU
-    gate_weight::QuantOrFloat32  # (hidden, intermediate) after GGUF reshape+transpose
-    up_weight::QuantOrFloat32    # (hidden, intermediate)
-    down_weight::QuantOrFloat32  # (intermediate, hidden)
+ gate_weight::QuantOrFloat32 # (intermediate, hidden) after GGUF reshape+transpose
+ up_weight::QuantOrFloat32 # (intermediate, hidden)
+ down_weight::QuantOrFloat32 # (hidden, intermediate)
+ # Pre-allocated work buffers
+ gate_buf::Vector{Float32}  # intermediate_size
+ up_buf::Vector{Float32}    # intermediate_size
+ hidden_buf::Vector{Float32} # intermediate_size
+ output_buf::Vector{Float32} # hidden_size (for down projection output)
 end
 
 # MLP call - uses generic forward that handles both Float32 and quantized weights
@@ -269,18 +274,25 @@ end
 
 # Generic MLP forward pass
 function mlp_forward(mlp::MLPCPU, x::Vector{Float32})
-    # Gate with SiLU
-    gate = mlp_mat_vec_mul(mlp.gate_weight, x)
-    @. gate = gate * (1.0f0 / (1.0f0 + exp(-gate))) # SiLU
-    
-    # Up projection
-    up = mlp_mat_vec_mul(mlp.up_weight, x)
-    
-    # Element-wise multiply
-    hidden = gate .* up
-    
-    # Down projection
-    return mlp_mat_vec_mul(mlp.down_weight, hidden)
+ # Use pre-allocated buffers
+ gate_buf = mlp.gate_buf
+ up_buf = mlp.up_buf
+ hidden_buf = mlp.hidden_buf
+ output_buf = mlp.output_buf
+ 
+ # Gate with SiLU - compute into gate_buf
+ mul!(gate_buf, mlp.gate_weight, x)
+ @. gate_buf = gate_buf * (1.0f0 / (1.0f0 + exp(-gate_buf))) # SiLU
+ 
+ # Up projection - compute into up_buf
+ mul!(up_buf, mlp.up_weight, x)
+ 
+ # Element-wise multiply - compute into hidden_buf
+ @. hidden_buf = gate_buf * up_buf
+ 
+ # Down projection - compute into output_buf and return
+ mul!(output_buf, mlp.down_weight, hidden_buf)
+ return output_buf
 end
 
 # --- GatedDeltaNet (SSM) ---

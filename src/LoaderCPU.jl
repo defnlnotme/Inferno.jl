@@ -465,21 +465,31 @@ function load_attention_layer(file::GGUF.GGUFFile, layer_idx::Int, config::Model
 end
 
 function load_mlp(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU; keep_quantized::Bool=false)
-    prefix = "blk.$(layer_idx)"
-    
-    # Load weights - transpose from GGUF format
-    # For quantized weights, we store them directly and handle transpose in multiplication
-    gate_info = file.tensors["$(prefix).ffn_gate.weight"]
-    up_info = file.tensors["$(prefix).ffn_up.weight"]
-    down_info = file.tensors["$(prefix).ffn_down.weight"]
-    
-    if keep_quantized && gate_info.type in (GGUF.GGML_TYPE_Q4_K, GGUF.GGML_TYPE_Q5_K, 
-                                              GGUF.GGML_TYPE_Q6_K, GGUF.GGML_TYPE_Q8_0)
-        # Load quantized weights - no transpose, we'll handle it in multiplication
-        gate_weight = extract_tensor_cpu(file, gate_info; keep_quantized=true)
-        up_weight = extract_tensor_cpu(file, up_info; keep_quantized=true)
-        down_weight = extract_tensor_cpu(file, down_info; keep_quantized=true)
-        return ModelCPU.MLPCPU(gate_weight, up_weight, down_weight)
+ prefix = "blk.$(layer_idx)"
+ 
+ # Load weights - transpose from GGUF format
+ # For quantized weights, we store them directly and handle transpose in multiplication
+ gate_info = file.tensors["$(prefix).ffn_gate.weight"]
+ up_info = file.tensors["$(prefix).ffn_up.weight"]
+ down_info = file.tensors["$(prefix).ffn_down.weight"]
+ 
+ # Determine intermediate size from weight dimensions
+ # gate_weight will be (intermediate, hidden) after transpose
+ intermediate_size = config.intermediate_size
+ 
+ # Pre-allocated work buffers
+ gate_buf = Vector{Float32}(undef, intermediate_size)
+ up_buf = Vector{Float32}(undef, intermediate_size)
+ hidden_buf = Vector{Float32}(undef, intermediate_size)
+ output_buf = Vector{Float32}(undef, config.hidden_size)
+ 
+ if keep_quantized && gate_info.type in (GGUF.GGML_TYPE_Q4_K, GGUF.GGML_TYPE_Q5_K, 
+ GGUF.GGML_TYPE_Q6_K, GGUF.GGML_TYPE_Q8_0)
+ # Load quantized weights - no transpose, we'll handle it in multiplication
+ gate_weight = extract_tensor_cpu(file, gate_info; keep_quantized=true)
+ up_weight = extract_tensor_cpu(file, up_info; keep_quantized=true)
+ down_weight = extract_tensor_cpu(file, down_info; keep_quantized=true)
+ return ModelCPU.MLPCPU(gate_weight, up_weight, down_weight, gate_buf, up_buf, hidden_buf, output_buf)
  else
  # Dequantize to Float32 and transpose for FFN multiplication
  # extract_tensor_cpu returns (hidden, intermediate) for gate/up, (intermediate, hidden) for down
@@ -487,7 +497,7 @@ function load_mlp(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConf
  gate_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_gate.weight"))')
  up_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_up.weight"))')
  down_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_down.weight"))')
- return ModelCPU.MLPCPU(gate_weight, up_weight, down_weight)
+ return ModelCPU.MLPCPU(gate_weight, up_weight, down_weight, gate_buf, up_buf, hidden_buf, output_buf)
  end
 end
 
