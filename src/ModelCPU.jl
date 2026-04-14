@@ -332,6 +332,10 @@ struct GatedDeltaNetCPU
  y_all_buf::Vector{Float32}
  alpha_proj_buf::Vector{Float32}
  beta_proj_buf::Vector{Float32}
+ # Pre-allocated mat-vec output buffers
+ qkv_buf::Vector{Float32}      # in_proj * x output
+ z_buf::Vector{Float32}        # gate_proj * x output
+ out_buf::Vector{Float32}      # ssm_out * y_all output
  # Per-head normalization buffers
  q_norm_buf::Vector{Float32}
  k_norm_buf::Vector{Float32}
@@ -344,10 +348,12 @@ function reset_states_cpu!(m::GatedDeltaNetCPU)
 end
 
 function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddingCPU, cache::KVCacheCPU)
- # 1. Input projections (supports both Float32 and quantized weights)
- qkv = ssm_mat_vec_mul(m.in_proj, x)
- z = ssm_mat_vec_mul(m.gate_proj, x)
-    
+ # 1. Input projections using pre-allocated buffers
+ qkv = m.qkv_buf
+ z = m.z_buf
+ mul!(qkv, m.in_proj, x)
+ mul!(z, m.gate_proj, x)
+ 
  # 2. Update conv state (ring buffer)
  if m.conv_kernel > 1
  m.conv_state[:, 1:(m.conv_kernel-1)] .= m.conv_state[:, 2:m.conv_kernel]
@@ -467,8 +473,10 @@ end
 # Removed variance scaling as it caused looping/instability
 # y_all .*= 1.0f0 / sqrt(Float32(m.head_v_dim))
  
- # 10. Output projection (supports both Float32 and quantized weights)
- return ssm_mat_vec_mul(m.ssm_out, y_all)
+ # 10. Output projection using pre-allocated buffer
+ out = m.out_buf
+ mul!(out, m.ssm_out, y_all)
+ return out
 end
 
 # --- SSM Matrix-Vector Multiplication Helpers ---

@@ -534,6 +534,10 @@ function load_ssm_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, config:
  y_all_buf = Vector{Float32}(undef, d_inner)
  alpha_proj_buf = Vector{Float32}(undef, num_v_heads)
  beta_proj_buf = Vector{Float32}(undef, num_v_heads)
+ # Pre-allocated mat-vec output buffers
+ qkv_buf = Vector{Float32}(undef, conv_channels)
+ z_buf = Vector{Float32}(undef, d_inner)
+ out_buf = Vector{Float32}(undef, config.hidden_size)
  q_norm_buf = Vector{Float32}(undef, head_k_dim)
  k_norm_buf = Vector{Float32}(undef, head_k_dim)
  
@@ -558,6 +562,7 @@ function load_ssm_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, config:
  conv_state,
  h,
  x_conv_buf, y_all_buf, alpha_proj_buf, beta_proj_buf,
+ qkv_buf, z_buf, out_buf,
  q_norm_buf, k_norm_buf
  ), load_mlp_safetensors(sf, layer_idx, config)
 end
