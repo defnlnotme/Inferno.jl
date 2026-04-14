@@ -88,26 +88,65 @@ function RotaryEmbeddingCPU(head_dim::Int, theta::Float32 = 10000.0f0, max_seq_l
 end
 
 function apply_rotary_emb!(x::Matrix{Float32}, pos::Int, rope::RotaryEmbeddingCPU)
-    head_dim, num_heads = size(x, 1), size(x, 2)
-    half = div(rope.rotary_dim, 2)
-    
-    for h in 1:num_heads
-        for i in 1:half
-            freq = rope.inv_freq[i] * pos
-            cos_val = cos(freq)
-            sin_val = sin(freq)
-            
-            idx1 = i
-            idx2 = i + half
-            
-            x1 = x[idx1, h]
-            x2 = x[idx2, h]
-            
-            x[idx1, h] = x1 * cos_val - x2 * sin_val
-            x[idx2, h] = x1 * sin_val + x2 * cos_val
-        end
-    end
-    return x
+ head_dim, num_heads = size(x, 1), size(x, 2)
+ half = div(rope.rotary_dim, 2)
+ 
+ for h in 1:num_heads
+ for i in 1:half
+ freq = rope.inv_freq[i] * pos
+ cos_val = cos(freq)
+ sin_val = sin(freq)
+ 
+ idx1 = i
+ idx2 = i + half
+ 
+ x1 = x[idx1, h]
+ x2 = x[idx2, h]
+ 
+ x[idx1, h] = x1 * cos_val - x2 * sin_val
+ x[idx2, h] = x1 * sin_val + x2 * cos_val
+ end
+ end
+ return x
+end
+
+# Fused RMSNorm + RoPE for attention (reduces memory passes)
+function rmsnorm_rotary!(x::Matrix{Float32}, pos::Int, rope::RotaryEmbeddingCPU, norm::RMSNormCPU)
+ head_dim, num_heads = size(x, 1), size(x, 2)
+ half = div(rope.rotary_dim, 2)
+ weight = norm.weight
+ 
+ for h in 1:num_heads
+ # First: RMSNorm on this head
+ sum_sq = 0.0f0
+ for i in 1:head_dim
+ sum_sq += x[i, h] * x[i, h]
+ end
+ rms = sqrt(sum_sq / head_dim + norm.eps)
+ inv_rms = 1.0f0 / rms
+ 
+ # Apply RMSNorm and RoPE in one pass
+ for i in 1:head_dim
+ x[i, h] = x[i, h] * inv_rms * weight[i]
+ end
+ 
+ # Now apply RoPE to the first rotary_dim dimensions
+ for i in 1:half
+ freq = rope.inv_freq[i] * pos
+ cos_val = cos(freq)
+ sin_val = sin(freq)
+ 
+ idx1 = i
+ idx2 = i + half
+ 
+ x1 = x[idx1, h]
+ x2 = x[idx2, h]
+ 
+ x[idx1, h] = x1 * cos_val - x2 * sin_val
+ x[idx2, h] = x1 * sin_val + x2 * cos_val
+ end
+ end
+ return x
 end
 
 # --- KV Cache ---
@@ -565,19 +604,9 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
  k = reshape(k, attn.head_dim, attn.n_kv)
  v = reshape(v, attn.head_dim, attn.n_kv)
 
- # Apply Q/K normalization (per-head)
- for h in 1:attn.n_heads
- q_h = view(query_states, :, h)
- rmsnorm_cpu!(q_h, q_h, attn.q_norm)
- end
- for h in 1:attn.n_kv
- k_h = view(k, :, h)
- rmsnorm_cpu!(k_h, k_h, attn.k_norm)
- end
-
- # Apply RoPE
- apply_rotary_emb!(query_states, pos, rope)
- apply_rotary_emb!(k, pos, rope)
+ # Fused RMSNorm + RoPE for Q and K (reduces memory passes)
+ rmsnorm_rotary!(query_states, pos, rope, attn.q_norm)
+ rmsnorm_rotary!(k, pos, rope, attn.k_norm)
 
  # Update KV cache
  update_kv_cache!(cache, k, v, pos)
