@@ -291,29 +291,38 @@ struct GatedDeltaNetCPU
  in_proj::QuantOrFloat32 # (hidden, conv_channels) — projects to Q+K+V
  gate_proj::QuantOrFloat32 # (hidden, d_inner) — SiLU gate
  ssm_out::QuantOrFloat32 # (d_inner, hidden) — output projection
-    ssm_conv1d::Matrix{Float32} # (conv_kernel, conv_channels) — transpose for column access
-    
-    # Alpha/beta projections (GGUF (heads, hidden) → Julia (hidden, heads) after reshape)
-    ssm_alpha_weight::Matrix{Float32}  # (hidden, num_v_heads)
-    ssm_beta_weight::Matrix{Float32}   # (hidden, num_v_heads)
-    
-    # SSM parameters
-    ssm_a::Vector{Float32}
-    ssm_dt_bias::Vector{Float32}
-    ssm_norm::RMSNormCPU
-    
-    # Dimensions
-    num_v_heads::Int
-    num_k_heads::Int
-    head_k_dim::Int
-    head_v_dim::Int
+ ssm_conv1d::Matrix{Float32} # (conv_kernel, conv_channels) — transpose for column access
+ 
+ # Alpha/beta projections (GGUF (heads, hidden) → Julia (hidden, heads) after reshape)
+ ssm_alpha_weight::Matrix{Float32} # (hidden, num_v_heads)
+ ssm_beta_weight::Matrix{Float32} # (hidden, num_v_heads)
+ 
+ # SSM parameters
+ ssm_a::Vector{Float32}
+ ssm_dt_bias::Vector{Float32}
+ ssm_norm::RMSNormCPU
+ 
+ # Dimensions
+ num_v_heads::Int
+ num_k_heads::Int
+ head_k_dim::Int
+ head_v_dim::Int
  d_inner::Int
  conv_channels::Int
  conv_kernel::Int
  
  # State buffers
  conv_state::Matrix{Float32}
- h::Array{Float32,3}  # Per-group states: (head_v_dim, head_k_dim, num_v_heads)
+ h::Array{Float32,3} # Per-group states: (head_v_dim, head_k_dim, num_v_heads)
+ 
+ # Pre-allocated work buffers to avoid GC
+ x_conv_buf::Vector{Float32}
+ y_all_buf::Vector{Float32}
+ alpha_proj_buf::Vector{Float32}
+ beta_proj_buf::Vector{Float32}
+ # Per-head normalization buffers
+ q_norm_buf::Vector{Float32}
+ k_norm_buf::Vector{Float32}
 end
 
 function reset_states_cpu!(m::GatedDeltaNetCPU)
@@ -327,39 +336,44 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
  qkv = ssm_mat_vec_mul(m.in_proj, x)
  z = ssm_mat_vec_mul(m.gate_proj, x)
     
-    # 2. Update conv state (ring buffer)
-    if m.conv_kernel > 1
-        m.conv_state[:, 1:(m.conv_kernel-1)] .= m.conv_state[:, 2:m.conv_kernel]
-    end
-    m.conv_state[:, m.conv_kernel] .= qkv
-    
+ # 2. Update conv state (ring buffer)
+ if m.conv_kernel > 1
+ m.conv_state[:, 1:(m.conv_kernel-1)] .= m.conv_state[:, 2:m.conv_kernel]
+ end
+ m.conv_state[:, m.conv_kernel] .= qkv
+ 
  # 3. Compute convolution - x_conv[c] = sum_k conv_state[c,k] * ssm_conv1d[c,k]
  # ssm_conv1d is stored as (conv_channels, conv_kernel) = (C, K)
  # conv_state is (conv_channels, conv_kernel) = (C, K)
- x_conv = Vector{Float32}(undef, m.conv_channels)
+ # Use pre-allocated buffer
+ x_conv = m.x_conv_buf
  for c in 1:m.conv_channels
  # Dot product of the channel's history and the kernel's weights for that channel
  # conv_state[c, :] is (conv_kernel,) - the history for channel c
  # ssm_conv1d[c, :] is (conv_kernel,) - the conv kernel weights for channel c
  x_conv[c] = dot(view(m.conv_state, c, :), view(m.ssm_conv1d, c, :))
  end
-    
-    # 4. SiLU activation
-    @. x_conv = x_conv * (1.0f0 / (1.0f0 + exp(-x_conv)))
-    
-    # 5. Split into Q, K, V
-    qk_size = m.head_k_dim * m.num_k_heads
-    q_all = reshape(view(x_conv, 1:qk_size), m.head_k_dim, m.num_k_heads)
-    k_all = reshape(view(x_conv, qk_size+1:2*qk_size), m.head_k_dim, m.num_k_heads)
-    v_all = reshape(view(x_conv, 2*qk_size+1:2*qk_size+m.d_inner), m.head_v_dim, m.num_v_heads)
-    
- # 6. Alpha/beta projections
+ 
+ # 4. SiLU activation
+ @. x_conv = x_conv * (1.0f0 / (1.0f0 + exp(-x_conv)))
+ 
+ # 5. Split into Q, K, V
+ qk_size = m.head_k_dim * m.num_k_heads
+ q_all = reshape(view(x_conv, 1:qk_size), m.head_k_dim, m.num_k_heads)
+ k_all = reshape(view(x_conv, qk_size+1:2*qk_size), m.head_k_dim, m.num_k_heads)
+ v_all = reshape(view(x_conv, 2*qk_size+1:2*qk_size+m.d_inner), m.head_v_dim, m.num_v_heads)
+ 
+ # 6. Alpha/beta projections (use pre-allocated buffers)
  # ssm_alpha_weight is (hidden, num_v_heads), need transpose for mat-vec mul
- alpha_proj = m.ssm_alpha_weight' * x
- beta_proj = m.ssm_beta_weight' * x
-    
+ mul!(m.alpha_proj_buf, m.ssm_alpha_weight', x)
+ mul!(m.beta_proj_buf, m.ssm_beta_weight', x)
+ alpha_proj = m.alpha_proj_buf
+ beta_proj = m.beta_proj_buf
+ 
 # 7. Process each head (delta net) - per-group states
-y_all = zeros(Float32, m.d_inner)
+# Use pre-allocated buffer
+y_all = m.y_all_buf
+fill!(y_all, 0.0f0)
 
 eps = 1.0f-6
 
@@ -374,10 +388,13 @@ for h in 1:m.num_v_heads
  scale = 1.0f0 / sqrt(Float32(m.head_k_dim))
 
  # L2 normalize q and k (as per llama.cpp ggml_l2_norm)
+ # Use pre-allocated buffers to avoid allocations in loop
  q_norm = Float32(norm(qg))
  k_norm = Float32(norm(kg))
- q_normalized = qg ./ (q_norm + eps) .* scale
- k_normalized = kg ./ (k_norm + eps)
+ q_normalized = m.q_norm_buf
+ k_normalized = m.k_norm_buf
+ @. q_normalized = qg / (q_norm + eps) * scale
+ @. k_normalized = kg / (k_norm + eps)
 
  # Gate values
  alpha_val = clamp(Float64(alpha_proj[h]) + Float64(m.ssm_dt_bias[h]), -20.0, 20.0)

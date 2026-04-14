@@ -392,24 +392,34 @@ ssm_beta_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_beta.w
     conv_channels = weight_outer_dim(in_proj) # 6144 (C)
     conv_kernel = size(ssm_conv1d, 2) # 4 (K)
     
-    # Recompute head_k_dim from conv_channels
-    # conv_channels = d_inner + 2 * num_k_heads * head_k_dim
-    # head_k_dim = (conv_channels - d_inner) / (2 * num_k_heads)
-    head_k_dim = (conv_channels - d_inner) ÷ (2 * num_k_heads)
-    
+ # Recompute head_k_dim from conv_channels
+ # conv_channels = d_inner + 2 * num_k_heads * head_k_dim
+ # head_k_dim = (conv_channels - d_inner) / (2 * num_k_heads)
+ head_k_dim = (conv_channels - d_inner) ÷ (2 * num_k_heads)
+ 
  # State buffers
  conv_state = zeros(Float32, conv_channels, conv_kernel)
  h = zeros(Float32, head_v_dim, head_k_dim, num_v_heads) # Per-group states
-    
-    return ModelCPU.GatedDeltaNetCPU(
-        layer_idx + 1,
-        in_proj, gate_proj, ssm_out, ssm_conv1d,
-        ssm_alpha_weight, ssm_beta_weight,
-        ssm_a, ssm_dt_bias, ssm_norm,
-        num_v_heads, num_k_heads, head_k_dim, head_v_dim, d_inner,
-        conv_channels, conv_kernel,
-        conv_state, h
-    )
+ 
+ # Pre-allocated work buffers to avoid GC
+ x_conv_buf = Vector{Float32}(undef, conv_channels)
+ y_all_buf = Vector{Float32}(undef, d_inner)
+ alpha_proj_buf = Vector{Float32}(undef, num_v_heads)
+ beta_proj_buf = Vector{Float32}(undef, num_v_heads)
+ q_norm_buf = Vector{Float32}(undef, head_k_dim)
+ k_norm_buf = Vector{Float32}(undef, head_k_dim)
+ 
+ return ModelCPU.GatedDeltaNetCPU(
+ layer_idx + 1,
+ in_proj, gate_proj, ssm_out, ssm_conv1d,
+ ssm_alpha_weight, ssm_beta_weight,
+ ssm_a, ssm_dt_bias, ssm_norm,
+ num_v_heads, num_k_heads, head_k_dim, head_v_dim, d_inner,
+ conv_channels, conv_kernel,
+ conv_state, h,
+ x_conv_buf, y_all_buf, alpha_proj_buf, beta_proj_buf,
+ q_norm_buf, k_norm_buf
+ )
 end
 
 function load_attention_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU)

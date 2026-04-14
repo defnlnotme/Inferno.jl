@@ -510,46 +510,56 @@ function load_ssm_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, config:
     conv_state = zeros(Float32, conv_channels, conv_kernel)
     h = zeros(Float32, head_v_dim, head_k_dim, num_v_heads)
     
-    # SSM norm
-    if ssm_norm_w === nothing
-        ssm_norm_w = ones(Float32, head_k_dim)
-    end
-    ssm_norm = ModelCPU.RMSNormCPU(ssm_norm_w, config.rms_norm_eps)
-    
-    # dt_bias
-    if ssm_dt_bias === nothing
-        ssm_dt_bias = zeros(Float32, num_v_heads)
-    end
-    
-    # alpha and beta weights
-    if alpha_weight === nothing
-        alpha_weight = zeros(Float32, num_v_heads, config.hidden_size)
-    end
-    if beta_weight === nothing
-        beta_weight = zeros(Float32, num_v_heads, config.hidden_size)
-    end
-    
-    return ModelCPU.GatedDeltaNetCPU(
-        layer_idx,
-        in_proj,
-        gate_proj,
-        ssm_out,
-        ssm_conv1d,
-        alpha_weight,
-        beta_weight,
-        ssm_a !== nothing ? ssm_a : zeros(Float32, num_v_heads),
-        ssm_dt_bias,
-        ssm_norm,
-        num_v_heads,
-        num_v_heads,
-        head_k_dim,
-        head_v_dim,
-        d_inner,
-        conv_channels,
-        conv_kernel,
-        conv_state,
-        h
-    ), load_mlp_safetensors(sf, layer_idx, config)
+ # SSM norm
+ if ssm_norm_w === nothing
+ ssm_norm_w = ones(Float32, head_k_dim)
+ end
+ ssm_norm = ModelCPU.RMSNormCPU(ssm_norm_w, config.rms_norm_eps)
+ 
+ # dt_bias
+ if ssm_dt_bias === nothing
+ ssm_dt_bias = zeros(Float32, num_v_heads)
+ end
+ 
+ # alpha and beta weights
+ if alpha_weight === nothing
+ alpha_weight = zeros(Float32, num_v_heads, config.hidden_size)
+ end
+ if beta_weight === nothing
+ beta_weight = zeros(Float32, num_v_heads, config.hidden_size)
+ end
+ 
+ # Pre-allocated work buffers to avoid GC
+ x_conv_buf = Vector{Float32}(undef, conv_channels)
+ y_all_buf = Vector{Float32}(undef, d_inner)
+ alpha_proj_buf = Vector{Float32}(undef, num_v_heads)
+ beta_proj_buf = Vector{Float32}(undef, num_v_heads)
+ q_norm_buf = Vector{Float32}(undef, head_k_dim)
+ k_norm_buf = Vector{Float32}(undef, head_k_dim)
+ 
+ return ModelCPU.GatedDeltaNetCPU(
+ layer_idx,
+ in_proj,
+ gate_proj,
+ ssm_out,
+ ssm_conv1d,
+ alpha_weight,
+ beta_weight,
+ ssm_a !== nothing ? ssm_a : zeros(Float32, num_v_heads),
+ ssm_dt_bias,
+ ssm_norm,
+ num_v_heads,
+ num_v_heads,
+ head_k_dim,
+ head_v_dim,
+ d_inner,
+ conv_channels,
+ conv_kernel,
+ conv_state,
+ h,
+ x_conv_buf, y_all_buf, alpha_proj_buf, beta_proj_buf,
+ q_norm_buf, k_norm_buf
+ ), load_mlp_safetensors(sf, layer_idx, config)
 end
 
 # Helper function to squeeze middle dimension of 3D array

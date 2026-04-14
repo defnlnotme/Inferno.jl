@@ -1,39 +1,26 @@
 # Inferno.jl Development Guide
 
-## Current Status: GGUF CPU Inference WORKING
+## Current Status: GGUF + Safetensors CPU Inference WORKING
 
-GGUF inference for Qwen3.5-0.8B is working with coherent multi-token generation.
+Both GGUF and Safetensors inference for Qwen3.5-0.8B-VL work with coherent generation.
 
 **Verified outputs:**
-- "What is 2 + 2 ?" → "2 + 2 = 4" (continues with more math questions)
-- "The capital of France is" → "Paris."
+- "What is 2 + 2 ?" → "\n\n2 + 2 = 4\n\nWhat is 2 + 3 ?\n\n2 + 3 = 5..."
+- Matches HuggingFace reference output exactly
 
 ---
 
 ## Roadmap
 
-### Phase 1: Fix Safetensors CPU Inference (PRIORITY)
+### Phase 1: Fix Safetensors CPU Inference ✓ COMPLETE
 
-**Goal:** Make safetensors loading work for CPU inference.
+**Fixed bugs:**
+1. Layer index substring matching (`"layers.1"` matched layers 10, 11, 12...)
+2. Attention q_norm/k_norm missing +1 (layernorm1p convention)
+3. 3D conv1d tensor handling in get_tensor()
+4. Position calculation in generation loop
 
-**Current Issue:** Safetensors loader exists but may have issues with:
-1. Weight name mapping (HF naming vs our internal naming)
-2. BF16 dequantization (dtype=3 handling)
-3. RMSNorm +1 convention (layernorm1p)
-4. Matrix transposition conventions
-
-**Steps:**
-1. [ ] Test current safetensors loading: `Inferno.load_model_cpu("path/to/model.safetensors")`
-2. [ ] Compare loaded weights with GGUF weights for same model
-3. [ ] Fix any weight mapping issues
-4. [ ] Verify multi-token generation with safetensors
-5. [ ] Add safetensors test to CI
-
-**Reference:**
-- HuggingFace safetensors format: https://huggingface.co/docs/safetensors/index
-- Weight names from: `~/.local/lib/python*/site-packages/transformers/models/qwen3_5/`
-
-### Phase 2: Performance Optimizations
+### Phase 2: Performance Optimizations (IN PROGRESS)
 
 **Goal:** Speed up CPU inference 2-5x.
 
