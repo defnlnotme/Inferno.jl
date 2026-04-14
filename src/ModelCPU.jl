@@ -364,20 +364,15 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
  end
  m.conv_state[:, m.conv_kernel] .= qkv
  
- # 3. Compute convolution - x_conv[c] = sum_k conv_state[c,k] * ssm_conv1d[c,k]
- # ssm_conv1d is stored as (conv_channels, conv_kernel) = (C, K)
- # conv_state is (conv_channels, conv_kernel) = (C, K)
- # Use pre-allocated buffer
+ # 3. Compute convolution with fused SiLU activation
+ # x_conv[c] = silu(sum_k conv_state[c,k] * ssm_conv1d[c,k])
+ # Fused: compute dot product and apply SiLU in one step
  x_conv = m.x_conv_buf
  for c in 1:m.conv_channels
- # Dot product of the channel's history and the kernel's weights for that channel
- # conv_state[c, :] is (conv_kernel,) - the history for channel c
- # ssm_conv1d[c, :] is (conv_kernel,) - the conv kernel weights for channel c
- x_conv[c] = dot(view(m.conv_state, c, :), view(m.ssm_conv1d, c, :))
+ # Fused conv + silu: silu(x) = x / (1 + exp(-x))
+ v = dot(view(m.conv_state, c, :), view(m.ssm_conv1d, c, :))
+ x_conv[c] = v / (1.0f0 + exp(-v))
  end
- 
- # 4. SiLU activation
- @. x_conv = x_conv * (1.0f0 / (1.0f0 + exp(-x_conv)))
  
  # 5. Split into Q, K, V
  qk_size = m.head_k_dim * m.num_k_heads
@@ -409,14 +404,27 @@ for h in 1:m.num_v_heads
  # Apply scale factor (llama.cpp uses 1/sqrt(head_k_dim))
  scale = 1.0f0 / sqrt(Float32(m.head_k_dim))
 
- # L2 normalize q and k (as per llama.cpp ggml_l2_norm)
+ # L2 normalize q and k with fused scaling (as per llama.cpp ggml_l2_norm)
+ # Fused: norm + divide + scale in one pass
  # Use pre-allocated buffers to avoid allocations in loop
- q_norm = Float32(norm(qg))
- k_norm = Float32(norm(kg))
  q_normalized = m.q_norm_buf
  k_normalized = m.k_norm_buf
- @. q_normalized = qg / (q_norm + eps) * scale
- @. k_normalized = kg / (k_norm + eps)
+ 
+ # Compute squared sums for L2 norm
+ q_sum_sq = 0.0f0
+ k_sum_sq = 0.0f0
+ for i in 1:m.head_k_dim
+ q_sum_sq += qg[i] * qg[i]
+ k_sum_sq += kg[i] * kg[i]
+ end
+ 
+ # Fused normalize + scale in one pass
+ q_norm_val = 1.0f0 / (sqrt(q_sum_sq) + eps) * scale
+ k_norm_val = 1.0f0 / (sqrt(k_sum_sq) + eps)
+ for i in 1:m.head_k_dim
+ q_normalized[i] = qg[i] * q_norm_val
+ k_normalized[i] = kg[i] * k_norm_val
+ end
 
  # Gate values
  alpha_val = clamp(Float64(alpha_proj[h]) + Float64(m.ssm_dt_bias[h]), -20.0, 20.0)
@@ -435,32 +443,27 @@ for h in 1:m.num_v_heads
  beta_gate = Float32(1.0 / (1.0 + exp(-beta_val)))
 
  # State operations (DeltaNet autoregressive)
- # state: [head_v_dim, head_v_dim] = [128, 128]
+ # state: [head_v_dim, head_k_dim] = [128, 128]
  state = view(m.h, :, :, h)
  
  # Decay: state *= exp(g) where g = ssm_a * softplus_alpha
  state .*= decay_to_apply
  
  # sk = state * k (matrix-vector multiply)
- # state is [V, K], k is [K,], result is [V,]
- # Use pre-allocated buffer
  sk = m.sk_buf
  mul!(sk, state, k_normalized)
  
  # d = beta * (v - sk)
- # Use pre-allocated buffer
  d = m.d_buf
  @. d = beta_gate * (vg - sk)
  
- # State update: S = S + d * k'
- # This adds outer product of d (V,) and k (K,) to state (V, K)
- state .+= d .* k_normalized' # Broadcasting: [V,] .* [K,]' = [V, K]
+ # State update: S = S + d * k' (outer product)
+ state .+= d .* k_normalized'
  
- # Output: y = state * q
- # state is [V, K], q is [K,], result is [V,]
- # Use pre-allocated buffer
+ # y = state * q
  y_h = m.y_h_buf
  mul!(y_h, state, q_normalized)
+ 
  yg = view(y_all, (h-1)*m.head_v_dim+1:h*m.head_v_dim)
  yg .= y_h
 end
