@@ -457,11 +457,18 @@ function load_attention_layer(file::GGUF.GGUFFile, layer_idx::Int, config::Model
     scale = 1.0f0 / sqrt(Float32(config.head_dim))
  
  # Pre-allocated work buffers
- q_size = n_heads * config.head_dim
+ qkv_size = n_heads * config.head_dim * 2  # wq output size
+ kv_size = n_kv * config.head_dim           # wk/wv output size
+ q_size = n_heads * config.head_dim         # query after split
+ 
+ qkv_buf = Vector{Float32}(undef, qkv_size)
+ k_buf = Vector{Float32}(undef, kv_size)
+ v_buf = Vector{Float32}(undef, kv_size)
  query_states_buf = Vector{Float32}(undef, q_size)
  gate_buf = Vector{Float32}(undef, q_size)
  output_buf = Vector{Float32}(undef, q_size)
- # Max seq_len for scores buffer (will be 4096 in practice)
+ wo_output_buf = Vector{Float32}(undef, config.hidden_size)
+ # Max seq_len for scores buffer
  max_seq = config.max_position_embeddings
  scores_buf = Vector{Float32}(undef, max_seq)
  
@@ -470,7 +477,8 @@ function load_attention_layer(file::GGUF.GGUFFile, layer_idx::Int, config::Model
  wq, wk, wv, wo,
  q_norm, k_norm,
  n_heads, n_kv, config.head_dim, scale,
- query_states_buf, gate_buf, output_buf, scores_buf
+ qkv_buf, k_buf, v_buf,
+ query_states_buf, gate_buf, output_buf, scores_buf, wo_output_buf
  )
 end
 

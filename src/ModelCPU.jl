@@ -162,9 +162,18 @@ function init_kv_cache_cpu(config::QwenConfigCPU, max_seq::Int = 4096)
 end
 
 function update_kv_cache!(cache::KVCacheCPU, k::Matrix{Float32}, v::Matrix{Float32}, pos::Int)
-    @views cache.k[:, :, pos + 1] .= k
-    @views cache.v[:, :, pos + 1] .= v
-    return cache
+ # Manual copy to avoid allocation
+ for h in 1:size(k, 2)
+ for d in 1:size(k, 1)
+ cache.k[d, h, pos + 1] = k[d, h]
+ end
+ end
+ for h in 1:size(v, 2)
+ for d in 1:size(v, 1)
+ cache.v[d, h, pos + 1] = v[d, h]
+ end
+ end
+ return cache
 end
 
 # --- MLP ---
@@ -571,38 +580,38 @@ struct FullAttentionCPU
  head_dim::Int
  scale::Float32
  # Pre-allocated work buffers
- query_states_buf::Vector{Float32}
- gate_buf::Vector{Float32}
- output_buf::Vector{Float32}
- scores_buf::Vector{Float32}
+ qkv_buf::Vector{Float32}      # wq output (n_heads * head_dim * 2)
+ k_buf::Vector{Float32}        # wk output (n_kv * head_dim)
+ v_buf::Vector{Float32}        # wv output (n_kv * head_dim)
+ query_states_buf::Vector{Float32}  # query after split (n_heads * head_dim)
+ gate_buf::Vector{Float32}          # gate after split (n_heads * head_dim)
+ output_buf::Vector{Float32}        # final output (n_heads * head_dim)
+ scores_buf::Vector{Float32}        # attention scores (max_seq_len)
+ wo_output_buf::Vector{Float32}     # wo output (hidden_size)
 end
 
 function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddingCPU, cache::KVCacheCPU)
- # Q, K, V projections
- qkv = attn.wq * x # This produces n_heads * head_dim * 2 output
- k = attn.wk * x
- v = attn.wv * x
+ # Q, K, V projections using pre-allocated buffers
+ mul!(attn.qkv_buf, attn.wq, x)
+ mul!(attn.k_buf, attn.wk, x)
+ mul!(attn.v_buf, attn.wv, x)
 
- # Split qkv into query and gate using pre-allocated buffers
- # HF layout: for each head, [query (head_dim), gate (head_dim)]
- # So qkv is: [q0, g0, q1, g1, ..., q7, g7] where each qi, gi is head_dim elements
- # Total: n_heads * (head_dim + head_dim) = n_heads * head_dim * 2
- q_size = attn.n_heads * attn.head_dim
+ # Split qkv into query and gate - manual loop to avoid allocation
  query_states = attn.query_states_buf
  gate = attn.gate_buf
  
  for h in 1:attn.n_heads
- # For each head, query is at [head_idx * (2*head_dim) : head_idx * (2*head_dim) + head_dim]
- # and gate is at [head_idx * (2*head_dim) + head_dim : (head_idx+1) * (2*head_dim)]
  base = (h - 1) * (2 * attn.head_dim)
- query_states[(h-1)*attn.head_dim+1:h*attn.head_dim] .= qkv[base+1:base+attn.head_dim]
- gate[(h-1)*attn.head_dim+1:h*attn.head_dim] .= qkv[base+attn.head_dim+1:base+2*attn.head_dim]
+ for i in 1:attn.head_dim
+ query_states[(h-1)*attn.head_dim+i] = attn.qkv_buf[base+i]
+ gate[(h-1)*attn.head_dim+i] = attn.qkv_buf[base+attn.head_dim+i]
+ end
  end
 
  # Reshape to (head_dim, num_heads)
  query_states = reshape(query_states, attn.head_dim, attn.n_heads)
- k = reshape(k, attn.head_dim, attn.n_kv)
- v = reshape(v, attn.head_dim, attn.n_kv)
+ k = reshape(attn.k_buf, attn.head_dim, attn.n_kv)
+ v = reshape(attn.v_buf, attn.head_dim, attn.n_kv)
 
  # Fused RMSNorm + RoPE for Q and K (reduces memory passes)
  rmsnorm_rotary!(query_states, pos, rope, attn.q_norm)
@@ -622,42 +631,53 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
  for h in 1:attn.n_heads
  kv_h = div(h - 1, gqa_ratio) + 1
 
- q_h = query_states[:, h]
+ # Use view instead of slice to avoid allocation
+ q_h = view(query_states, :, h)
 
  # Extract K and V for this KV head: (head_dim, seq_len)
  K_h = view(cache.k, :, kv_h, 1:seq_len)
  V_h = view(cache.v, :, kv_h, 1:seq_len)
 
  # Compute scores: K' * q = (seq_len, head_dim) * (head_dim,) = (seq_len,)
- # Use pre-allocated scores buffer
- # Note: K_h is (head_dim, seq_len), we need to compute K_h' * q_h
- # which gives (seq_len, head_dim) * (head_dim,) = (seq_len,)
  scores = view(attn.scores_buf, 1:seq_len)
  # Manual mat-vec multiply to avoid allocation
  for i in 1:seq_len
  scores[i] = dot(view(K_h, :, i), q_h) * attn.scale
  end
 
- # Softmax (in-place on scores buffer)
+ # Softmax (in-place on scores buffer) - manual to avoid broadcast allocation
  max_score = maximum(scores)
- @. scores = exp(scores - max_score)
+ for i in 1:seq_len
+ scores[i] = exp(scores[i] - max_score)
+ end
  sum_scores = sum(scores)
- @. scores /= sum_scores
+ for i in 1:seq_len
+ scores[i] /= sum_scores
+ end
 
  # Weighted sum: V * scores = (head_dim, seq_len) * (seq_len,) = (head_dim,)
- out_h = V_h * scores
-
- output[(h-1)*attn.head_dim+1:h*attn.head_dim] .= out_h
+ # Manual mat-vec to avoid allocation
+ for i in 1:attn.head_dim
+ s = 0.0f0
+ for j in 1:seq_len
+ s += V_h[i, j] * scores[j]
+ end
+ output[(h-1)*attn.head_dim+i] = s
+ end
  end
 
  # Apply sigmoid gate to output (gate comes from Q projection)
- # gate has shape (n_heads * head_dim,) = (q_size,)
- gate_sigmoid = gate  # Reuse gate buffer for sigmoid result
- @. gate_sigmoid = 1.0f0 / (1.0f0 + exp(-gate))
- output .*= gate_sigmoid
+ # Manual loop to avoid broadcast allocation
+ for i in 1:length(gate)
+ gate[i] = 1.0f0 / (1.0f0 + exp(-gate[i]))
+ end
+ for i in 1:length(output)
+ output[i] *= gate[i]
+ end
 
- # Output projection
- return attn.wo * output
+ # Output projection using pre-allocated buffer
+ mul!(attn.wo_output_buf, attn.wo, output)
+ return attn.wo_output_buf
 end
 
 # --- Decoder Layer ---
@@ -707,7 +727,8 @@ function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
  for t in 1:seq_len
  tok = tokens[t] # Already 1-indexed from encode()
  curr_pos = pos + t - 1
- x = view(model.embed, :, tok)
+ # Copy embedding to avoid modifying the embedding matrix
+ x = model.embed[:, tok]
  for (i, layer) in enumerate(model.layers)
  x = layer(x, curr_pos, model.rope, caches[i])
  end
@@ -721,13 +742,14 @@ function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
  for t in 1:seq_len
  tok = tokens[t] # Already 1-indexed from encode()
  curr_pos = pos + t - 1
- x = view(model.embed, :, tok)
+ # Copy embedding to avoid modifying the embedding matrix
+ x = model.embed[:, tok]
  for (i, layer) in enumerate(model.layers)
  x = layer(x, curr_pos, model.rope, caches[i])
  end
  x = model.final_norm(x)
  if t == seq_len
- last_logits .= model.lm_head * x
+ mul!(last_logits, model.lm_head, x)
  end
  end
  return reshape(last_logits, model.config.vocab_size, 1)

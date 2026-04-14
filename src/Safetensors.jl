@@ -635,10 +635,21 @@ function load_attention_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, c
  end
  
  # Pre-allocated work buffers
- q_size = config.num_attention_heads * config.head_dim
+ n_heads = config.num_attention_heads
+ n_kv = config.num_key_value_heads
+ head_dim = config.head_dim
+ 
+ qkv_size = n_heads * head_dim * 2  # wq output size
+ kv_size = n_kv * head_dim           # wk/wv output size
+ q_size = n_heads * head_dim         # query after split
+ 
+ qkv_buf = Vector{Float32}(undef, qkv_size)
+ k_buf = Vector{Float32}(undef, kv_size)
+ v_buf = Vector{Float32}(undef, kv_size)
  query_states_buf = Vector{Float32}(undef, q_size)
  gate_buf = Vector{Float32}(undef, q_size)
  output_buf = Vector{Float32}(undef, q_size)
+ wo_output_buf = Vector{Float32}(undef, config.hidden_size)
  max_seq = config.max_position_embeddings
  scores_buf = Vector{Float32}(undef, max_seq)
  
@@ -646,11 +657,10 @@ function load_attention_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, c
  layer_idx,
  wq, wk, wv, wo,
  q_norm, k_norm,
- config.num_attention_heads,
- config.num_key_value_heads,
- config.head_dim,
- Float32(1.0 / sqrt(config.head_dim)),
- query_states_buf, gate_buf, output_buf, scores_buf
+ n_heads, n_kv, head_dim,
+ Float32(1.0 / sqrt(head_dim)),
+ qkv_buf, k_buf, v_buf,
+ query_states_buf, gate_buf, output_buf, scores_buf, wo_output_buf
  )
 end
 
