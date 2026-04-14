@@ -28,6 +28,11 @@ This matches HuggingFace reference output exactly.
 - After: 60 KiB, 81 allocs per call
 - Reduction: 40% memory, 37% allocations
 
+**MLP Layer Optimization:**
+- Before: 46 KiB, 12 allocs per call
+- After: 0 bytes, 0 allocs per call
+- Reduction: 100% memory, 100% allocations
+
 **Overall Performance:**
 - 11-19 tokens/sec (up from 10-18 baseline)
 - 52-86 ms/token latency
@@ -86,6 +91,7 @@ All weights now match between GGUF and safetensors:
 1. ✓ Performance optimizations (Phase 2 - IN PROGRESS)
    - ✓ SSM pre-allocated buffers (27% memory reduction)
    - ✓ Attention pre-allocated buffers (40% memory reduction)
+   - ✓ MLP pre-allocated buffers (100% memory reduction)
    - [ ] SIMD vectorization with LoopVectorization.jl
    - [ ] Memory pre-allocation for remaining hot paths
    - [ ] BLAS threading optimization
