@@ -619,20 +619,29 @@ function load_attention_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, c
  
  q_norm = ModelCPU.RMSNormCPU(q_norm_w, config.rms_norm_eps)
  k_norm = ModelCPU.RMSNormCPU(k_norm_w, config.rms_norm_eps)
-    
-    if wq === nothing || wk === nothing || wv === nothing || wo === nothing
-        error("Missing attention tensors for layer $layer_idx")
-    end
-    
-    return ModelCPU.FullAttentionCPU(
-        layer_idx,
-        wq, wk, wv, wo,
-        q_norm, k_norm,
-        config.num_attention_heads,
-        config.num_key_value_heads,
-        config.head_dim,
-        Float32(1.0 / sqrt(config.head_dim))
-    )
+ 
+ if wq === nothing || wk === nothing || wv === nothing || wo === nothing
+ error("Missing attention tensors for layer $layer_idx")
+ end
+ 
+ # Pre-allocated work buffers
+ q_size = config.num_attention_heads * config.head_dim
+ query_states_buf = Vector{Float32}(undef, q_size)
+ gate_buf = Vector{Float32}(undef, q_size)
+ output_buf = Vector{Float32}(undef, q_size)
+ max_seq = config.max_position_embeddings
+ scores_buf = Vector{Float32}(undef, max_seq)
+ 
+ return ModelCPU.FullAttentionCPU(
+ layer_idx,
+ wq, wk, wv, wo,
+ q_norm, k_norm,
+ config.num_attention_heads,
+ config.num_key_value_heads,
+ config.head_dim,
+ Float32(1.0 / sqrt(config.head_dim)),
+ query_states_buf, gate_buf, output_buf, scores_buf
+ )
 end
 
 function load_mlp_safetensors(sf::SafetensorsFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU)

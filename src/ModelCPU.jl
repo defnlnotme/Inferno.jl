@@ -488,17 +488,22 @@ end
 
 # --- Full Attention ---
 struct FullAttentionCPU
-    index::Int
-    wq::Matrix{Float32}  # (n_heads * head_dim * 2, hidden) — query + gate projection
-    wk::Matrix{Float32}  # (n_kv * head_dim, hidden)
-    wv::Matrix{Float32}  # (n_kv * head_dim, hidden)
-    wo::Matrix{Float32}  # (hidden, n_heads * head_dim)     — output projection
-    q_norm::RMSNormCPU
-    k_norm::RMSNormCPU
-    n_heads::Int
-    n_kv::Int
-    head_dim::Int
-    scale::Float32
+ index::Int
+ wq::Matrix{Float32} # (n_heads * head_dim * 2, hidden) — query + gate projection
+ wk::Matrix{Float32} # (n_kv * head_dim, hidden)
+ wv::Matrix{Float32} # (n_kv * head_dim, hidden)
+ wo::Matrix{Float32} # (hidden, n_heads * head_dim) — output projection
+ q_norm::RMSNormCPU
+ k_norm::RMSNormCPU
+ n_heads::Int
+ n_kv::Int
+ head_dim::Int
+ scale::Float32
+ # Pre-allocated work buffers
+ query_states_buf::Vector{Float32}
+ gate_buf::Vector{Float32}
+ output_buf::Vector{Float32}
+ scores_buf::Vector{Float32}
 end
 
 function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddingCPU, cache::KVCacheCPU)
@@ -507,21 +512,20 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
  k = attn.wk * x
  v = attn.wv * x
 
- # Split qkv into query and gate
+ # Split qkv into query and gate using pre-allocated buffers
  # HF layout: for each head, [query (head_dim), gate (head_dim)]
  # So qkv is: [q0, g0, q1, g1, ..., q7, g7] where each qi, gi is head_dim elements
  # Total: n_heads * (head_dim + head_dim) = n_heads * head_dim * 2
- # We need to extract query and gate for each head separately
  q_size = attn.n_heads * attn.head_dim
- query_states = zeros(Float32, q_size)
- gate = zeros(Float32, q_size)
+ query_states = attn.query_states_buf
+ gate = attn.gate_buf
  
  for h in 1:attn.n_heads
-     # For each head, query is at [head_idx * (2*head_dim) : head_idx * (2*head_dim) + head_dim]
-     # and gate is at [head_idx * (2*head_dim) + head_dim : (head_idx+1) * (2*head_dim)]
-     base = (h - 1) * (2 * attn.head_dim)
-     query_states[(h-1)*attn.head_dim+1:h*attn.head_dim] .= qkv[base+1:base+attn.head_dim]
-     gate[(h-1)*attn.head_dim+1:h*attn.head_dim] .= qkv[base+attn.head_dim+1:base+2*attn.head_dim]
+ # For each head, query is at [head_idx * (2*head_dim) : head_idx * (2*head_dim) + head_dim]
+ # and gate is at [head_idx * (2*head_dim) + head_dim : (head_idx+1) * (2*head_dim)]
+ base = (h - 1) * (2 * attn.head_dim)
+ query_states[(h-1)*attn.head_dim+1:h*attn.head_dim] .= qkv[base+1:base+attn.head_dim]
+ gate[(h-1)*attn.head_dim+1:h*attn.head_dim] .= qkv[base+attn.head_dim+1:base+2*attn.head_dim]
  end
 
  # Reshape to (head_dim, num_heads)
@@ -547,7 +551,9 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
  update_kv_cache!(cache, k, v, pos)
 
  # Compute attention scores using BLAS
- output = zeros(Float32, attn.n_heads * attn.head_dim)
+ # Use pre-allocated output buffer
+ output = attn.output_buf
+ fill!(output, 0.0f0)
 
  gqa_ratio = div(attn.n_heads, attn.n_kv)
  seq_len = pos + 1
@@ -562,13 +568,20 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
  V_h = view(cache.v, :, kv_h, 1:seq_len)
 
  # Compute scores: K' * q = (seq_len, head_dim) * (head_dim,) = (seq_len,)
- scores = K_h' * q_h
- scores .*= attn.scale
+ # Use pre-allocated scores buffer
+ # Note: K_h is (head_dim, seq_len), we need to compute K_h' * q_h
+ # which gives (seq_len, head_dim) * (head_dim,) = (seq_len,)
+ scores = view(attn.scores_buf, 1:seq_len)
+ # Manual mat-vec multiply to avoid allocation
+ for i in 1:seq_len
+ scores[i] = dot(view(K_h, :, i), q_h) * attn.scale
+ end
 
- # Softmax
+ # Softmax (in-place on scores buffer)
  max_score = maximum(scores)
- scores = exp.(scores .- max_score)
- scores ./= sum(scores)
+ @. scores = exp(scores - max_score)
+ sum_scores = sum(scores)
+ @. scores /= sum_scores
 
  # Weighted sum: V * scores = (head_dim, seq_len) * (seq_len,) = (head_dim,)
  out_h = V_h * scores
@@ -578,7 +591,8 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
 
  # Apply sigmoid gate to output (gate comes from Q projection)
  # gate has shape (n_heads * head_dim,) = (q_size,)
- gate_sigmoid = 1.0f0 ./ (1.0f0 .+ exp.(-gate)) # sigmoid
+ gate_sigmoid = gate  # Reuse gate buffer for sigmoid result
+ @. gate_sigmoid = 1.0f0 / (1.0f0 + exp(-gate))
  output .*= gate_sigmoid
 
  # Output projection

@@ -445,13 +445,23 @@ function load_attention_layer(file::GGUF.GGUFFile, layer_idx::Int, config::Model
     n_kv = size(wk, 1) ÷ config.head_dim
     
     scale = 1.0f0 / sqrt(Float32(config.head_dim))
-    
-    return ModelCPU.FullAttentionCPU(
-        layer_idx + 1,
-        wq, wk, wv, wo,
-        q_norm, k_norm,
-        n_heads, n_kv, config.head_dim, scale
-    )
+ 
+ # Pre-allocated work buffers
+ q_size = n_heads * config.head_dim
+ query_states_buf = Vector{Float32}(undef, q_size)
+ gate_buf = Vector{Float32}(undef, q_size)
+ output_buf = Vector{Float32}(undef, q_size)
+ # Max seq_len for scores buffer (will be 4096 in practice)
+ max_seq = config.max_position_embeddings
+ scores_buf = Vector{Float32}(undef, max_seq)
+ 
+ return ModelCPU.FullAttentionCPU(
+ layer_idx + 1,
+ wq, wk, wv, wo,
+ q_norm, k_norm,
+ n_heads, n_kv, config.head_dim, scale,
+ query_states_buf, gate_buf, output_buf, scores_buf
+ )
 end
 
 function load_mlp(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU; keep_quantized::Bool=false)
