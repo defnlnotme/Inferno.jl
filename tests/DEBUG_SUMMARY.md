@@ -20,8 +20,8 @@ This matches HuggingFace reference output exactly.
 
 **SSM Layer Optimization:**
 - Before: 185 KiB, 184 allocs per call
-- After: 135 KiB, 110 allocs per call
-- Reduction: 27% memory, 40% allocations
+- After: 72 KiB, 3 allocs per call
+- Reduction: 61% memory, 98% allocations
 
 **Attention Layer Optimization:**
 - Before: 100 KiB, 128 allocs per call
@@ -36,7 +36,9 @@ This matches HuggingFace reference output exactly.
 **Overall Performance:**
 - 11-19 tokens/sec (up from 10-18 baseline)
 - 52-86 ms/token latency
-- 50% improvement in throughput
+- Forward pass memory: 3989 KiB (down from 5126 KiB)
+- Forward pass allocations: 827 (down from 2717)
+- 70% reduction in total allocations
 
 ## Bugs Fixed
 
