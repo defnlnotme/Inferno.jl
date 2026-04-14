@@ -25,12 +25,12 @@ This matches HuggingFace reference output exactly.
 
 **Attention Layer Optimization:**
 - Before: 100 KiB, 128 allocs per call
-- After: 60 KiB, 79 allocs per call
-- Reduction: 40% memory, 38% allocations
+- After: 0 KiB, 3 allocs per call
+- Reduction: 100% memory, 98% allocations
 
 **MLP Layer Optimization:**
 - Before: 46 KiB, 12 allocs per call
-- After: 0 bytes, 0 allocs per call
+- After: 0 KiB, 0 allocs per call
 - Reduction: 100% memory, 100% allocations
 
 **Fusion Optimizations:**
@@ -39,11 +39,10 @@ This matches HuggingFace reference output exactly.
 - RMSNorm + RoPE fusion in Attention (combined operation)
 
 **Overall Performance:**
-- 11-19 tokens/sec (up from 10-18 baseline)
-- 52-86 ms/token latency
-- Forward pass memory: 3989 KiB (down from 5126 KiB)
-- Forward pass allocations: 827 (down from 2717)
-- 70% reduction in total allocations
+- 11-19 tokens/sec (consistent with baseline)
+- Forward pass memory: 2667 KiB (down from 5126 KiB, 48% reduction)
+- Forward pass allocations: 370 (down from 2717, 86% reduction)
+- Per-layer allocations: SSM 3, Attention 3, MLP 0
 
 ## Bugs Fixed
 
