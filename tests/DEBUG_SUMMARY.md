@@ -25,13 +25,18 @@ This matches HuggingFace reference output exactly.
 
 **Attention Layer Optimization:**
 - Before: 100 KiB, 128 allocs per call
-- After: 60 KiB, 81 allocs per call
-- Reduction: 40% memory, 37% allocations
+- After: 60 KiB, 79 allocs per call
+- Reduction: 40% memory, 38% allocations
 
 **MLP Layer Optimization:**
 - Before: 46 KiB, 12 allocs per call
 - After: 0 bytes, 0 allocs per call
 - Reduction: 100% memory, 100% allocations
+
+**Fusion Optimizations:**
+- Conv + SiLU fusion in SSM (reduces memory passes)
+- L2 norm + scale fusion in SSM (single-pass normalization)
+- RMSNorm + RoPE fusion in Attention (combined operation)
 
 **Overall Performance:**
 - 11-19 tokens/sec (up from 10-18 baseline)
