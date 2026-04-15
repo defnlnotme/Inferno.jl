@@ -6,6 +6,7 @@ module ModelCPU
 
 using LinearAlgebra
 using Statistics
+using LoopVectorization
 using ..QuantsCPU
 using Printf
 
@@ -436,9 +437,12 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
  # x_conv[c] = silu(sum_k conv_state[c,k] * ssm_conv1d[c,k])
  # Fused: compute dot product and apply SiLU in one step
  x_conv = m.x_conv_buf
- for c in 1:m.conv_channels
+ @turbo for c in 1:m.conv_channels
  # Fused conv + silu: silu(x) = x / (1 + exp(-x))
- v = dot(view(m.conv_state, c, :), view(m.ssm_conv1d, c, :))
+ v = zero(Float32)
+ for k in 1:m.conv_kernel
+ v += m.conv_state[c, k] * m.ssm_conv1d[c, k]
+ end
  x_conv[c] = v / (1.0f0 + exp(-v))
  end
  
@@ -519,15 +523,21 @@ for h in 1:m.num_v_heads
  state = view(m.h, :, :, h)
  
  # Decay: state *= exp(g) where g = ssm_a * softplus_alpha
- state .*= decay_to_apply
+ @turbo state .*= decay_to_apply
  
  # sk = state * k (matrix-vector multiply)
  sk = m.sk_buf
- mul!(sk, state, k_normalized)
+ @turbo for i in 1:m.head_v_dim
+ s = zero(Float32)
+ for j in 1:m.head_k_dim
+ s += state[i, j] * k_normalized[j]
+ end
+ sk[i] = s
+ end
  
  # d = beta * (v - sk)
  d = m.d_buf
- @. d = beta_gate * (vg - sk)
+ @turbo @. d = beta_gate * (vg - sk)
  
  # State update: S = S + d * k' (outer product) - use BLAS.ger! for rank-1 update
  # ger!(alpha, x, y, A) computes A = alpha*x*y' + A
@@ -535,7 +545,13 @@ for h in 1:m.num_v_heads
  
  # y = state * q
  y_h = m.y_h_buf
- mul!(y_h, state, q_normalized)
+ @turbo for i in 1:m.head_v_dim
+ s = zero(Float32)
+ for j in 1:m.head_k_dim
+ s += state[i, j] * q_normalized[j]
+ end
+ y_h[i] = s
+ end
  
  yg = view(y_all, (h-1)*m.head_v_dim+1:h*m.head_v_dim)
  yg .= y_h
