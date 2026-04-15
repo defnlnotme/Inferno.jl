@@ -91,20 +91,26 @@ function apply_rotary_emb!(x::Matrix{Float32}, pos::Int, rope::RotaryEmbeddingCP
  head_dim, num_heads = size(x, 1), size(x, 2)
  half = div(rope.rotary_dim, 2)
  
+ # Precompute cos/sin for this position (shared across all heads)
+ # This avoids recomputing cos/sin for each head
+ cos_vals = @inbounds [cos(rope.inv_freq[i] * pos) for i in 1:half]
+ sin_vals = @inbounds [sin(rope.inv_freq[i] * pos) for i in 1:half]
+ 
  for h in 1:num_heads
  for i in 1:half
- freq = rope.inv_freq[i] * pos
- cos_val = cos(freq)
- sin_val = sin(freq)
- 
+ @inbounds begin
  idx1 = i
  idx2 = i + half
  
  x1 = x[idx1, h]
  x2 = x[idx2, h]
  
- x[idx1, h] = x1 * cos_val - x2 * sin_val
- x[idx2, h] = x1 * sin_val + x2 * cos_val
+ c = cos_vals[i]
+ s = sin_vals[i]
+ 
+ x[idx1, h] = x1 * c - x2 * s
+ x[idx2, h] = x1 * s + x2 * c
+ end
  end
  end
  return x
@@ -116,34 +122,39 @@ function rmsnorm_rotary!(x::Matrix{Float32}, pos::Int, rope::RotaryEmbeddingCPU,
  half = div(rope.rotary_dim, 2)
  weight = norm.weight
  
+ # Precompute cos/sin for this position (shared across all heads)
+ cos_vals = @inbounds [cos(rope.inv_freq[i] * pos) for i in 1:half]
+ sin_vals = @inbounds [sin(rope.inv_freq[i] * pos) for i in 1:half]
+ 
  for h in 1:num_heads
  # First: RMSNorm on this head
  sum_sq = 0.0f0
  for i in 1:head_dim
- sum_sq += x[i, h] * x[i, h]
+ @inbounds sum_sq += x[i, h] * x[i, h]
  end
  rms = sqrt(sum_sq / head_dim + norm.eps)
  inv_rms = 1.0f0 / rms
  
  # Apply RMSNorm and RoPE in one pass
  for i in 1:head_dim
- x[i, h] = x[i, h] * inv_rms * weight[i]
+ @inbounds x[i, h] = x[i, h] * inv_rms * weight[i]
  end
  
  # Now apply RoPE to the first rotary_dim dimensions
  for i in 1:half
- freq = rope.inv_freq[i] * pos
- cos_val = cos(freq)
- sin_val = sin(freq)
- 
+ @inbounds begin
  idx1 = i
  idx2 = i + half
  
  x1 = x[idx1, h]
  x2 = x[idx2, h]
  
- x[idx1, h] = x1 * cos_val - x2 * sin_val
- x[idx2, h] = x1 * sin_val + x2 * cos_val
+ c = cos_vals[i]
+ s = sin_vals[i]
+ 
+ x[idx1, h] = x1 * c - x2 * s
+ x[idx2, h] = x1 * s + x2 * c
+ end
  end
  end
  return x
@@ -505,8 +516,9 @@ for h in 1:m.num_v_heads
  d = m.d_buf
  @. d = beta_gate * (vg - sk)
  
- # State update: S = S + d * k' (outer product)
- state .+= d .* k_normalized'
+ # State update: S = S + d * k' (outer product) - use BLAS.ger! for rank-1 update
+ # ger!(alpha, x, y, A) computes A = alpha*x*y' + A
+ BLAS.ger!(1.0f0, d, k_normalized, state)
  
  # y = state * q
  y_h = m.y_h_buf
