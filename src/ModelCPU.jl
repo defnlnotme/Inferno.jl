@@ -58,19 +58,19 @@ function RMSNormCPU(weight::AbstractArray{Float32}, eps::Float32)
     return RMSNormCPU(vec(weight), eps)
 end
 
-function (norm::RMSNormCPU)(x::AbstractArray{Float32})
+@inline function (norm::RMSNormCPU)(x::AbstractArray{Float32})
  ss = mapreduce(abs2, +, x)
  m = ss / length(x)
  scale = 1.0f0 / sqrt(m + norm.eps)
  return x .* scale .* norm.weight
 end
 
-function rmsnorm_cpu!(out::AbstractArray{Float32}, x::AbstractArray{Float32}, norm::RMSNormCPU)
-    # Using sum(abs2, x) is generally faster and more stable in Julia for this size
-    ss = sum(abs2, x)
-    scale = 1.0f0 / sqrt(ss / length(x) + norm.eps)
-    out .= x .* scale .* norm.weight
-    return out
+@inline function rmsnorm_cpu!(out::AbstractArray{Float32}, x::AbstractArray{Float32}, norm::RMSNormCPU)
+ # Using sum(abs2, x) is generally faster and more stable in Julia for this size
+ ss = sum(abs2, x)
+ scale = 1.0f0 / sqrt(ss / length(x) + norm.eps)
+ out .= x .* scale .* norm.weight
+ return out
 end
 
 # --- Rotary Position Embedding ---
@@ -469,20 +469,24 @@ for h in 1:m.num_v_heads
  q_normalized = m.q_norm_buf
  k_normalized = m.k_norm_buf
  
- # Compute squared sums for L2 norm
+ # Compute squared sums for L2 norm with SIMD
  q_sum_sq = 0.0f0
  k_sum_sq = 0.0f0
- for i in 1:m.head_k_dim
+ @simd ivdep for i in 1:m.head_k_dim
+ @inbounds begin
  q_sum_sq += qg[i] * qg[i]
  k_sum_sq += kg[i] * kg[i]
  end
+ end
  
- # Fused normalize + scale in one pass
+ # Fused normalize + scale in one pass with SIMD
  q_norm_val = 1.0f0 / (sqrt(q_sum_sq) + eps) * scale
  k_norm_val = 1.0f0 / (sqrt(k_sum_sq) + eps)
- for i in 1:m.head_k_dim
+ @simd ivdep for i in 1:m.head_k_dim
+ @inbounds begin
  q_normalized[i] = qg[i] * q_norm_val
  k_normalized[i] = kg[i] * k_norm_val
+ end
  end
 
  # Gate values
@@ -540,8 +544,10 @@ end
 
 # 9. SiLU gate on z
 # silu(z) = z * sigmoid(z) = z / (1 + exp(-z))
-# Output: norm(y_all) * silu(z)
-@. y_all = y_all * z * (1.0f0 / (1.0f0 + exp(-z)))
+# Output: norm(y_all) * silu(z) - use SIMD for element-wise operation
+@simd ivdep for i in 1:length(y_all)
+ @inbounds y_all[i] = y_all[i] * z[i] * (1.0f0 / (1.0f0 + exp(-z[i])))
+end
 # Removed variance scaling as it caused looping/instability
 # y_all .*= 1.0f0 / sqrt(Float32(m.head_v_dim))
  
@@ -652,26 +658,26 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
 
  # Compute scores: K' * q = (seq_len, head_dim) * (head_dim,) = (seq_len,)
  scores = view(attn.scores_buf, 1:seq_len)
- # Manual mat-vec multiply to avoid allocation
- for i in 1:seq_len
+ # Manual mat-vec multiply to avoid allocation - use SIMD for inner loop
+ @inbounds for i in 1:seq_len
  scores[i] = dot(view(K_h, :, i), q_h) * attn.scale
  end
 
  # Softmax (in-place on scores buffer) - manual to avoid broadcast allocation
  max_score = maximum(scores)
- for i in 1:seq_len
- scores[i] = exp(scores[i] - max_score)
+ @simd ivdep for i in 1:seq_len
+ @inbounds scores[i] = exp(scores[i] - max_score)
  end
  sum_scores = sum(scores)
- for i in 1:seq_len
- scores[i] /= sum_scores
+ @simd ivdep for i in 1:seq_len
+ @inbounds scores[i] /= sum_scores
  end
 
  # Weighted sum: V * scores = (head_dim, seq_len) * (seq_len,) = (head_dim,)
- # Manual mat-vec to avoid allocation
- for i in 1:attn.head_dim
+ # Manual mat-vec to avoid allocation - use SIMD
+ @inbounds for i in 1:attn.head_dim
  s = 0.0f0
- for j in 1:seq_len
+ @simd ivdep for j in 1:seq_len
  s += V_h[i, j] * scores[j]
  end
  output[(h-1)*attn.head_dim+i] = s
@@ -679,12 +685,12 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
  end
 
  # Apply sigmoid gate to output (gate comes from Q projection)
- # Manual loop to avoid broadcast allocation
- for i in 1:length(gate)
- gate[i] = 1.0f0 / (1.0f0 + exp(-gate[i]))
+ # Manual loop to avoid broadcast allocation - use SIMD
+ @simd ivdep for i in 1:length(gate)
+ @inbounds gate[i] = 1.0f0 / (1.0f0 + exp(-gate[i]))
  end
- for i in 1:length(output)
- output[i] *= gate[i]
+ @simd ivdep for i in 1:length(output)
+ @inbounds output[i] *= gate[i]
  end
 
  # Output projection using pre-allocated buffer
