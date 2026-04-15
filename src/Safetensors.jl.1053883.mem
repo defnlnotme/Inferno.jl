@@ -1,0 +1,705 @@
+        - """
+        - Safetensors loader for Inferno.jl
+        - Loads model weights from HuggingFace safetensors format.
+        - """
+        - module Safetensors
+        - 
+        - using JSON3
+        - using LinearAlgebra
+        - using ..ModelCPU
+        - using ..Tokenizer
+        - 
+        - export load_safetensors_model, SafetensorsFile
+        - 
+        - struct SafetensorsFile
+        0     path::String
+        -     metadata::Dict{String, Any}
+        -     tensors::Dict{String, Tuple{Int, Int, Vector{Int}}}  # name -> (offset, dtype, shape)
+        -     data::Vector{UInt8}
+        - end
+        - 
+        - """
+        - Parse safetensors file header and return tensor info.
+        - """
+        - function parse_safetensors(path::String)
+        0     data = read(path)
+        -     
+        -     # First 8 bytes are header size (little-endian uint64)
+        0     header_size = reinterpret(UInt64, data[1:8])[1]
+        -     
+        -     # Parse JSON header
+        0     header_bytes = data[9:8+header_size]
+        0     header = JSON3.read(String(header_bytes))
+        -     
+        -     # Extract tensor info
+        0     tensors = Dict{String, Tuple{Int, Int, Vector{Int}}}()
+        0     data_offset = 8 + header_size
+        -     
+        0     for (name_sym, info) in header
+        0         name = String(name_sym)  # Convert Symbol to String
+        0  if name == "__metadata__"
+        -  continue
+        -  end
+        -  
+        -  # Get tensor properties
+        0  dtype_str = get(info, :dtype, "F32")
+        0  dtype = if dtype_str == "F32"
+        -  1
+        0  elseif dtype_str == "F16"
+        -  2
+        0  elseif dtype_str == "BF16"
+        -  3 # BF16
+        -  else
+        0  1 # Default to F32
+        -  end
+        0  shape = Int.(get(info, :shape, []))
+        0  offsets = Int.(get(info, :data_offsets, [0, 0]))
+        -         
+        -         # Store offset relative to data section (add 1 for Julia 1-indexing)
+        -         # The offsets in JSON are 0-indexed relative to data section start
+        0         tensors[name] = (data_offset + offsets[1] + 1, dtype, shape)
+        0     end
+        -     
+        0     metadata = get(header, "__metadata__", Dict{String, Any}())
+        -     
+        0     return SafetensorsFile(path, metadata, tensors, data)
+        - end
+        - 
+        - """
+        - Get tensor data from safetensors file.
+        - """
+        - function get_tensor(safetensors::SafetensorsFile, name::String)
+        0  if !haskey(safetensors.tensors, name)
+        0  return nothing
+        -  end
+        -  
+        0  offset, dtype, shape = safetensors.tensors[name]
+        0  num_elements = prod(shape)
+        -  
+        0  if dtype == 1 # F32
+        0  bytes = safetensors.data[offset:offset + num_elements * 4 - 1]
+        0  data = reinterpret(Float32, bytes)
+        -  # Materialize the array before reshape
+        0  data_vec = Vector{Float32}(data)
+        -  # Safetensors stores row-major, Julia is column-major
+        0  if length(shape) == 2
+        0  return copy(reshape(data_vec, shape[2], shape[1])')
+        0  elseif length(shape) == 3 && shape[2] == 1
+        -  # 3D tensor with shape [C, 1, K] (like conv1d)
+        -  # Safetensors stores as [C, K] in row-major
+        -  # Need: reshape to (K, C) then transpose to (C, K)
+        0  return copy(reshape(data_vec, shape[3], shape[1])')
+        -  else
+        0  return copy(reshape(data_vec, shape...))
+        -  end
+        0  elseif dtype == 2 # F16
+        0  bytes = safetensors.data[offset:offset + num_elements * 2 - 1]
+        0  data16 = reinterpret(Float16, bytes)
+        0  data = Float32.(Vector{Float16}(data16))
+        -  # Safetensors stores row-major, Julia is column-major
+        0  if length(shape) == 2
+        0  return copy(reshape(data, shape[2], shape[1])')
+        0  elseif length(shape) == 3 && shape[2] == 1
+        -  # 3D tensor with shape [C, 1, K] (like conv1d)
+        0  return copy(reshape(data, shape[3], shape[1])')
+        -  else
+        0  return copy(reshape(data, shape...))
+        -  end
+        0  elseif dtype == 3 # BF16
+        0  bytes = safetensors.data[offset:offset + num_elements * 2 - 1]
+        -  # BF16 is stored as 16-bit values, need to convert to Float32
+        -  # BF16 has same exponent format as F32, just truncated mantissa
+        -  # To convert: reinterpret as UInt16, shift left 16 bits, reinterpret as Float32
+        0  data_bf16 = reinterpret(UInt16, bytes)
+        -  # Each BF16 value needs to become a Float32
+        0  data_f32 = [reinterpret(Float32, UInt32(x) << 16) for x in data_bf16]
+        -  # Safetensors stores data in row-major order, but Julia uses column-major.
+        -  # We need to reshape and then transpose to get correct ordering.
+        -  # For a 2D tensor with shape [rows, cols], the data is stored row-by-row.
+        -  # In Julia, reshape(data, cols, rows)' gives the correct matrix.
+        0  if length(shape) == 2
+        0  return copy(reshape(data_f32, shape[2], shape[1])')
+        0  elseif length(shape) == 3 && shape[2] == 1
+        -  # 3D tensor with shape [C, 1, K] (like conv1d)
+        -  # Safetensors stores as [C, K] in row-major
+        -  # Need: reshape to (K, C) then transpose to (C, K)
+        0  return copy(reshape(data_f32, shape[3], shape[1])')
+        -  else
+        0  return copy(reshape(data_f32, shape...))
+        -  end
+        -  else
+        0  error("Unsupported dtype: $dtype")
+        -  end
+        - end
+        - 
+        - """
+        - List all tensor names matching a pattern.
+        - """
+        - function list_tensors(safetensors::SafetensorsFile, pattern::Regex)
+        -     return filter(name -> occursin(pattern, name), keys(safetensors.tensors))
+        - end
+        - 
+        - """
+        - Load Qwen3.5 model from safetensors format.
+        - Accepts either a directory path (containing config.json and .safetensors files)
+        - or a direct path to a .safetensors file.
+        - """
+        - function load_safetensors_model(model_path::String)
+        -  # Determine if path is file or directory
+        0  if isfile(model_path) && endswith(lowercase(model_path), ".safetensors")
+        -  # Direct file path
+        -  safetensors_path = model_path
+        0  model_dir = dirname(model_path)
+        0  if isempty(model_dir)
+        -  model_dir = "."
+        -  end
+        0  elseif isdir(model_path)
+        -  # Directory path
+        -  model_dir = model_path
+        0  safetensors_files = filter(f -> endswith(lowercase(f), ".safetensors"), readdir(model_dir))
+        0  if isempty(safetensors_files)
+        0  error("No safetensors files found in $model_dir")
+        -  end
+        0  safetensors_path = joinpath(model_dir, safetensors_files[1])
+        -  else
+        0  error("Invalid path: $model_path (must be .safetensors file or directory)")
+        -  end
+        -  
+        -  # Load config
+        0  config_path = joinpath(model_dir, "config.json")
+        0  if !isfile(config_path)
+        0  error("config.json not found in $model_dir")
+        -  end
+        0  config = JSON3.read(read(config_path, String))
+        -     
+        -     # Parse text_config
+        0     text_config = get(config, "text_config", Dict{String, Any}())
+        -     
+        -     # Create QwenConfigCPU
+        0     model_config = ModelCPU.QwenConfigCPU(
+        -         architecture = :qwen35,
+        -         vocab_size = get(text_config, "vocab_size", 248320),
+        -         hidden_size = get(text_config, "hidden_size", 1024),
+        -         intermediate_size = get(text_config, "intermediate_size", 3584),
+        -         num_hidden_layers = get(text_config, "num_hidden_layers", 24),
+        -         num_attention_heads = get(text_config, "num_attention_heads", 8),
+        -         num_key_value_heads = get(text_config, "num_key_value_heads", 2),
+        -         head_dim = get(text_config, "head_dim", 256),
+        -         rms_norm_eps = Float32(get(text_config, "rms_norm_eps", 1e-6)),
+        -         rope_theta = Float32(get(text_config, "rope_theta", 10000000.0)),
+        -         max_position_embeddings = get(text_config, "max_position_embeddings", 262144),
+        -         partial_rotary_factor = Float32(get(get(text_config, "rope_parameters", Dict{String, Any}()), "partial_rotary_factor", 0.25)),
+        -         full_attention_interval = get(text_config, "full_attention_interval", 4),
+        -         ssm_inner_size = get(text_config, "intermediate_size", 3584),
+        -         ssm_state_size = get(text_config, "linear_key_head_dim", 128),
+        -  ssm_group_count = get(text_config, "linear_num_key_heads", 16),
+        -  ssm_time_step_rank = get(text_config, "linear_num_value_heads", 16),
+        -  ssm_conv_kernel = get(text_config, "linear_conv_kernel_dim", 4),
+        -  )
+        -  
+        -  # Load safetensors file
+        0  println("Loading safetensors from: $safetensors_path")
+        0  sf = parse_safetensors(safetensors_path)
+        -     
+        -     # Print tensor names for debugging
+        0     println("\nAvailable tensor names (first 20):")
+        0     for (i, name) in enumerate(keys(sf.tensors))
+        0         if i > 20
+        -             break
+        -         end
+        0         println("  $name")
+        0     end
+        -     
+        -  # Load embedding
+        0  embed = get_tensor(sf, "model.language_model.embed_tokens.weight")
+        0  if embed === nothing
+        0  error("Could not find embed_tokens.weight")
+        -  end
+        -  # get_tensor already returns correctly shaped matrix (vocab_size, hidden_size)
+        -  # We need (hidden_size, vocab_size) for our model, so transpose
+        0  embed = Matrix(Float32.(embed'))
+        -  
+        0  println("\\nEmbedding shape: ", size(embed))
+        -     
+        -     # Load layers
+        0     layers = ModelCPU.DecoderLayerCPU[]
+        0     layer_types = get(text_config, "layer_types", [])
+        -     
+        0     for layer_idx in 0:(model_config.num_hidden_layers - 1)
+        0         println("Loading layer $layer_idx...")
+        -         
+        -         # Determine layer type
+        0         is_ssm = layer_idx < length(layer_types) && layer_types[layer_idx + 1] == "linear_attention"
+        -         
+        -  # Load attention norm - try multiple naming conventions
+        -  # Filter out mtp layers - we want model.language_model.layers.X
+        -  in_norm_w = nothing
+        0  for name in keys(sf.tensors)
+        -  # Use regex with dot after layer number to avoid layers.1 matching layers.10
+        0  if occursin(Regex("layers\\.$layer_idx\\."), name) && !occursin("mtp", name)
+        0  if occursin("input_layernorm", name) || occursin("attention_norm", name)
+        0  in_norm_w = get_tensor(sf, name)
+        -  break
+        -  end
+        -  end
+        0  end
+        0 if in_norm_w === nothing
+        0  in_norm_w = ones(Float32, model_config.hidden_size)
+        - end
+        - # Qwen uses standard RMSNorm: weight directly multiplies (no +1 transform)
+        - # HuggingFace weights are stored as-is, not as (w-1)
+        0 in_norm = ModelCPU.RMSNormCPU(vec(Float32.(in_norm_w) .+ 1.0f0), model_config.rms_norm_eps)
+        -  
+        -  # Load post attention norm
+        -  post_norm_w = nothing
+        0  for name in keys(sf.tensors)
+        -  # Use regex with dot after layer number to avoid layers.1 matching layers.10
+        0  if occursin(Regex("layers\\.$layer_idx\\."), name) && !occursin("mtp", name)
+        0  if occursin("post_attention", name) || occursin("post_attention_norm", name)
+        0  post_norm_w = get_tensor(sf, name)
+        -  break
+        -  end
+        -  end
+        0  end
+        0 if post_norm_w === nothing
+        0  post_norm_w = ones(Float32, model_config.hidden_size)
+        - end
+        - # ModelCPU expects +1 (layernorm1p convention) - add 1 to match GGUF format
+        0 post_norm = ModelCPU.RMSNormCPU(vec(Float32.(post_norm_w) .+ 1.0f0), model_config.rms_norm_eps)
+        -         
+        0         if is_ssm
+        -             # Load SSM/linear attention layer
+        0             op, mlp = load_ssm_layer_safetensors(sf, layer_idx, model_config)
+        -         else
+        -             # Load full attention layer
+        0             op = load_attention_layer_safetensors(sf, layer_idx, model_config)
+        0             mlp = load_mlp_safetensors(sf, layer_idx, model_config)
+        -         end
+        -         
+        0         push!(layers, ModelCPU.DecoderLayerCPU(in_norm, op, post_norm, mlp, is_ssm))
+        0     end
+        -     
+        -     # Load final norm
+        -     final_norm_w = nothing
+        0     for name in keys(sf.tensors)
+        0         if occursin("language_model.norm", name) || occursin("ln_f", name)
+        0             final_norm_w = get_tensor(sf, name)
+        -             break
+        -         end
+        0     end
+        0 if final_norm_w === nothing
+        0  final_norm_w = ones(Float32, model_config.hidden_size)
+        - end
+        - # ModelCPU expects +1 (layernorm1p convention) - add 1 to match GGUF format
+        0 final_norm = ModelCPU.RMSNormCPU(vec(Float32.(final_norm_w) .+ 1.0f0), model_config.rms_norm_eps)
+        -     
+        0     println("\nFinal norm weight mean: ", sum(final_norm.weight) / length(final_norm.weight))
+        -     
+        -     # LM head (tied with embedding for Qwen)
+        0     lm_head = embed'
+        -     
+        -     # Create RoPE
+        0     rotary_dim = round(Int, model_config.head_dim * model_config.partial_rotary_factor)
+        0     rope = ModelCPU.RotaryEmbeddingCPU(model_config.head_dim, model_config.rope_theta, model_config.max_position_embeddings; rotary_dim=rotary_dim)
+        -     
+        -     # Load tokenizer
+        0     tokenizer = load_hf_tokenizer(model_dir)
+        -     
+        0     return ModelCPU.QwenModelCPU(model_config, embed, lm_head, layers, final_norm, rope), tokenizer
+        - end
+        - 
+        - """
+        - Load tokenizer from HuggingFace format files.
+        - """
+        - function load_hf_tokenizer(model_dir::String)
+        -     # Try to load tokenizer.json
+        0     tokenizer_json_path = joinpath(model_dir, "tokenizer.json")
+        -     
+        0     if !isfile(tokenizer_json_path)
+        0         error("tokenizer.json not found in $model_dir")
+        -     end
+        -     
+        0     tokenizer_data = JSON3.read(read(tokenizer_json_path, String))
+        -     
+        -     # Load vocab
+        0     vocab_path = joinpath(model_dir, "vocab.json")
+        0     if isfile(vocab_path)
+        0         vocab = JSON3.read(read(vocab_path, String))
+        -     else
+        0         vocab = Dict{String, Int}()
+        -     end
+        -     
+        -     # Load merges
+        0     merges_path = joinpath(model_dir, "merges.txt")
+        0     merges = String[]
+        0     if isfile(merges_path)
+        0         merge_lines = readlines(merges_path)
+        -         # Skip header line if present
+        0         start_idx = startswith(merge_lines[1], "#") || !occursin(" ", merge_lines[1]) ? 2 : 1
+        0         merges = merge_lines[start_idx:end]
+        -     end
+        -     
+        -     # Build token_to_id and id_to_token
+        -     # Use vocab if available, otherwise use tokenizer_data
+        0     token_to_id = Dict{String, Int}()
+        -     
+        0     if !isempty(vocab)
+        0         for (token_sym, id) in vocab
+        0             token_to_id[String(token_sym)] = id + 1  # Convert to 1-indexed
+        0         end
+        0     elseif haskey(tokenizer_data, :model) && haskey(tokenizer_data[:model], :vocab)
+        0         for (token_sym, id) in tokenizer_data[:model][:vocab]
+        0             token_to_id[String(token_sym)] = id + 1
+        0         end
+        -     end
+        -     
+        0     vocab_size = length(token_to_id)
+        0     id_to_token = Vector{String}(undef, vocab_size)
+        0     for (token, id) in token_to_id
+        0         id_to_token[id] = token
+        0     end
+        -     
+        -     # Build merge priority
+        0     merge_priority = Dict{Tuple{String, String}, Int}()
+        0     for (i, m) in enumerate(merges)
+        0         parts = split(m, ' ', limit=2)
+        0         if length(parts) == 2
+        0             merge_priority[(parts[1], parts[2])] = i
+        -         end
+        0     end
+        -     
+        -     # Get special tokens
+        0     special_tokens = String[]
+        0     if haskey(tokenizer_data, :added_tokens)
+        0         added_tokens = tokenizer_data[:added_tokens]
+        0         if isa(added_tokens, Dict) || isa(added_tokens, AbstractDict)
+        0             for (id, info) in added_tokens
+        0                 if isa(info, Dict) || isa(info, AbstractDict)
+        0                     content = get(info, :content, "")
+        -                 else
+        -                     content = ""
+        -                 end
+        0                 if !in(content, special_tokens) && !isempty(content)
+        0                     push!(special_tokens, content)
+        -                 end
+        0             end
+        -         end
+        -     end
+        -     
+        -     # Load tokenizer config for EOS/BOS
+        0     tokenizer_config_path = joinpath(model_dir, "tokenizer_config.json")
+        -     eos_id = -1
+        -     bos_id = -1
+        -     
+        0     if isfile(tokenizer_config_path)
+        0         tc = JSON3.read(read(tokenizer_config_path, String))
+        0         if haskey(tc, :eos_token)
+        0             eos_tok = tc[:eos_token]
+        -             if isa(eos_tok, Dict)
+        -                 eos_tok = String(get(eos_tok, :content, ""))
+        -             end
+        0             if haskey(token_to_id, eos_tok)
+        0                 eos_id = token_to_id[eos_tok]
+        -             end
+        -         end
+        0         if haskey(tc, :bos_token)
+        0             bos_tok = tc[:bos_token]
+        -             if isa(bos_tok, Dict)
+        -                 bos_tok = String(get(bos_tok, :content, ""))
+        -             end
+        0             if haskey(token_to_id, bos_tok)
+        0                 bos_id = token_to_id[bos_tok]
+        -             end
+        -         end
+        -     end
+        -     
+        -     # Default EOS for Qwen
+        0     if eos_id == -1
+        -         eos_id = 248045  # <|im_end|>
+        -     end
+        -     
+        -     # Determine pretokenizer
+        0     pretokenizer = "default"
+        0     if haskey(tokenizer_data, :normalizer) || haskey(tokenizer_data, :pre_tokenizer)
+        -         pretokenizer = "qwen2"
+        -     end
+        -     
+        0     Tokenizer.BPETokenizer(
+        -         token_to_id,
+        -         id_to_token,
+        -         [(split(m, ' ', limit=2)[1], split(m, ' ', limit=2)[2]) for m in merges if length(split(m, ' ', limit=2)) == 2],
+        -         merge_priority,
+        -         special_tokens,
+        -         pretokenizer,
+        -         bos_id,
+        -         eos_id
+        -     )
+        - end
+        - 
+        - function load_ssm_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU)
+        -     # Find SSM tensors with flexible naming
+        -     # Safetensors format: in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, conv1d, out_proj, A_log, dt_bias, norm
+        -     in_proj = nothing
+        -     gate_proj = nothing  # in_proj_z in safetensors
+        -     ssm_out = nothing
+        -     ssm_conv1d = nothing
+        -     ssm_a = nothing
+        -     ssm_dt_bias = nothing
+        -     ssm_norm_w = nothing
+        -     alpha_weight = nothing  # in_proj_a in safetensors
+        -  beta_weight = nothing # in_proj_b in safetensors
+        -  
+        0  for name in keys(sf.tensors)
+        -  # Must match exact layer number - use regex with word boundary to avoid layers.1 matching layers.10
+        0  if !occursin(Regex("layers\\.$layer_idx\\."), name) || occursin("mtp", name)
+        -  continue
+        -  end
+        -  
+        0  if occursin("linear_attn.in_proj_qkv", name)
+        0             tensor = get_tensor(sf, name)
+        0             in_proj = Matrix{Float32}(tensor)  # (6144, 1024) - no transpose needed
+        0         elseif occursin("linear_attn.in_proj_z", name)
+        0             tensor = get_tensor(sf, name)
+        0             gate_proj = Matrix{Float32}(tensor)  # (2048, 1024) - no transpose needed
+        0  elseif occursin("linear_attn.in_proj_a", name)
+        0  tensor = get_tensor(sf, name)
+        -  # Safetensors stores as (num_v_heads, hidden_size) = (16, 1024)
+        -  # ModelCPU expects (hidden_size, num_v_heads) = (1024, 16) for: weight' * x
+        -  # Need to transpose
+        0  alpha_weight = Matrix{Float32}(tensor') # Transpose to (1024, 16)
+        0  elseif occursin("linear_attn.in_proj_b", name)
+        0  tensor = get_tensor(sf, name)
+        -  # Same as alpha - transpose to match ModelCPU expectation
+        0  beta_weight = Matrix{Float32}(tensor') # Transpose to (1024, 16)
+        0         elseif occursin("linear_attn.out_proj", name)
+        0             tensor = get_tensor(sf, name)
+        0             ssm_out = Matrix{Float32}(tensor)  # (1024, 2048) - no transpose needed
+        0  elseif occursin("linear_attn.conv1d", name)
+        0  tensor = get_tensor(sf, name)
+        -  # conv1d is [6144, 1, 4] in safetensors = (channels, 1, kernel_size)
+        -  # get_tensor handles the 3D -> 2D conversion for us
+        -  # Result is (6144, 4) = (channels, kernel_size)
+        0  ssm_conv1d = Matrix{Float32}(tensor)
+        0         elseif occursin("linear_attn.A_log", name)
+        0             data = get_tensor(sf, name)
+        0             ssm_a = -exp.(Float32.(vec(data)))  # A_log stores log(-A), need -exp(A_log) = A
+        0         elseif occursin("linear_attn.dt_bias", name)
+        0             data = get_tensor(sf, name)
+        0             ssm_dt_bias = vec(Float32.(data))
+        0         elseif occursin("linear_attn.norm", name)
+        0             data = get_tensor(sf, name)
+        0             ssm_norm_w = vec(Float32.(data))
+        -         end
+        0     end
+        -     
+        -  # Get dimensions from in_proj shape
+        0  conv_channels = size(in_proj, 1) # 6144
+        0  d_inner = conv_channels ÷ 3 # 2048 (QKV split)
+        -  
+        -  # Get num_v_heads from A_log or dt_bias
+        0  num_v_heads = ssm_a !== nothing ? length(ssm_a) : 16
+        -  
+        -  # Get head dimensions
+        0  head_v_dim = d_inner ÷ num_v_heads # 2048 / 16 = 128
+        0  head_k_dim = ssm_norm_w !== nothing ? length(ssm_norm_w) : 128
+        -  
+        -  # Conv kernel - ssm_conv1d is (channels, kernel_size) = (6144, 4) after fix
+        0  conv_kernel = size(ssm_conv1d, 2) # 4 (kernel_size)
+        -     
+        -     # Create state buffers
+        0     conv_state = zeros(Float32, conv_channels, conv_kernel)
+        0     h = zeros(Float32, head_v_dim, head_k_dim, num_v_heads)
+        -     
+        -  # SSM norm
+        0  if ssm_norm_w === nothing
+        0  ssm_norm_w = ones(Float32, head_k_dim)
+        -  end
+        0  ssm_norm = ModelCPU.RMSNormCPU(ssm_norm_w, config.rms_norm_eps)
+        -  
+        -  # dt_bias
+        0  if ssm_dt_bias === nothing
+        0  ssm_dt_bias = zeros(Float32, num_v_heads)
+        -  end
+        -  
+        -  # alpha and beta weights
+        0  if alpha_weight === nothing
+        0  alpha_weight = zeros(Float32, num_v_heads, config.hidden_size)
+        -  end
+        0  if beta_weight === nothing
+        0  beta_weight = zeros(Float32, num_v_heads, config.hidden_size)
+        -  end
+        -  
+        -  # Pre-allocated work buffers to avoid GC
+        0  x_conv_buf = Vector{Float32}(undef, conv_channels)
+        0  y_all_buf = Vector{Float32}(undef, d_inner)
+        0  alpha_proj_buf = Vector{Float32}(undef, num_v_heads)
+        0  beta_proj_buf = Vector{Float32}(undef, num_v_heads)
+        -  # Pre-allocated mat-vec output buffers
+        0  qkv_buf = Vector{Float32}(undef, conv_channels)
+        0  z_buf = Vector{Float32}(undef, d_inner)
+        0  out_buf = Vector{Float32}(undef, config.hidden_size)
+        -  # Per-head loop buffers
+        0  sk_buf = Vector{Float32}(undef, head_v_dim)
+        0  d_buf = Vector{Float32}(undef, head_v_dim)
+        0  y_h_buf = Vector{Float32}(undef, head_v_dim)
+        0  q_norm_buf = Vector{Float32}(undef, head_k_dim)
+        0  k_norm_buf = Vector{Float32}(undef, head_k_dim)
+        -  
+        0  return ModelCPU.GatedDeltaNetCPU(
+        -  layer_idx,
+        -  in_proj,
+        -  gate_proj,
+        -  ssm_out,
+        -  ssm_conv1d,
+        -  alpha_weight,
+        -  beta_weight,
+        -  ssm_a !== nothing ? ssm_a : zeros(Float32, num_v_heads),
+        -  ssm_dt_bias,
+        -  ssm_norm,
+        -  num_v_heads,
+        -  num_v_heads,
+        -  head_k_dim,
+        -  head_v_dim,
+        -  d_inner,
+        -  conv_channels,
+        -  conv_kernel,
+        -  conv_state,
+        -  h,
+        -  x_conv_buf, y_all_buf, alpha_proj_buf, beta_proj_buf,
+        -  qkv_buf, z_buf, out_buf,
+        -  sk_buf, d_buf, y_h_buf,
+        -  q_norm_buf, k_norm_buf
+        -  ), load_mlp_safetensors(sf, layer_idx, config)
+        - end
+        - 
+        - # Helper function to squeeze middle dimension of 3D array
+        - function squeeze_middle(arr::Array{Float32, 3})
+        -     s = size(arr)
+        -     if s[2] == 1
+        -         return reshape(arr, s[1], s[3])
+        -     else
+        -         return dropdims(arr, dims=2)
+        -     end
+        - end
+        - 
+        - function load_attention_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU)
+        -     wq = nothing
+        -     wk = nothing
+        -     wv = nothing
+        -     wo = nothing
+        -  q_norm_w = nothing
+        -  k_norm_w = nothing
+        -  
+        0  for name in keys(sf.tensors)
+        -  # Use regex with dot after layer number to avoid layers.1 matching layers.10
+        0  if !occursin(Regex("layers\\.$layer_idx\\."), name) || occursin("mtp", name)
+        -  continue
+        -  end
+        -  
+        0  if occursin("self_attn.q_proj", name) && occursin("weight", name)
+        0  tensor = get_tensor(sf, name)
+        -  # q_proj outputs [num_heads * head_dim * 2, hidden] = [2048 * 2, 1024] = [4096, 1024]
+        -  # This is Q + gate concatenated
+        0  wq = Matrix{Float32}(tensor)
+        0         elseif occursin("self_attn.k_proj", name) && occursin("weight", name)
+        0             tensor = get_tensor(sf, name)
+        0             wk = Matrix{Float32}(tensor)  # (n_kv * head_dim, hidden)
+        0         elseif occursin("self_attn.v_proj", name) && occursin("weight", name)
+        0             tensor = get_tensor(sf, name)
+        0             wv = Matrix{Float32}(tensor)  # (n_kv * head_dim, hidden)
+        0  elseif occursin("self_attn.o_proj", name) && occursin("weight", name)
+        0  tensor = get_tensor(sf, name)
+        0  wo = Matrix{Float32}(tensor) # (hidden, n_heads * head_dim)
+        0  elseif occursin("q_norm", name)
+        -  # Qwen uses layernorm1p convention for attention norms - add 1
+        0  q_norm_w = vec(Float32.(get_tensor(sf, name))) .+ 1.0f0
+        0  elseif occursin("k_norm", name)
+        -  # Qwen uses layernorm1p convention for attention norms - add 1
+        0  k_norm_w = vec(Float32.(get_tensor(sf, name))) .+ 1.0f0
+        -  end
+        0  end
+        -  
+        -  # Default norms
+        0  if q_norm_w === nothing
+        0  q_norm_w = ones(Float32, config.head_dim) .+ 1.0f0  # Also apply +1 for defaults
+        -  end
+        0  if k_norm_w === nothing
+        0  k_norm_w = ones(Float32, config.head_dim) .+ 1.0f0  # Also apply +1 for defaults
+        -  end
+        -  
+        0  q_norm = ModelCPU.RMSNormCPU(q_norm_w, config.rms_norm_eps)
+        0  k_norm = ModelCPU.RMSNormCPU(k_norm_w, config.rms_norm_eps)
+        -  
+        0  if wq === nothing || wk === nothing || wv === nothing || wo === nothing
+        0  error("Missing attention tensors for layer $layer_idx")
+        -  end
+        -  
+        -  # Pre-allocated work buffers
+        0  n_heads = config.num_attention_heads
+        0  n_kv = config.num_key_value_heads
+        0  head_dim = config.head_dim
+        -  
+        0  qkv_size = n_heads * head_dim * 2  # wq output size
+        0  kv_size = n_kv * head_dim           # wk/wv output size
+        0  q_size = n_heads * head_dim         # query after split
+        -  
+        0  qkv_buf = Vector{Float32}(undef, qkv_size)
+        0  k_buf = Vector{Float32}(undef, kv_size)
+        0  v_buf = Vector{Float32}(undef, kv_size)
+        0  query_states_buf = Vector{Float32}(undef, q_size)
+        0  gate_buf = Vector{Float32}(undef, q_size)
+        0  output_buf = Vector{Float32}(undef, q_size)
+        0  wo_output_buf = Vector{Float32}(undef, config.hidden_size)
+        0  max_seq = config.max_position_embeddings
+        0  scores_buf = Vector{Float32}(undef, max_seq)
+        -  
+        0  return ModelCPU.FullAttentionCPU(
+        -  layer_idx,
+        -  wq, wk, wv, wo,
+        -  q_norm, k_norm,
+        -  n_heads, n_kv, head_dim,
+        -  Float32(1.0 / sqrt(head_dim)),
+        -  qkv_buf, k_buf, v_buf,
+        -  query_states_buf, gate_buf, output_buf, scores_buf, wo_output_buf
+        -  )
+        - end
+        - 
+        - function load_mlp_safetensors(sf::SafetensorsFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU)
+        -  gate_proj = nothing
+        -  up_proj = nothing
+        -  down_proj = nothing
+        -  
+        0  for name in keys(sf.tensors)
+        -  # Use regex with dot after layer number to avoid layers.1 matching layers.10
+        0  if !occursin(Regex("layers\\.$layer_idx\\."), name) || occursin("mtp", name)
+        -  continue
+        -  end
+        -  
+        0  if occursin("mlp.gate_proj", name) && occursin("weight", name)
+        0             tensor = get_tensor(sf, name)
+        -             # Safetensors stores as (intermediate, hidden) which is correct for weight * x
+        0             gate_proj = Matrix{Float32}(tensor)
+        0         elseif occursin("mlp.up_proj", name) && occursin("weight", name)
+        0             tensor = get_tensor(sf, name)
+        0             up_proj = Matrix{Float32}(tensor)
+        0         elseif occursin("mlp.down_proj", name) && occursin("weight", name)
+        0             tensor = get_tensor(sf, name)
+        -             # down_proj stores as (hidden, intermediate), which is already correct for weight * x
+        0             down_proj = Matrix{Float32}(tensor)
+        -         end
+        0     end
+        -     
+        0  if gate_proj === nothing || up_proj === nothing || down_proj === nothing
+        0  error("Missing MLP tensors for layer $layer_idx")
+        -  end
+        -  
+        -  # Pre-allocated work buffers
+        0  gate_buf = Vector{Float32}(undef, config.intermediate_size)
+        0  up_buf = Vector{Float32}(undef, config.intermediate_size)
+        0  hidden_buf = Vector{Float32}(undef, config.intermediate_size)
+        0  output_buf = Vector{Float32}(undef, config.hidden_size)
+        -  
+        0  return ModelCPU.MLPCPU(gate_proj, up_proj, down_proj, gate_buf, up_buf, hidden_buf, output_buf)
+        - end
+        - 
+        - end # module
