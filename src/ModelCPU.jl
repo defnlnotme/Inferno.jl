@@ -1052,32 +1052,24 @@ function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, de
 
  last_token = next_token
  
+ # Check if MTP is requested but not supported
+ mtp_enabled = use_mtp
+ if mtp_enabled
+ if model.mtp === nothing
+ @warn "MTP requested but model does not have MTP weights. Falling back to sequential generation."
+ mtp_enabled = false
+ else
+ @warn "MTP is experimental. Qwen3.5-0.8B was not trained with MTP mask tokens. Predictions may be incorrect."
+ # For now, disable MTP since it produces garbage output
+ # TODO: Implement proper MTP when we have a model trained for it
+ mtp_enabled = false
+ end
+ end
+ 
  # Generate remaining tokens
  tokens_generated = 1
  while tokens_generated < max_tokens
- if use_mtp && model.mtp !== nothing
- # MTP mode: predict k_toks tokens at once
- mtp_tokens = mtp_predict_step!(model, [last_token], curr_pos, caches;
- k_toks=k_toks, mask_id=mask_id,
- temperature=temperature, top_p=top_p, top_k=top_k)
- 
- for (i, tok) in enumerate(mtp_tokens)
- if tok in stop_tokens
- return
- end
- if tokens_generated >= max_tokens
- return
- end
- 
- curr_pos += 1
- token_counts[tok] = get(token_counts, tok, 0) + 1
- token_str = decode_fn([tok])
- put!(chan, token_str)
- last_token = tok
- tokens_generated += 1
- end
- else
- # Standard single-token generation
+ # Standard single-token generation (MTP disabled for now)
  next_token, _ = generate_cpu(model, [last_token], curr_pos, caches;
  temperature=temperature, top_p=top_p, top_k=top_k, 
  repetition_penalty=repetition_penalty, token_counts=token_counts, 
@@ -1096,7 +1088,6 @@ function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, de
  
  last_token = next_token
  tokens_generated += 1
- end
  end
  end
  
