@@ -38,19 +38,29 @@ Both GGUF and Safetensors inference for Qwen3.5-0.8B-VL work with coherent gener
 - [ ] BLAS threading optimization (currently 10 threads)
 - [ ] MKL vs OpenBLAS comparison
 
-### Phase 2.5: Multi-Token Prediction (MTP) ✓ IMPLEMENTED
+### Phase 2.5: Multi-Token Prediction (MTP) ✓ RESEARCHED
 
-**Status:** Code implemented but requires MTP-trained model.
+**Status:** Infrastructure implemented, but **MTP does NOT work** for Qwen3.5-0.8B.
 
-**Important:** Standard Qwen3.5 models are NOT trained with MTP. To use MTP:
-1. Need model specifically trained with MTP objective (e.g., `Qwen3-4B-Inst-2507-MTP`)
-2. Use correct mask_id (151669 for Qwen3-MTP models)
-3. The model predicts k tokens simultaneously using mask tokens
+**Key Finding:** Qwen3.5-0.8B was NOT trained with MTP mask tokens. The `mtp.*` weights
+in the safetensors file are for training only, not inference prediction.
+
+**Evidence:**
+- Tested multiple mask tokens (BOS, EOS, PAD, Space, Newline) - all produce wrong predictions
+- HF implementation has NO references to `mtp.fc`, `mtp.norm`, etc. in forward pass
+- The `_mtp_generate` function just appends masks and runs standard forward pass
+- Only position 1 predicts correctly, positions 2-4 produce garbage
 
 **Implementation:**
-- `generate_mtp_cpu()` - Main MTP generation function
-- `mtp_predict_step!()` - Predict k tokens in one forward pass
-- `mtp_verify_step!()` - Verify draft tokens (for speculative decoding)
+- `generate_mtp_cpu()` - Main MTP generation function (disabled)
+- `mtp_predict_step!()` - Predict k tokens (produces incorrect output)
+- `mtp_predict_with_head!()` - MTP head approach (produces garbage)
+- `stream_to_stdout_cpu()` - `use_mtp=true` flag shows warning and falls back
+
+**To use MTP properly:**
+1. Need a model specifically trained with MTP objective (e.g., `Qwen3-4B-Inst-2507-MTP`)
+2. Use correct mask token ID (varies by model)
+3. Implement verification step for speculative decoding
 
 ### Phase 3: Quantization Support
 
