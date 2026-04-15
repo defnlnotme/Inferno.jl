@@ -34,3 +34,4 @@ dump_tensors.cpp
 *.npz
 hermes_conversation_*.json
 tests/debug/
+*.mem
