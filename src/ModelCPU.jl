@@ -1212,9 +1212,220 @@ function decode_tokens(tok, ids::Vector{Int})
     # Handle BPETokenizer (already 1-indexed, pass through)
     elseif hasfield(typeof(tok), :id_to_token) && hasfield(typeof(tok), :merges)
         return Base.invokelatest(getfield(parentmodule(typeof(tok)), :decode), tok, ids)
-    else
-        return tok(ids)
-    end
+ else
+ return tok(ids)
+ end
+end
+
+# --- Multi-Token Prediction (MTP) Functions ---
+
+# NOTE: MTP requires a model specifically trained with Multi-Token Prediction objective.
+# Standard Qwen3.5 models are NOT trained with MTP and will not work correctly.
+# To use MTP, you need a model like "jwkirchenbauer/Qwen3-4B-Inst-2507-MTP".
+#
+# MTP models use a special mask token (typically 151669 for Qwen3) and are trained
+# to predict multiple future tokens simultaneously. The mask token acts as a placeholder
+# for positions where the model should predict the next token.
+
+"""
+ generate_mtp_cpu(model, prompt_tokens; k_toks=4, mask_id, kwargs...)
+
+Generate tokens using Multi-Token Prediction (MTP) for speculative decoding.
+
+**IMPORTANT**: This only works with models specifically trained for MTP.
+Standard Qwen3.5 models are NOT trained with MTP and will produce incorrect output.
+
+MTP allows predicting k future tokens in a single forward pass by appending
+mask tokens to the input. The model outputs logits for all positions, and
+the last k positions give predictions for the next k tokens.
+
+Arguments:
+- model: The QwenModelCPU model (must be MTP-trained)
+- prompt_tokens: Initial prompt tokens
+- k_toks: Number of tokens to predict per step (default: 4)
+- mask_id: Token ID to use as mask (151669 for Qwen3-MTP models)
+- max_tokens: Maximum tokens to generate
+- temperature, top_p, top_k: Sampling parameters
+- stop_tokens: Set of token IDs that stop generation
+- strategy: :greedy or :adaptive (confidence-based)
+
+Returns: Vector of generated token IDs
+
+Example:
+```julia
+# For MTP-trained models only!
+mask_id = 151669  # MTP mask token for Qwen3
+tokens = generate_mtp_cpu(model, prompt_tokens; k_toks=4, mask_id=mask_id, max_tokens=100)
+```
+
+To use MTP, you need to:
+1. Download an MTP-trained model (e.g., from huggingface)
+2. Convert to GGUF or safetensors format
+3. Load with the correct mask_id (check the model's README)
+```
+"""
+function generate_mtp_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int};
+ k_toks::Int=4,
+ mask_id::Int,
+ max_tokens::Int=512,
+ temperature::Float32=0.0f0,  # 0 = greedy
+ top_p::Float32=1.0f0,
+ top_k::Int=0,
+ stop_tokens::Set{Int}=Set{Int}(),
+ strategy::Symbol=:greedy,  # :greedy, :adaptive
+ confidence_threshold::Float32=0.9f0,
+ max_context::Int=8192)
+ 
+ # Initialize caches
+ max_cache_seq = min(model.config.max_position_embeddings, max_context)
+ caches = [init_kv_cache_cpu(model.config, max_cache_seq) for _ in 1:model.config.num_hidden_layers]
+ reset_states_cpu!(model)
+ 
+ generated_tokens = Int[]
+ 
+ # Process prompt
+ curr_pos = length(prompt_tokens)
+ logits = forward_cpu!(model, prompt_tokens, 0, caches; full_logits=false)
+ 
+ # Get first prediction from prompt
+ first_logits = vec(logits)
+ if temperature == 0.0f0
+ next_token = argmax(first_logits)
+ else
+ next_token = softmax_sample(first_logits; temperature=temperature, top_p=top_p, top_k=top_k)
+ end
+ push!(generated_tokens, next_token)
+ curr_pos += 1
+ 
+ # Check if first token is stop
+ if next_token in stop_tokens
+ return generated_tokens
+ end
+ 
+ # MTP generation loop
+ while length(generated_tokens) < max_tokens
+ # Predict k tokens at once
+ tokens_predicted = mtp_predict_step!(model, [next_token], curr_pos, caches;
+ k_toks=k_toks, mask_id=mask_id,
+ temperature=temperature, top_p=top_p, top_k=top_k,
+ strategy=strategy, confidence_threshold=confidence_threshold)
+ 
+ # Add predicted tokens
+ for (i, tok) in enumerate(tokens_predicted)
+ if tok in stop_tokens
+ return generated_tokens
+ end
+ push!(generated_tokens, tok)
+ if length(generated_tokens) >= max_tokens
+ break
+ end
+ end
+ 
+ # Update position
+ curr_pos += length(tokens_predicted)
+ 
+ # Last token becomes the seed for next prediction
+ if !isempty(tokens_predicted)
+ next_token = tokens_predicted[end]
+ end
+ end
+ 
+ return generated_tokens
+end
+
+"""
+ mtp_predict_step!(model, input_tokens, pos, caches; kwargs...)
+
+Predict k future tokens in a single forward pass using MTP.
+
+Returns a vector of k predicted tokens.
+"""
+function mtp_predict_step!(model::QwenModelCPU, input_tokens::Vector{Int}, pos::Int, caches::Vector{KVCacheCPU};
+ k_toks::Int=4,
+ mask_id::Int,
+ temperature::Float32=0.0f0,
+ top_p::Float32=1.0f0,
+ top_k::Int=0,
+ strategy::Symbol=:greedy,
+ confidence_threshold::Float32=0.9f0)
+ 
+ # Build input with mask tokens: [token, MASK, MASK, ..., MASK]
+ # We append (k_toks - 1) mask tokens after the actual token
+ num_masks = k_toks - 1
+ mtp_input = vcat(input_tokens, fill(mask_id, num_masks))
+ 
+ # Forward pass with full logits to get predictions at all positions
+ all_logits = forward_cpu!(model, mtp_input, pos, caches; full_logits=true)
+ 
+ # Extract logits for the last k_toks positions
+ # These correspond to predictions for positions pos+1 through pos+k_toks
+ last_k_logits = all_logits[:, end-k_toks+1:end]  # shape: (vocab_size, k_toks)
+ 
+ predicted_tokens = Int[]
+ 
+ for i in 1:k_toks
+ logits_i = last_k_logits[:, i]
+ 
+ if strategy == :greedy || temperature == 0.0f0
+ # Greedy: take argmax
+ tok = argmax(logits_i)
+ push!(predicted_tokens, tok)
+ elseif strategy == :adaptive
+ # Adaptive: check confidence and stop if below threshold
+ probs = softmax(logits_i)
+ max_prob = maximum(probs)
+ if max_prob < confidence_threshold && i > 1
+ # Stop predicting - confidence too low
+ break
+ end
+ tok = argmax(probs)
+ push!(predicted_tokens, tok)
+ else
+ # Standard sampling
+ tok = softmax_sample(logits_i; temperature=temperature, top_p=top_p, top_k=top_k)
+ push!(predicted_tokens, tok)
+ end
+ end
+ 
+ return predicted_tokens
+end
+
+"""
+ softmax(logits)
+
+Compute softmax of logits vector.
+"""
+function softmax(logits::AbstractVector{Float32})
+ max_l = maximum(logits)
+ exp_l = exp.(logits .- max_l)
+ return exp_l ./ sum(exp_l)
+end
+
+"""
+ mtp_verify_step!(model, draft_tokens, pos, caches; kwargs...)
+
+Verify draft tokens using the model. Returns:
+- (accepted_count, verification_logits)
+
+This implements the verification step of speculative decoding where
+the base model checks which draft tokens are correct.
+"""
+function mtp_verify_step!(model::QwenModelCPU, draft_tokens::Vector{Int}, pos::Int, caches::Vector{KVCacheCPU})
+ # Run forward pass for all draft tokens
+ logits = forward_cpu!(model, draft_tokens, pos, caches; full_logits=true)
+ 
+ # For each position i, check if draft_tokens[i+1] matches argmax(logits[:, i])
+ accepted = 0
+ for i in 1:length(draft_tokens)-1
+ predicted = argmax(logits[:, i])
+ if predicted == draft_tokens[i+1]
+ accepted += 1
+ else
+ break
+ end
+ end
+ 
+ return accepted, logits
 end
 
 end # module
