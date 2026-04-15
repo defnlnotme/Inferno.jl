@@ -77,6 +77,7 @@ end
 function main()
     args = parse_commandline()
     
+    is_stdout_tty = isa(stdout, Base.TTY)
     device_arg = args["device"] == -1 ? nothing : args["device"]
     println("\e[1;35m🔥 Inferno Chat Interface 🔥\e[0m")
 
@@ -114,13 +115,22 @@ function main()
                                               top_p=Float32(args["top-p"]))
         
         full_response = ""
+        first_token = true
         try
+            if is_stdout_tty
+                print("\e[2m...\e[0m")
+                flush(stdout)
+            end
+
             for token_text in stream
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
             end
-            println()
         catch e
             if e isa InterruptException
                 close(stream)
@@ -129,6 +139,11 @@ function main()
             else
                 rethrow(e)
             end
+        finally
+            if first_token && is_stdout_tty
+                print("\b\b\b\e[K")
+            end
+            println()
         end
         push!(messages, "assistant" => full_response)
     end
@@ -197,13 +212,22 @@ function main()
                                               top_p=Float32(args["top-p"]))
                                               
         full_response = ""
+        first_token = true
         try
+            if is_stdout_tty
+                print("\e[2m...\e[0m")
+                flush(stdout)
+            end
+
             for token_text in stream
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
             end
-            println()
         catch e
             if e isa InterruptException
                 close(stream)
@@ -212,6 +236,11 @@ function main()
             else
                 rethrow(e)
             end
+        finally
+            if first_token && is_stdout_tty
+                print("\b\b\b\e[K")
+            end
+            println()
         end
         
         push!(messages, "assistant" => full_response)
