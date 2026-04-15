@@ -742,6 +742,42 @@ function (layer::DecoderLayerCPU)(x::AbstractVector{Float32}, pos::Int, rope::Ro
  return x
 end
 
+# --- MTP (Multi-Token Prediction) Head ---
+
+"""
+ MTPHeadCPU
+
+Multi-Token Prediction head for speculative decoding. This is an additional
+layer that predicts multiple future tokens in parallel.
+
+The MTP head consists of:
+- pre_fc_norm_embedding: RMSNorm for the input embedding
+- pre_fc_norm_hidden: RMSNorm for the hidden state
+- fc: Combined projection (hidden -> hidden)
+- layers: A single attention layer (optional)
+- norm: Final normalization
+
+The MTP forward pass:
+1. Take the last hidden state h and the embedding of the predicted token e
+2. norm(e) + norm(h) -> concatenated
+3. fc(concatenated) -> hidden
+4. norm(hidden) -> hidden
+5. lm_head(hidden) -> logits for next token prediction
+"""
+struct MTPHeadCPU
+ pre_fc_norm_embedding::RMSNormCPU
+ pre_fc_norm_hidden::RMSNormCPU
+ fc::Matrix{Float32} # (hidden_size, 2*hidden_size)
+ layers::Vector{DecoderLayerCPU} # Optional MTP layers (typically 1)
+ norm::RMSNormCPU
+ # Pre-allocated buffers
+ embed_buf::Vector{Float32}
+ hidden_buf::Vector{Float32}
+ combined_buf::Vector{Float32}
+ fc_out_buf::Vector{Float32}
+ logits_buf::Vector{Float32}
+end
+
 # --- Full Model ---
 struct QwenModelCPU
  config::QwenConfigCPU
@@ -753,6 +789,8 @@ struct QwenModelCPU
  # Pre-allocated buffers to avoid allocations per token
  final_norm_buf::Vector{Float32}
  lm_head_buf::Vector{Float32}
+ # Optional MTP head (for models trained with Multi-Token Prediction)
+ mtp::Union{MTPHeadCPU, Nothing}
 end
 
 function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches::Vector{KVCacheCPU}; full_logits::Bool=false)
@@ -1266,7 +1304,7 @@ To use MTP, you need to:
 """
 function generate_mtp_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int};
  k_toks::Int=4,
- mask_id::Int,
+ mask_id::Int=151643, # Default to BOS, only used if no MTP head
  max_tokens::Int=512,
  temperature::Float32=0.0f0,  # 0 = greedy
  top_p::Float32=1.0f0,
@@ -1338,19 +1376,30 @@ end
 
 Predict k future tokens in a single forward pass using MTP.
 
+**With MTP head**: Uses the model's MTP head for prediction.
+**Without MTP head**: Falls back to mask-token approach (requires MTP-trained model).
+
 Returns a vector of k predicted tokens.
 """
 function mtp_predict_step!(model::QwenModelCPU, input_tokens::Vector{Int}, pos::Int, caches::Vector{KVCacheCPU};
  k_toks::Int=4,
- mask_id::Int,
+ mask_id::Int=151643, # Default to BOS token
  temperature::Float32=0.0f0,
  top_p::Float32=1.0f0,
  top_k::Int=0,
  strategy::Symbol=:greedy,
  confidence_threshold::Float32=0.9f0)
  
+ if model.mtp !== nothing
+ # Use actual MTP head for prediction
+ return mtp_predict_with_head!(model, input_tokens, pos, caches;
+ k_toks=k_toks, temperature=temperature,
+ top_p=top_p, top_k=top_k, strategy=strategy,
+ confidence_threshold=confidence_threshold)
+ end
+ 
+ # Fallback: mask-token approach (for models trained with mask tokens)
  # Build input with mask tokens: [token, MASK, MASK, ..., MASK]
- # We append (k_toks - 1) mask tokens after the actual token
  num_masks = k_toks - 1
  mtp_input = vcat(input_tokens, fill(mask_id, num_masks))
  
@@ -1358,8 +1407,7 @@ function mtp_predict_step!(model::QwenModelCPU, input_tokens::Vector{Int}, pos::
  all_logits = forward_cpu!(model, mtp_input, pos, caches; full_logits=true)
  
  # Extract logits for the last k_toks positions
- # These correspond to predictions for positions pos+1 through pos+k_toks
- last_k_logits = all_logits[:, end-k_toks+1:end]  # shape: (vocab_size, k_toks)
+ last_k_logits = all_logits[:, end-k_toks+1:end]
  
  predicted_tokens = Int[]
  
@@ -1367,27 +1415,143 @@ function mtp_predict_step!(model::QwenModelCPU, input_tokens::Vector{Int}, pos::
  logits_i = last_k_logits[:, i]
  
  if strategy == :greedy || temperature == 0.0f0
- # Greedy: take argmax
  tok = argmax(logits_i)
  push!(predicted_tokens, tok)
  elseif strategy == :adaptive
- # Adaptive: check confidence and stop if below threshold
  probs = softmax(logits_i)
  max_prob = maximum(probs)
  if max_prob < confidence_threshold && i > 1
- # Stop predicting - confidence too low
  break
  end
  tok = argmax(probs)
  push!(predicted_tokens, tok)
  else
- # Standard sampling
  tok = softmax_sample(logits_i; temperature=temperature, top_p=top_p, top_k=top_k)
  push!(predicted_tokens, tok)
  end
  end
  
  return predicted_tokens
+end
+
+"""
+ mtp_predict_with_head!(model, input_tokens, pos, caches; kwargs...)
+
+Use the MTP head to predict multiple future tokens.
+
+The MTP head takes:
+1. The last hidden state from the main model
+2. The embedding of the predicted token
+
+And produces logits for the next token. This is done iteratively to predict k tokens.
+"""
+function mtp_predict_with_head!(model::QwenModelCPU, input_tokens::Vector{Int}, pos::Int, caches::Vector{KVCacheCPU};
+ k_toks::Int=4,
+ temperature::Float32=0.0f0,
+ top_p::Float32=1.0f0,
+ top_k::Int=0,
+ strategy::Symbol=:greedy,
+ confidence_threshold::Float32=0.9f0)
+ 
+ mtp = model.mtp
+ @assert mtp !== nothing "MTP head is not loaded"
+ 
+ predicted_tokens = Int[]
+ 
+ # Get the last hidden state from the main model
+ # Run forward pass through main model to get hidden state
+ hidden = forward_hidden!(model, input_tokens, pos, caches)
+ 
+ # Get first predicted token from main model
+ first_logits = model.lm_head_buf
+ first_token = argmax(first_logits)
+ push!(predicted_tokens, first_token)
+ 
+ # Now use MTP head to predict remaining tokens
+ for i in 2:k_toks
+ # Get embedding of last predicted token
+ embed_i = model.embed[:, first_token]
+ 
+ # MTP forward pass: norm(embed) + norm(hidden) -> fc -> logits
+ mtp_logits = mtp_forward!(mtp, embed_i, hidden, model)
+ 
+ if strategy == :greedy || temperature == 0.0f0
+ next_token = argmax(mtp_logits)
+ elseif strategy == :adaptive
+ probs = softmax(mtp_logits)
+ max_prob = maximum(probs)
+ if max_prob < confidence_threshold
+ break
+ end
+ next_token = argmax(probs)
+ else
+ next_token = softmax_sample(mtp_logits; temperature=temperature, top_p=top_p, top_k=top_k)
+ end
+ 
+ push!(predicted_tokens, next_token)
+ first_token = next_token
+ end
+ 
+ return predicted_tokens
+end
+
+"""
+ mtp_forward!(mtp, embedding, hidden, model)
+
+Forward pass through the MTP head.
+
+Takes the token embedding and hidden state, normalizes both,
+combines them, and produces vocab logits for next token prediction.
+
+The MTP fc projects from 2*hidden to hidden. The final prediction
+uses the main model's lm_head to get vocab logits.
+"""
+function mtp_forward!(mtp::MTPHeadCPU, embedding::AbstractVector{Float32}, hidden::AbstractVector{Float32}, model::QwenModelCPU)
+ # Normalize embedding
+ rmsnorm_cpu!(mtp.embed_buf, embedding, mtp.pre_fc_norm_embedding)
+ 
+ # Normalize hidden state
+ rmsnorm_cpu!(mtp.hidden_buf, hidden, mtp.pre_fc_norm_hidden)
+ 
+ # Combine: fc expects concatenated [norm_emb; norm_hidden]
+ hidden_size = length(hidden)
+ mtp.combined_buf[1:hidden_size] .= mtp.embed_buf
+ mtp.combined_buf[hidden_size+1:end] .= mtp.hidden_buf
+ 
+ # Project through fc: (hidden_size, 2*hidden_size) * (2*hidden_size,) -> (hidden_size,)
+ mul!(mtp.fc_out_buf, mtp.fc, mtp.combined_buf)
+ 
+ # Apply final norm
+ rmsnorm_cpu!(mtp.fc_out_buf, mtp.fc_out_buf, mtp.norm)
+ 
+ # Project to vocab using main model's lm_head: (vocab_size, hidden_size) * (hidden_size,) -> (vocab_size,)
+ mul!(mtp.logits_buf, model.lm_head, mtp.fc_out_buf)
+ 
+ return mtp.logits_buf
+end
+
+"""
+ forward_hidden!(model, tokens, pos, caches)
+
+Run forward pass and return the hidden state before LM head.
+This is needed for MTP which takes the hidden state as input.
+"""
+function forward_hidden!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches::Vector{KVCacheCPU})
+ seq_len = length(tokens)
+ 
+ # For single token, just get embedding
+ x = model.embed[:, tokens[end]]
+ curr_pos = pos + seq_len - 1
+ 
+ # Run through all layers
+ for (i, layer) in enumerate(model.layers)
+ x = layer(x, curr_pos, model.rope, caches[i])
+ end
+ 
+ # Final norm (but don't project to vocab)
+ rmsnorm_cpu!(model.final_norm_buf, x, model.final_norm)
+ 
+ return model.final_norm_buf
 end
 
 """

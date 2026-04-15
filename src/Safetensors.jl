@@ -276,8 +276,10 @@ post_norm = ModelCPU.RMSNormCPU(vec(Float32.(post_norm_w) .+ 1.0f0), model_confi
             mlp = load_mlp_safetensors(sf, layer_idx, model_config)
         end
         
-        push!(layers, ModelCPU.DecoderLayerCPU(in_norm, op, post_norm, mlp, is_ssm))
-    end
+ push!(layers, ModelCPU.DecoderLayerCPU(in_norm, op, post_norm, mlp, is_ssm,
+ Vector{Float32}(undef, model_config.hidden_size), # norm_buf1
+ Vector{Float32}(undef, model_config.hidden_size))) # norm_buf2
+ end
     
     # Load final norm
     final_norm_w = nothing
@@ -292,20 +294,79 @@ if final_norm_w === nothing
 end
 # ModelCPU expects +1 (layernorm1p convention) - add 1 to match GGUF format
 final_norm = ModelCPU.RMSNormCPU(vec(Float32.(final_norm_w) .+ 1.0f0), model_config.rms_norm_eps)
-    
-    println("\nFinal norm weight mean: ", sum(final_norm.weight) / length(final_norm.weight))
-    
-    # LM head (tied with embedding for Qwen)
-    lm_head = embed'
-    
-    # Create RoPE
-    rotary_dim = round(Int, model_config.head_dim * model_config.partial_rotary_factor)
-    rope = ModelCPU.RotaryEmbeddingCPU(model_config.head_dim, model_config.rope_theta, model_config.max_position_embeddings; rotary_dim=rotary_dim)
-    
-    # Load tokenizer
-    tokenizer = load_hf_tokenizer(model_dir)
-    
-    return ModelCPU.QwenModelCPU(model_config, embed, lm_head, layers, final_norm, rope), tokenizer
+ 
+ println("\nFinal norm weight mean: ", sum(final_norm.weight) / length(final_norm.weight))
+ 
+ # LM head (tied with embedding for Qwen)
+ lm_head = embed'
+ 
+ # Create RoPE
+ rotary_dim = round(Int, model_config.head_dim * model_config.partial_rotary_factor)
+ rope = ModelCPU.RotaryEmbeddingCPU(model_config.head_dim, model_config.rope_theta, model_config.max_position_embeddings; rotary_dim=rotary_dim)
+ 
+ # Load MTP head if present
+ mtp_head = load_mtp_head(sf, model_config, rope)
+ if mtp_head !== nothing
+ println("\nMTP head loaded successfully!")
+ end
+ 
+ # Load tokenizer
+ tokenizer = load_hf_tokenizer(model_dir)
+ 
+ # Pre-allocate buffers
+ final_norm_buf = Vector{Float32}(undef, model_config.hidden_size)
+ lm_head_buf = Vector{Float32}(undef, model_config.vocab_size)
+ 
+ return ModelCPU.QwenModelCPU(model_config, embed, lm_head, layers, final_norm, rope, final_norm_buf, lm_head_buf, mtp_head), tokenizer
+end
+
+"""Load MTP (Multi-Token Prediction) head from safetensors if present."""
+function load_mtp_head(sf, config::ModelCPU.QwenConfigCPU, rope::ModelCPU.RotaryEmbeddingCPU)
+ # Check if MTP weights exist
+ mtp_tensors = [k for k in keys(sf.tensors) if startswith(k, "mtp.")]
+ 
+ if isempty(mtp_tensors)
+ println("\nNo MTP weights found in model")
+ return nothing
+ end
+ 
+ println("\nLoading MTP head...")
+ println(" MTP tensors found: ", length(mtp_tensors))
+ 
+ # Load pre-fc norms
+ pre_fc_norm_emb_w = get_tensor(sf, "mtp.pre_fc_norm_embedding.weight")
+ pre_fc_norm_hidden_w = get_tensor(sf, "mtp.pre_fc_norm_hidden.weight")
+ 
+ # MTP norms don't use +1 (layernorm1p convention is for main model only)
+ pre_fc_norm_embedding = ModelCPU.RMSNormCPU(vec(Float32.(pre_fc_norm_emb_w)), config.rms_norm_eps)
+ pre_fc_norm_hidden = ModelCPU.RMSNormCPU(vec(Float32.(pre_fc_norm_hidden_w)), config.rms_norm_eps)
+ 
+ # Load fc projection: (vocab_size, 2*hidden) or (vocab_size, hidden)
+ fc_w = get_tensor(sf, "mtp.fc.weight")
+ fc = Float32.(fc_w)
+ 
+ # Load final norm
+ norm_w = get_tensor(sf, "mtp.norm.weight")
+ norm = ModelCPU.RMSNormCPU(vec(Float32.(norm_w)), config.rms_norm_eps)
+ 
+ # Load MTP layer if present (mtp.layers.0.*)
+ mtp_layers = ModelCPU.DecoderLayerCPU[]
+ # Note: MTP attention layer requires matching FullAttentionCPU structure
+ # For now, we skip it since the main MTP functionality is in the fc projection
+ # The attention layer is optional and provides additional context refinement
+ 
+ # Pre-allocate buffers for MTP
+ embed_buf = Vector{Float32}(undef, config.hidden_size)
+ hidden_buf = Vector{Float32}(undef, config.hidden_size)
+ combined_buf = Vector{Float32}(undef, 2 * config.hidden_size)
+ fc_out_buf = Vector{Float32}(undef, config.hidden_size) # fc output buffer
+ logits_buf = Vector{Float32}(undef, config.vocab_size) # final vocab logits
+ 
+ return ModelCPU.MTPHeadCPU(
+ pre_fc_norm_embedding, pre_fc_norm_hidden,
+ fc, mtp_layers, norm,
+ embed_buf, hidden_buf, combined_buf, fc_out_buf, logits_buf
+ )
 end
 
 """

@@ -278,8 +278,12 @@ function load_model_cpu(path::String; keep_quantized::Bool=false)
  # Load tokenizer
  tok = Tokenizer.load_tokenizer(file.metadata)
  
- return ModelCPU.QwenModelCPU(config, embed, lm_head, layers, final_norm, rope, final_norm_buf, lm_head_buf), tok
- end
+ # GGUF files don't include MTP weights - they're skipped during conversion
+ # MTP is only available in safetensors format
+ mtp_head = nothing
+ 
+ return ModelCPU.QwenModelCPU(config, embed, lm_head, layers, final_norm, rope, final_norm_buf, lm_head_buf, mtp_head), tok
+end
 
 function get_config(file::GGUF.GGUFFile)
     arch = get(file.metadata, "general.architecture", "qwen")
