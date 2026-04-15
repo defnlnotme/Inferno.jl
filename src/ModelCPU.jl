@@ -417,11 +417,20 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
  mul!(qkv, m.in_proj, x)
  mul!(z, m.gate_proj, x)
  
- # 2. Update conv state (ring buffer)
+ # 2. Update conv state (ring buffer) - use manual loop to avoid slice allocation
+ # The slice assignment `m.conv_state[:, 1:3] .= m.conv_state[:, 2:4]` allocates ~74KB
+ # Manual loop is allocation-free
  if m.conv_kernel > 1
- m.conv_state[:, 1:(m.conv_kernel-1)] .= m.conv_state[:, 2:m.conv_kernel]
+ for j in 1:(m.conv_kernel-1)
+ @simd ivdep for i in 1:m.conv_channels
+ @inbounds m.conv_state[i, j] = m.conv_state[i, j+1]
  end
- m.conv_state[:, m.conv_kernel] .= qkv
+ end
+ end
+ # Copy qkv to the last column of conv_state
+ @simd ivdep for i in 1:m.conv_channels
+ @inbounds m.conv_state[i, m.conv_kernel] = qkv[i]
+ end
  
  # 3. Compute convolution with fused SiLU activation
  # x_conv[c] = silu(sum_k conv_state[c,k] * ssm_conv1d[c,k])
@@ -700,41 +709,50 @@ end
 
 # --- Decoder Layer ---
 struct DecoderLayerCPU
-    in_norm::RMSNormCPU
-    op::Union{GatedDeltaNetCPU,FullAttentionCPU}
-    post_norm::RMSNormCPU
-    mlp::MLPCPU
-    is_ssm::Bool
+ in_norm::RMSNormCPU
+ op::Union{GatedDeltaNetCPU,FullAttentionCPU}
+ post_norm::RMSNormCPU
+ mlp::MLPCPU
+ is_ssm::Bool
+ # Pre-allocated norm buffers to avoid allocation
+ norm_buf1::Vector{Float32}
+ norm_buf2::Vector{Float32}
 end
 
 function (layer::DecoderLayerCPU)(x::AbstractVector{Float32}, pos::Int, rope::RotaryEmbeddingCPU, cache::KVCacheCPU)
-    # Input normalization
-    x_norm = layer.in_norm(x)
-    
-    # Attention/SSM
-    residual = layer.op(x_norm, pos, rope, cache)
-    
-    # Residual connection
-    x = x + residual
-    
-    # Post-attention normalization
-    x_norm = layer.post_norm(x)
-    
-    # MLP
-    residual = layer.mlp(x_norm)
-    
-    # Final residual
-    return x + residual
+ # Input normalization - use pre-allocated buffer
+ x_norm = layer.norm_buf1
+ rmsnorm_cpu!(x_norm, x, layer.in_norm)
+ 
+ # Attention/SSM
+ residual = layer.op(x_norm, pos, rope, cache)
+ 
+ # Residual connection (mutate x directly)
+ x .+= residual
+ 
+ # Post-attention normalization - use pre-allocated buffer
+ x_norm2 = layer.norm_buf2
+ rmsnorm_cpu!(x_norm2, x, layer.post_norm)
+ 
+ # MLP
+ residual = layer.mlp(x_norm2)
+ 
+ # Final residual
+ x .+= residual
+ return x
 end
 
 # --- Full Model ---
 struct QwenModelCPU
-    config::QwenConfigCPU
-    embed::Matrix{Float32}  # (hidden, vocab_size)
-    lm_head::Matrix{Float32}  # (vocab_size, hidden) or tied to embed
-    layers::Vector{DecoderLayerCPU}
-    final_norm::RMSNormCPU
-    rope::RotaryEmbeddingCPU
+ config::QwenConfigCPU
+ embed::Matrix{Float32} # (hidden, vocab_size)
+ lm_head::Matrix{Float32} # (vocab_size, hidden) or tied to embed
+ layers::Vector{DecoderLayerCPU}
+ final_norm::RMSNormCPU
+ rope::RotaryEmbeddingCPU
+ # Pre-allocated buffers to avoid allocations per token
+ final_norm_buf::Vector{Float32}
+ lm_head_buf::Vector{Float32}
 end
 
 function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches::Vector{KVCacheCPU}; full_logits::Bool=false)
@@ -750,13 +768,15 @@ function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
  for (i, layer) in enumerate(model.layers)
  x = layer(x, curr_pos, model.rope, caches[i])
  end
- x = model.final_norm(x)
- all_logits[:, t] = model.lm_head * x
+ # Use pre-allocated buffers for final_norm and lm_head
+ rmsnorm_cpu!(model.final_norm_buf, x, model.final_norm)
+ mul!(model.lm_head_buf, model.lm_head, model.final_norm_buf)
+ all_logits[:, t] = model.lm_head_buf
  end
  return all_logits
  else
  # Only compute LM head for the last position
- last_logits = Vector{Float32}(undef, model.config.vocab_size)
+ last_logits = model.lm_head_buf
  for t in 1:seq_len
  tok = tokens[t] # Already 1-indexed from encode()
  curr_pos = pos + t - 1
@@ -765,9 +785,10 @@ function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
  for (i, layer) in enumerate(model.layers)
  x = layer(x, curr_pos, model.rope, caches[i])
  end
- x = model.final_norm(x)
  if t == seq_len
- mul!(last_logits, model.lm_head, x)
+ # Use pre-allocated buffers for final_norm and lm_head
+ rmsnorm_cpu!(model.final_norm_buf, x, model.final_norm)
+ mul!(last_logits, model.lm_head, model.final_norm_buf)
  end
  end
  return reshape(last_logits, model.config.vocab_size, 1)

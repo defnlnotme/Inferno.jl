@@ -262,19 +262,23 @@ function load_model_cpu(path::String; keep_quantized::Bool=false)
     
     # LM head (check if tied or separate)
     if haskey(file.tensors, "output.weight")
-        lm_head = Float32.(extract_tensor_cpu(file, "output.weight"))
-    else
-        lm_head = embed'
-    end
-    
-    # Create RoPE with partial rotary
+ lm_head = Float32.(extract_tensor_cpu(file, "output.weight"))
+ else
+ lm_head = embed'
+ end
+ 
+ # Create RoPE with partial rotary
  rotary_dim = round(Int, config.head_dim * config.partial_rotary_factor)
  rope = ModelCPU.RotaryEmbeddingCPU(config.head_dim, config.rope_theta, config.max_position_embeddings; rotary_dim=rotary_dim)
+ 
+ # Pre-allocate buffers for final_norm and lm_head to avoid per-token allocations
+ final_norm_buf = Vector{Float32}(undef, config.hidden_size)
+ lm_head_buf = Vector{Float32}(undef, config.vocab_size)
  
  # Load tokenizer
  tok = Tokenizer.load_tokenizer(file.metadata)
  
- return ModelCPU.QwenModelCPU(config, embed, lm_head, layers, final_norm, rope), tok
+ return ModelCPU.QwenModelCPU(config, embed, lm_head, layers, final_norm, rope, final_norm_buf, lm_head_buf), tok
  end
 
 function get_config(file::GGUF.GGUFFile)
@@ -322,11 +326,16 @@ function load_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenCo
  else
  op = load_attention_layer(file, layer_idx, config)
  end
-    
+ 
  # Load MLP
  mlp = load_mlp(file, layer_idx, config; keep_quantized=keep_quantized)
  
- return ModelCPU.DecoderLayerCPU(in_norm, op, post_norm, mlp, is_ssm)
+ # Pre-allocate norm buffers
+ hidden_size = config.hidden_size
+ norm_buf1 = zeros(Float32, hidden_size)
+ norm_buf2 = zeros(Float32, hidden_size)
+ 
+ return ModelCPU.DecoderLayerCPU(in_norm, op, post_norm, mlp, is_ssm, norm_buf1, norm_buf2)
  end
 
 function load_ssm_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU; keep_quantized::Bool=false)
