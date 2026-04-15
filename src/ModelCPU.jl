@@ -977,7 +977,7 @@ function generate_cpu(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
 end
 
 """
-    generate_stream_cpu(model, prompt_tokens; kwargs...)
+ generate_stream_cpu(model, prompt_tokens; kwargs...)
 
 Create a channel that yields decoded token strings as they are generated.
 
@@ -985,8 +985,16 @@ Usage:
 ```julia
 stream = generate_stream_cpu(model, prompt_tokens; max_tokens=100)
 for token_str in stream
-    print(token_str)
+ print(token_str)
 end
+```
+
+MTP Support:
+Set `use_mtp=true` to enable Multi-Token Prediction for faster generation.
+When enabled, the model predicts `k_toks` tokens per forward pass.
+
+```julia
+stream = generate_stream_cpu(model, prompt_tokens; use_mtp=true, k_toks=4)
 ```
 """
 function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, decode_fn::Function;
@@ -998,7 +1006,11 @@ function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, de
  presence_penalty::Float32=0.0f0,
  min_p::Float32=0.0f0,
  stop_tokens::Set{Int}=Set{Int}(),
- max_context::Int=8192) # Maximum context length for KV cache
+ max_context::Int=8192,
+ # MTP options
+ use_mtp::Bool=false,
+ k_toks::Int=4,
+ mask_id::Int=151643) # BOS token as default mask
  
  return Channel{String}(32) do chan
  try
@@ -1006,71 +1018,99 @@ function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, de
  max_cache_seq = min(model.config.max_position_embeddings, max_context)
  caches = [init_kv_cache_cpu(model.config, max_cache_seq) for _ in 1:model.config.num_hidden_layers]
  reset_states_cpu!(model)
-            
-            # Track token counts for repetition/presence penalty
-            token_counts = Dict{Int,Int}()
-            for t in prompt_tokens
-                token_counts[t] = get(token_counts, t, 0) + 1
-            end
-            
-# Process prompt tokens
-curr_pos = 0
-if !isempty(prompt_tokens)
-    # Process all prompt tokens together to properly update states
-    # logits has shape (vocab_size, length(prompt_tokens))
-    logits = forward_cpu!(model, prompt_tokens, 0, caches)
-    curr_pos = length(prompt_tokens)
+ 
+ # Track token counts for repetition/presence penalty
+ token_counts = Dict{Int,Int}()
+ for t in prompt_tokens
+ token_counts[t] = get(token_counts, t, 0) + 1
+ end
+ 
+ # Process prompt tokens
+ curr_pos = 0
+ if !isempty(prompt_tokens)
+ # Process all prompt tokens together to properly update states
+ # logits has shape (vocab_size, length(prompt_tokens))
+ logits = forward_cpu!(model, prompt_tokens, 0, caches)
+ curr_pos = length(prompt_tokens)
 
-    # The logits for the first generated token are the logits of the last prompt token
-    first_logits_vec = vec(logits[:, end])
+ # The logits for the first generated token are the logits of the last prompt token
+ first_logits_vec = vec(logits[:, end])
 
-    # Apply penalties to the first token's logits
-    apply_presence_penalty!(first_logits_vec, token_counts, presence_penalty)
-    apply_repetition_penalty!(first_logits_vec, token_counts, repetition_penalty)
+ # Apply penalties to the first token's logits
+ apply_presence_penalty!(first_logits_vec, token_counts, presence_penalty)
+ apply_repetition_penalty!(first_logits_vec, token_counts, repetition_penalty)
 
-    # Sample the first token
-    next_token = softmax_sample(first_logits_vec; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
+ # Sample the first token
+ next_token = softmax_sample(first_logits_vec; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
 
-    curr_pos += 1
-    token_counts[next_token] = get(token_counts, next_token, 0) + 1
+ curr_pos += 1
+ token_counts[next_token] = get(token_counts, next_token, 0) + 1
 
-    # Decode and yield
-    token_str = decode_fn([next_token])
-    put!(chan, token_str)
+ # Decode and yield
+ token_str = decode_fn([next_token])
+ put!(chan, token_str)
 
-    last_token = next_token
-                
-                # Generate remaining tokens
-                for _ in 2:max_tokens
-                    next_token, _ = generate_cpu(model, [last_token], curr_pos, caches;
-                        temperature=temperature, top_p=top_p, top_k=top_k, repetition_penalty=repetition_penalty, token_counts=token_counts, presence_penalty=presence_penalty, min_p=min_p)
-                    
-                    # Check stop token BEFORE updating state and yielding
-                    if next_token in stop_tokens
-                        break
-                    end
-                    
-                    curr_pos += 1
-                    token_counts[next_token] = get(token_counts, next_token, 0) + 1
-                    
-                    token_str = decode_fn([next_token])
-                    put!(chan, token_str)
-                    
-                    last_token = next_token
-                end
-            end
-            
-        catch e
-            if !(e isa InvalidStateException)
-                @error "ERROR during CPU generation stream" exception=(e, catch_backtrace())
-            end
-        finally
-            try
-                close(chan)
-            catch
-            end
-        end
-    end
+ last_token = next_token
+ 
+ # Generate remaining tokens
+ tokens_generated = 1
+ while tokens_generated < max_tokens
+ if use_mtp && model.mtp !== nothing
+ # MTP mode: predict k_toks tokens at once
+ mtp_tokens = mtp_predict_step!(model, [last_token], curr_pos, caches;
+ k_toks=k_toks, mask_id=mask_id,
+ temperature=temperature, top_p=top_p, top_k=top_k)
+ 
+ for (i, tok) in enumerate(mtp_tokens)
+ if tok in stop_tokens
+ return
+ end
+ if tokens_generated >= max_tokens
+ return
+ end
+ 
+ curr_pos += 1
+ token_counts[tok] = get(token_counts, tok, 0) + 1
+ token_str = decode_fn([tok])
+ put!(chan, token_str)
+ last_token = tok
+ tokens_generated += 1
+ end
+ else
+ # Standard single-token generation
+ next_token, _ = generate_cpu(model, [last_token], curr_pos, caches;
+ temperature=temperature, top_p=top_p, top_k=top_k, 
+ repetition_penalty=repetition_penalty, token_counts=token_counts, 
+ presence_penalty=presence_penalty, min_p=min_p)
+ 
+ # Check stop token BEFORE updating state and yielding
+ if next_token in stop_tokens
+ break
+ end
+ 
+ curr_pos += 1
+ token_counts[next_token] = get(token_counts, next_token, 0) + 1
+ 
+ token_str = decode_fn([next_token])
+ put!(chan, token_str)
+ 
+ last_token = next_token
+ tokens_generated += 1
+ end
+ end
+ end
+ 
+ catch e
+ if !(e isa InvalidStateException)
+ @error "ERROR during CPU generation stream" exception=(e, catch_backtrace())
+ end
+ finally
+ try
+ close(chan)
+ catch
+ end
+ end
+ end
 end
 
 """
@@ -1079,6 +1119,9 @@ end
 Generate tokens and print them to stdout as they are produced.
 
 Returns the complete generated text as a String.
+
+MTP Support:
+Set `use_mtp=true` to enable Multi-Token Prediction for faster generation.
 """
 function stream_to_stdout_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, decode_fn::Function;
  max_tokens::Int=100,
@@ -1091,12 +1134,17 @@ function stream_to_stdout_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, d
  stop_tokens::Set{Int}=Set{Int}(),
  show_tps::Bool=false,
  io::IO=stdout,
- max_context::Int=8192)
+ max_context::Int=8192,
+ # MTP options
+ use_mtp::Bool=false,
+ k_toks::Int=4,
+ mask_id::Int=151643)
  
  stream = generate_stream_cpu(model, prompt_tokens, decode_fn;
  max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, 
  repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, 
- min_p=min_p, stop_tokens=stop_tokens, max_context=max_context)
+ min_p=min_p, stop_tokens=stop_tokens, max_context=max_context,
+ use_mtp=use_mtp, k_toks=k_toks, mask_id=mask_id)
     
     generated_text = IOBuffer()
     try

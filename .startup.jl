@@ -1,5 +1,5 @@
-ENV["MODEL_PATH"] = joinpath(@__DIR__, "tests/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
-# ENV["MODEL_PATH"] = joinpath(@__DIR__, "tests/models/Qwen3.5-0.8B/model.safetensors-00001-of-00001.safetensors")
+# ENV["MODEL_PATH"] = joinpath(@__DIR__, "tests/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
+ENV["MODEL_PATH"] = joinpath(@__DIR__, "tests/models/Qwen3.5-0.8B/model.safetensors-00001-of-00001.safetensors")
 global const MODEL_PATH = ENV["MODEL_PATH"]
 using Inferno
 model, bpetok = load_model(MODEL_PATH, backend=:cpu)
