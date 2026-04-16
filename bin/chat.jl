@@ -108,14 +108,26 @@ function main()
         
         print("\n\e[1;32mAssistant:\e[0m ")
         flush(stdout)
+
+        is_stdout_tty = isa(stdout, Base.TTY)
+        if is_stdout_tty
+            print("\e[2m...\e[0m")
+            flush(stdout)
+        end
+
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
                                               max_tokens=args["max-tokens"], 
                                               temperature=Float32(args["temperature"]), 
                                               top_p=Float32(args["top-p"]))
         
         full_response = ""
+        first_token = true
         try
             for token_text in stream
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
@@ -124,10 +136,21 @@ function main()
         catch e
             if e isa InterruptException
                 close(stream)
-                println("\n\e[31m[Interrupted]\e[0m")
                 full_response *= " [Interrupted]"
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                    first_token = false
+                elseif !first_token || !is_stdout_tty
+                    println()
+                end
+                println("\e[31m[Interrupted]\e[0m")
             else
                 rethrow(e)
+            end
+        finally
+            if first_token && is_stdout_tty
+                print("\b\b\b\e[K")
+                flush(stdout)
             end
         end
         push!(messages, "assistant" => full_response)
@@ -136,6 +159,7 @@ function main()
     println("\nType \e[33m/help\e[0m for commands, or just chat away!")
     
     is_tty = isa(stdin, Base.TTY)
+    is_stdout_tty = isa(stdout, Base.TTY)
     
     # Interactive loop
     while true
@@ -190,6 +214,11 @@ function main()
         
         print("\e[1;32mAssistant:\e[0m ")
         flush(stdout)
+
+        if is_stdout_tty
+            print("\e[2m...\e[0m")
+            flush(stdout)
+        end
         
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
                                               max_tokens=args["max-tokens"], 
@@ -197,8 +226,13 @@ function main()
                                               top_p=Float32(args["top-p"]))
                                               
         full_response = ""
+        first_token = true
         try
             for token_text in stream
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
@@ -207,10 +241,21 @@ function main()
         catch e
             if e isa InterruptException
                 close(stream)
-                println("\n\e[31m[Interrupted]\e[0m")
                 full_response *= " [Interrupted]"
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                    first_token = false
+                elseif !first_token || !is_stdout_tty
+                    println()
+                end
+                println("\e[31m[Interrupted]\e[0m")
             else
                 rethrow(e)
+            end
+        finally
+            if first_token && is_stdout_tty
+                print("\b\b\b\e[K")
+                flush(stdout)
             end
         end
         

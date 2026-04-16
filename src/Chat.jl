@@ -54,7 +54,23 @@ function chat!(model, tok;
     
     while true
         printstyled("You> ", color=:green, bold=true)
-        line = chomp(readline(stdin))
+
+        line = try
+            readline(stdin)
+        catch e
+            if e isa InterruptException
+                println("^C")
+                continue
+            elseif e isa EOFError
+                println("Goodbye!")
+                break
+            else
+                rethrow(e)
+            end
+        end
+
+
+        line = chomp(line)
         
         if isempty(line)
             continue
@@ -69,9 +85,21 @@ function chat!(model, tok;
             continue
         elseif line == "/system"
             printstyled("New system prompt: ", color=:magenta)
-            new_system = chomp(readline(stdin))
-            if !isempty(new_system)
-                system_prompt = new_system
+            new_system = try
+                readline(stdin)
+            catch e
+                if e isa InterruptException
+                    println("^C")
+                    nothing
+                elseif e isa EOFError
+                    nothing
+                else
+                    rethrow(e)
+                end
+            end
+
+            if new_system !== nothing && !isempty(chomp(new_system))
+                system_prompt = chomp(new_system)
                 messages = [Message(:system, system_prompt)]
                 printstyled("System prompt updated!\n", color=:green)
             end
