@@ -683,26 +683,30 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
 
  # Compute scores: K' * q = (seq_len, head_dim) * (head_dim,) = (seq_len,)
  scores = view(attn.scores_buf, 1:seq_len)
- # Manual mat-vec multiply to avoid allocation - use SIMD for inner loop
- @inbounds for i in 1:seq_len
- scores[i] = dot(view(K_h, :, i), q_h) * attn.scale
+ # Manual mat-vec multiply to avoid allocation - use @turbo for SIMD
+ @turbo for i in 1:seq_len
+ s = zero(Float32)
+ for j in 1:attn.head_dim
+ s += K_h[j, i] * q_h[j]
+ end
+ scores[i] = s * attn.scale
  end
 
- # Softmax (in-place on scores buffer) - manual to avoid broadcast allocation
+ # Softmax (in-place on scores buffer)
  max_score = maximum(scores)
- @simd ivdep for i in 1:seq_len
- @inbounds scores[i] = exp(scores[i] - max_score)
+ @turbo for i in 1:seq_len
+ scores[i] = exp(scores[i] - max_score)
  end
  sum_scores = sum(scores)
- @simd ivdep for i in 1:seq_len
- @inbounds scores[i] /= sum_scores
+ @turbo for i in 1:seq_len
+ scores[i] /= sum_scores
  end
 
  # Weighted sum: V * scores = (head_dim, seq_len) * (seq_len,) = (head_dim,)
- # Manual mat-vec to avoid allocation - use SIMD
- @inbounds for i in 1:attn.head_dim
- s = 0.0f0
- @simd ivdep for j in 1:seq_len
+ # Manual mat-vec to avoid allocation - use @turbo
+ @turbo for i in 1:attn.head_dim
+ s = zero(Float32)
+ for j in 1:seq_len
  s += V_h[i, j] * scores[j]
  end
  output[(h-1)*attn.head_dim+i] = s
@@ -710,12 +714,11 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
  end
 
  # Apply sigmoid gate to output (gate comes from Q projection)
- # Manual loop to avoid broadcast allocation - use SIMD
- @simd ivdep for i in 1:length(gate)
- @inbounds gate[i] = 1.0f0 / (1.0f0 + exp(-gate[i]))
+ @turbo for i in 1:length(gate)
+ gate[i] = 1.0f0 / (1.0f0 + exp(-gate[i]))
  end
- @simd ivdep for i in 1:length(output)
- @inbounds output[i] *= gate[i]
+ @turbo for i in 1:length(output)
+ output[i] *= gate[i]
  end
 
  # Output projection using pre-allocated buffer
