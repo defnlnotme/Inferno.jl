@@ -24,6 +24,7 @@ StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 StructTypes = "856f2bd8-1eba-4b0a-8007-ebc267875bd4"
 Tar = "a4e569a6-e804-4fa4-b0f3-eef7a1d5b13e"
+ThreadPools = "b189fb0b-2eb5-4ed4-bc0c-d34c51242431"
 Unicode = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"
 oneAPI = "8f75cd03-7ff8-4ecb-9b8f-daf728133b1b"
 
@@ -47,6 +48,7 @@ Sockets = "1.11.0"
 Statistics = "1.11.0"
 StructTypes = "1.11.0"
 Tar = "1.10.0"
+ThreadPools = "2.1.1"
 Unicode = "1.11.0"
 
 [extras]
