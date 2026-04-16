@@ -76,26 +76,45 @@ end
 
 # --- Rotary Position Embedding ---
 struct RotaryEmbeddingCPU
-    inv_freq::Vector{Float32}
-    max_seq_len::Int
-    rotary_dim::Int  # Number of dimensions that get rotary (partial rotary)
+ inv_freq::Vector{Float32}
+ max_seq_len::Int
+ rotary_dim::Int # Number of dimensions that get rotary (partial rotary)
+ # Precomputed cos/sin for all positions
+ cos_cache::Matrix{Float32}  # (half, max_seq_len)
+ sin_cache::Matrix{Float32}  # (half, max_seq_len)
 end
 
 function RotaryEmbeddingCPU(head_dim::Int, theta::Float32 = 10000.0f0, max_seq_len::Int = 4096; rotary_dim::Int = head_dim)
  # Only compute inv_freq for the rotary dimensions
  # Formula: inv_freq[i] = 1.0 / (theta ^ (2i / rotary_dim))
- inv_freq = Float32[1.0 / (theta ^ (2(i-1)/rotary_dim)) for i in 1:div(rotary_dim, 2)]
- return RotaryEmbeddingCPU(inv_freq, max_seq_len, rotary_dim)
+ half = div(rotary_dim, 2)
+ inv_freq = Float32[1.0 / (theta ^ (2(i-1)/rotary_dim)) for i in 1:half]
+ 
+ # Precompute cos/sin for all positions
+ cos_cache = Matrix{Float32}(undef, half, max_seq_len)
+ sin_cache = Matrix{Float32}(undef, half, max_seq_len)
+ 
+ for pos in 1:max_seq_len
+ for i in 1:half
+ freq = inv_freq[i] * (pos - 1)  # 0-indexed positions
+ cos_cache[i, pos] = cos(freq)
+ sin_cache[i, pos] = sin(freq)
+ end
+ end
+ 
+ return RotaryEmbeddingCPU(inv_freq, max_seq_len, rotary_dim, cos_cache, sin_cache)
 end
 
 function apply_rotary_emb!(x::Matrix{Float32}, pos::Int, rope::RotaryEmbeddingCPU)
  head_dim, num_heads = size(x, 1), size(x, 2)
  half = div(rope.rotary_dim, 2)
  
- # Precompute cos/sin for this position (shared across all heads)
- # This avoids recomputing cos/sin for each head
- cos_vals = @inbounds [cos(rope.inv_freq[i] * pos) for i in 1:half]
- sin_vals = @inbounds [sin(rope.inv_freq[i] * pos) for i in 1:half]
+ # Use precomputed cos/sin (1-indexed position)
+ pos_idx = pos + 1  # Convert 0-indexed to 1-indexed
+ @inbounds begin
+ cos_vals = view(rope.cos_cache, :, pos_idx)
+ sin_vals = view(rope.sin_cache, :, pos_idx)
+ end
  
  for h in 1:num_heads
  for i in 1:half
@@ -123,9 +142,12 @@ function rmsnorm_rotary!(x::Matrix{Float32}, pos::Int, rope::RotaryEmbeddingCPU,
  half = div(rope.rotary_dim, 2)
  weight = norm.weight
  
- # Precompute cos/sin for this position (shared across all heads)
- cos_vals = @inbounds [cos(rope.inv_freq[i] * pos) for i in 1:half]
- sin_vals = @inbounds [sin(rope.inv_freq[i] * pos) for i in 1:half]
+ # Use precomputed cos/sin (1-indexed position)
+ pos_idx = pos + 1  # Convert 0-indexed to 1-indexed
+ @inbounds begin
+ cos_vals = view(rope.cos_cache, :, pos_idx)
+ sin_vals = view(rope.sin_cache, :, pos_idx)
+ end
  
  for h in 1:num_heads
  # First: RMSNorm on this head
