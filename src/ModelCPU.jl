@@ -901,7 +901,7 @@ allows each thread to work on a cache-friendly subset of rows.
 
 Benchmark: 13ms vs 27ms for direct BLAS (2.1x speedup with 8 threads)
 """
-function lm_head_project!(output::Vector{Float32}, weight::Matrix{Float32}, hidden::Vector{Float32}; nchunks::Int=8)
+function lm_head_project!(output::Vector{Float32}, weight::Matrix{Float32}, hidden::Vector{Float32}; nchunks::Int=4)
  vocab_size = size(weight, 1)
  chunk_size = cld(vocab_size, nchunks)
  
