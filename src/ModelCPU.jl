@@ -67,10 +67,16 @@ end
 end
 
 @inline function rmsnorm_cpu!(out::AbstractArray{Float32}, x::AbstractArray{Float32}, norm::RMSNormCPU)
- # Using sum(abs2, x) is generally faster and more stable in Julia for this size
- ss = sum(abs2, x)
+ # Compute sum of squares with @turbo for SIMD
+ ss = zero(Float32)
+ @turbo for i in eachindex(x)
+ ss += x[i] * x[i]
+ end
  scale = 1.0f0 / sqrt(ss / length(x) + norm.eps)
- out .= x .* scale .* norm.weight
+ # Apply normalization with @turbo
+ @turbo for i in eachindex(x)
+ out[i] = x[i] * scale * norm.weight[i]
+ end
  return out
 end
 
