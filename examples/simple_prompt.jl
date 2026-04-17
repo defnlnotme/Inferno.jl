@@ -66,17 +66,33 @@ function main()
     # 3. Generate and print (streaming)
     println("\nGenerating response...")
     println("-"^40)
-    print("Response: ")
+    printstyled("Response: ", color=:green, bold=true)
+
+    is_stdout_tty = isa(stdout, Base.TTY)
+    if is_stdout_tty
+        print("\e[2m...\e[0m")
+    end
+    flush(stdout)
 
     # generate_stream yields one string token (decoded) at a time
     stream = Inferno.generate_stream(model, tok, prompt; max_tokens=256, temperature=0.0f0, top_p=1.0f0, top_k=1)
+    first_token = true
     try
         for token in stream
+            if first_token
+                if is_stdout_tty
+                    print("\b\b\b\e[K")
+                end
+                first_token = false
+            end
             print(token)
             flush(stdout)
         end
     catch e
         if e isa InterruptException
+            if first_token && is_stdout_tty
+                print("\b\b\b\e[K")
+            end
             println("\n\nInterrupted!")
             close(stream)
         else
