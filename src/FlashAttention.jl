@@ -14,14 +14,14 @@ Key optimizations:
 This is essentially Flash Attention-2/3 adapted for CPU.
 """
 function flash_attention_cpu!(
-    output::Vector{Float32},
-    Q::Vector{Float32},
-    cache_k::Array{Float32,3},
-    cache_v::Array{Float32,3},
-    kv_h::Int,
-    seq_len::Int,
-    scale::Float32,
-    head_dim::Int
+ output::AbstractVector{Float32},
+ Q::AbstractVector{Float32},
+ cache_k::AbstractArray{Float32,3},
+ cache_v::AbstractArray{Float32,3},
+ kv_h::Int,
+ seq_len::Int,
+ scale::Float32,
+ head_dim::Int
 )
     fill!(output, 0.0f0)
     

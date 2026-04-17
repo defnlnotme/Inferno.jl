@@ -356,8 +356,53 @@ function mlp_mat_vec_mul(weight::Q6_K_Matrix, x::Vector{Float32})
 end
 
 function mlp_mat_vec_mul(weight::Q8_0_Matrix, x::Vector{Float32})
-    out = Vector{Float32}(undef, weight.outer_dim)
-    return mul_quant_mat_vec(weight, x, out)
+ out = Vector{Float32}(undef, weight.outer_dim)
+ return mul_quant_mat_vec(weight, x, out)
+end
+
+# Generic mat-vec multiplication for attention layers (returns new vector)
+function mul_quant_or_float32(weight::Matrix{Float32}, x::Vector{Float32})
+ return weight * x
+end
+
+function mul_quant_or_float32(weight::Q4_K_Matrix, x::Vector{Float32})
+ out = Vector{Float32}(undef, weight.outer_dim)
+ return mul_quant_mat_vec(weight, x, out)
+end
+
+function mul_quant_or_float32(weight::Q5_K_Matrix, x::Vector{Float32})
+ out = Vector{Float32}(undef, weight.outer_dim)
+ return mul_quant_mat_vec(weight, x, out)
+end
+
+function mul_quant_or_float32(weight::Q6_K_Matrix, x::Vector{Float32})
+ out = Vector{Float32}(undef, weight.outer_dim)
+ return mul_quant_mat_vec(weight, x, out)
+end
+
+function mul_quant_or_float32(weight::Q8_0_Matrix, x::Vector{Float32})
+ out = Vector{Float32}(undef, weight.outer_dim)
+ return mul_quant_mat_vec(weight, x, out)
+end
+
+# In-place mat-vec multiplication for attention layers
+function mul!(out::Vector{Float32}, weight::Matrix{Float32}, x::Vector{Float32})
+ LinearAlgebra.mul!(out, weight, x)
+ return out
+end
+
+function mul!(out::AbstractVector{Float32}, weight::AbstractMatrix{Float32}, x::Vector{Float32})
+ LinearAlgebra.mul!(out, weight, x)
+ return out
+end
+
+function mul!(out::Vector{Float32}, weight::QuantOrFloat32, x::Vector{Float32})
+ if weight isa Matrix{Float32}
+ LinearAlgebra.mul!(out, weight, x)
+ else
+ mul_quant_mat_vec(weight, x, out)
+ end
+ return out
 end
 
 # Generic MLP forward pass
@@ -487,9 +532,9 @@ function (m::GatedDeltaNetCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddi
  v_all = reshape(view(x_conv, 2*qk_size+1:2*qk_size+m.d_inner), m.head_v_dim, m.num_v_heads)
  
  # 6. Alpha/beta projections (use pre-allocated buffers)
- # ssm_alpha_weight is (hidden, num_v_heads), need transpose for mat-vec mul
- mul!(m.alpha_proj_buf, m.ssm_alpha_weight', x)
- mul!(m.beta_proj_buf, m.ssm_beta_weight', x)
+ # ssm_alpha_weight is now (num_v_heads, hidden_size), no transpose needed
+ mul!(m.alpha_proj_buf, m.ssm_alpha_weight, x)
+ mul!(m.beta_proj_buf, m.ssm_beta_weight, x)
  alpha_proj = m.alpha_proj_buf
  beta_proj = m.beta_proj_buf
  
@@ -646,10 +691,10 @@ end
 # --- Full Attention ---
 struct FullAttentionCPU
  index::Int
- wq::Matrix{Float32} # (n_heads * head_dim * 2, hidden) — query + gate projection
- wk::Matrix{Float32} # (n_kv * head_dim, hidden)
- wv::Matrix{Float32} # (n_kv * head_dim, hidden)
- wo::Matrix{Float32} # (hidden, n_heads * head_dim) — output projection
+ wq::QuantOrFloat32 # (n_heads * head_dim * 2, hidden) — query + gate projection
+ wk::QuantOrFloat32 # (n_kv * head_dim, hidden)
+ wv::QuantOrFloat32 # (n_kv * head_dim, hidden)
+ wo::QuantOrFloat32 # (hidden, n_heads * head_dim) — output projection
  q_norm::RMSNormCPU
  k_norm::RMSNormCPU
  n_heads::Int

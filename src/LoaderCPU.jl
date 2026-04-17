@@ -376,11 +376,11 @@ ssm_conv1d = Matrix{Float32}(ssm_conv1d_raw')  # Transpose to (6144, 4) = (C, K)
  
 # Alpha/beta weights
 # GGUF stores as (num_v_heads, hidden_size) in row-major
-# Julia reads as (hidden_size, num_v_heads) due to column-major - this is what we want
-# Forward pass expects (hidden, heads) for: ssm_alpha_weight' * x -> (heads,)
-ssm_alpha_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_alpha.weight")))
-# Keep as (hidden, heads) - no transpose needed
-ssm_beta_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_beta.weight")))
+# We need (num_v_heads, hidden_size) for the forward pass which does weight' * x
+# So we transpose at load: (hidden, heads) -> (heads, hidden) so that (heads, hidden)' = (hidden, heads)
+ssm_alpha_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_alpha.weight"))')
+# After transpose we have (num_v_heads, hidden_size) - no transpose needed in forward pass
+ssm_beta_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_beta.weight"))')
     
     # SSM parameters - ssm_a is a tensor, not a bias
     ssm_a = Float32.(vec(extract_tensor_cpu(file, "$(prefix).ssm_a")))
@@ -448,11 +448,11 @@ end
 function load_attention_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU)
     prefix = "blk.$(layer_idx)"
     
-    # Load weights - transpose from GGUF format
-    wq = Float32.(extract_tensor_cpu(file, "$(prefix).attn_q.weight"))'
-    wk = Float32.(extract_tensor_cpu(file, "$(prefix).attn_k.weight"))'
-    wv = Float32.(extract_tensor_cpu(file, "$(prefix).attn_v.weight"))'
-    wo = Float32.(extract_tensor_cpu(file, "$(prefix).attn_output.weight"))'
+ # Load weights - transpose from GGUF format
+ wq = collect(Float32.(extract_tensor_cpu(file, "$(prefix).attn_q.weight"))')
+ wk = collect(Float32.(extract_tensor_cpu(file, "$(prefix).attn_k.weight"))')
+ wv = collect(Float32.(extract_tensor_cpu(file, "$(prefix).attn_v.weight"))')
+ wo = collect(Float32.(extract_tensor_cpu(file, "$(prefix).attn_output.weight"))')
     
     # Q/K norms
     q_norm_w = Float32.(extract_tensor_cpu(file, "$(prefix).attn_q_norm.weight"))
