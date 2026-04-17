@@ -657,14 +657,17 @@ struct FullAttentionCPU
  head_dim::Int
  scale::Float32
  # Pre-allocated work buffers
- qkv_buf::Vector{Float32}      # wq output (n_heads * head_dim * 2)
- k_buf::Vector{Float32}        # wk output (n_kv * head_dim)
- v_buf::Vector{Float32}        # wv output (n_kv * head_dim)
- query_states_buf::Vector{Float32}  # query after split (n_heads * head_dim)
- gate_buf::Vector{Float32}          # gate after split (n_heads * head_dim)
- output_buf::Vector{Float32}        # final output (n_heads * head_dim)
- scores_buf::Vector{Float32}        # attention scores (max_seq_len)
- wo_output_buf::Vector{Float32}     # wo output (hidden_size)
+ qkv_buf::Vector{Float32} # wq output (n_heads * head_dim * 2)
+ k_buf::Vector{Float32} # wk output (n_kv * head_dim)
+ v_buf::Vector{Float32} # wv output (n_kv * head_dim)
+ query_states_buf::Vector{Float32} # query after split (n_heads * head_dim)
+ gate_buf::Vector{Float32} # gate after split (n_heads * head_dim)
+ output_buf::Vector{Float32} # final output (n_heads * head_dim)
+ scores_buf::Vector{Float32} # attention scores (max_seq_len)
+ wo_output_buf::Vector{Float32} # wo output (hidden_size)
+ # Flash attention buffers (reused per head)
+ fa_output_buf::Vector{Float32} # (head_dim) for flash attention accumulation
+ use_flash_attention::Bool
 end
 
 function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbeddingCPU, cache::KVCacheCPU)
@@ -697,8 +700,7 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
  # Update KV cache
  update_kv_cache!(cache, k, v, pos)
 
- # Compute attention scores using BLAS
- # Use pre-allocated output buffer
+ # Compute attention: choose between standard and flash attention
  output = attn.output_buf
  fill!(output, 0.0f0)
 
@@ -707,17 +709,27 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
 
  for h in 1:attn.n_heads
  kv_h = div(h - 1, gqa_ratio) + 1
-
- # Use view instead of slice to avoid allocation
  q_h = view(query_states, :, h)
 
- # Extract K and V for this KV head: (head_dim, seq_len)
+ if attn.use_flash_attention
+ # Flash Attention: memory-efficient tiled computation
+ fa_out = view(attn.fa_output_buf, 1:attn.head_dim)
+ fill!(fa_out, 0.0f0)
+ 
+ # Call the flash_attention_cpu! function from FlashAttention.jl
+ flash_attention_cpu!(fa_out, q_h, cache.k, cache.v, kv_h, seq_len, attn.scale, attn.head_dim)
+ 
+ # Copy result to output buffer
+ @turbo for i in 1:attn.head_dim
+ output[(h-1)*attn.head_dim+i] = fa_out[i]
+ end
+ else
+ # Standard attention with manual @turbo
  K_h = view(cache.k, :, kv_h, 1:seq_len)
  V_h = view(cache.v, :, kv_h, 1:seq_len)
-
+ 
  # Compute scores: K' * q = (seq_len, head_dim) * (head_dim,) = (seq_len,)
  scores = view(attn.scores_buf, 1:seq_len)
- # Manual mat-vec multiply to avoid allocation - use @turbo for SIMD
  @turbo for i in 1:seq_len
  s = zero(Float32)
  for j in 1:attn.head_dim
@@ -737,13 +749,13 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
  end
 
  # Weighted sum: V * scores = (head_dim, seq_len) * (seq_len,) = (head_dim,)
- # Manual mat-vec to avoid allocation - use @turbo
  @turbo for i in 1:attn.head_dim
  s = zero(Float32)
  for j in 1:seq_len
  s += V_h[i, j] * scores[j]
  end
  output[(h-1)*attn.head_dim+i] = s
+ end
  end
  end
 
@@ -1717,5 +1729,9 @@ function mtp_verify_step!(model::QwenModelCPU, draft_tokens::Vector{Int}, pos::I
  
  return accepted, logits
 end
+
+# Include Flash Attention and Speculative Decoding
+include("FlashAttention.jl")
+include("SpeculativeDecoding.jl")
 
 end # module

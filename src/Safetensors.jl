@@ -714,6 +714,12 @@ function load_attention_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, c
  max_seq = config.max_position_embeddings
  scores_buf = Vector{Float32}(undef, max_seq)
  
+ # Flash attention output buffer (head_dim per head)
+ fa_output_buf = Vector{Float32}(undef, head_dim)
+ 
+ # Default: flash attention enabled
+ use_fa = get(ENV, "INFERNO_USE_FLASH_ATTENTION", "true") != "false"
+ 
  return ModelCPU.FullAttentionCPU(
  layer_idx,
  wq, wk, wv, wo,
@@ -721,7 +727,8 @@ function load_attention_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, c
  n_heads, n_kv, head_dim,
  Float32(1.0 / sqrt(head_dim)),
  qkv_buf, k_buf, v_buf,
- query_states_buf, gate_buf, output_buf, scores_buf, wo_output_buf
+ query_states_buf, gate_buf, output_buf, scores_buf, wo_output_buf,
+ fa_output_buf, use_fa
  )
 end
 
