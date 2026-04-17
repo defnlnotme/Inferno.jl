@@ -14,6 +14,7 @@ include("QuantsCPU.jl")
 include("QuantMV.jl")
 include("GGUF.jl")
 include("Model.jl")
+include("BF16Support.jl")
 include("ModelCPU.jl")
 include("Tokenizer.jl")
 include("Loader.jl")
@@ -29,6 +30,7 @@ using .QuantsCPU
 using .QuantMV
 using .GGUF
 using .Model
+using .BF16Support
 using .ModelCPU
 using .Tokenizer
 using .Loader
@@ -39,10 +41,11 @@ using .Server
 using .Generate
 
 export load_model, load_model_cpu, start_server, non_nothing_fields, stream_to_stdout, stream_to_stdout_cpu
-export LoaderCPU, ModelCPU, generate_stream_cpu, generate_cpu, softmax_sample
+export LoaderCPU, ModelCPU, generate_stream_cpu, generate_cpu, softmax_sample, BF16Support
 export generate_text, chat
 export chat!, start_chat, Message, build_prompt
 export load_safetensors_model, Safetensors, detect_model_format
+export set_inference_precision!, get_inference_precision, should_use_bf16
 
 """
     non_nothing_fields(obj) -> NamedTuple
