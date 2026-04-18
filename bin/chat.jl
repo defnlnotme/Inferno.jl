@@ -102,6 +102,7 @@ function main()
     messages = Pair{String, String}[]
     
     # If initial prompt is given, process it first
+    is_stdout_tty = isa(stdout, Base.TTY)
     if args["prompt"] !== nothing
         push!(messages, "user" => args["prompt"])
         prompt_text = format_messages(args["system-prompt"], messages)
@@ -114,8 +115,20 @@ function main()
                                               top_p=Float32(args["top-p"]))
         
         full_response = ""
+        first_token = true
+        if is_stdout_tty
+            print("\e[2m...\e[0m")
+            flush(stdout)
+        end
+
         try
             for token_text in stream
+                if first_token
+                    if is_stdout_tty
+                        print("\b\b\b\e[K")
+                    end
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
@@ -123,6 +136,10 @@ function main()
             println()
         catch e
             if e isa InterruptException
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                    first_token = false
+                end
                 close(stream)
                 println("\n\e[31m[Interrupted]\e[0m")
                 full_response *= " [Interrupted]"
@@ -197,8 +214,20 @@ function main()
                                               top_p=Float32(args["top-p"]))
                                               
         full_response = ""
+        first_token = true
+        if is_stdout_tty
+            print("\e[2m...\e[0m")
+            flush(stdout)
+        end
+
         try
             for token_text in stream
+                if first_token
+                    if is_stdout_tty
+                        print("\b\b\b\e[K")
+                    end
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
@@ -206,6 +235,10 @@ function main()
             println()
         catch e
             if e isa InterruptException
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                    first_token = false
+                end
                 close(stream)
                 println("\n\e[31m[Interrupted]\e[0m")
                 full_response *= " [Interrupted]"
