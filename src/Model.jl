@@ -438,34 +438,26 @@ function MLP(index::Int, gate_weight, up_weight, down_weight)
 end
 
 function (m::MLP)(x::oneMatrix{Float16}, cache::KVCache)
- # GPU path - use numerically stable SiLU with Float32 intermediate
- mul!(cache.mlp_gate, m.gate_weight, x)
- mul!(cache.mlp_up, m.up_weight, x)
- 
- # Numerically stable SiLU: gate * sigmoid(gate)
- # Use Float32 for exp() to avoid overflow/underflow
- gate_cpu = Array(cache.mlp_gate)
- up_cpu = Array(cache.mlp_up)
- 
- # Apply SiLU in Float32 for numerical stability
- @. gate_cpu = gate_cpu * (Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_cpu))))
- gate_cpu .*= up_cpu
- 
- # Copy back to GPU
- copyto!(cache.mlp_gate, Float16.(gate_cpu))
- mul!(cache.branch_out, m.down_weight, cache.mlp_gate)
+    # GPU path - use numerically stable SiLU with Float32 intermediate on-device
+    mul!(cache.mlp_gate, m.gate_weight, x)
+    mul!(cache.mlp_up, m.up_weight, x)
 
- return cache.branch_out
+    # Numerically stable SiLU: gate * sigmoid(gate) * up
+    # Use Float32 for exp() to avoid overflow/underflow, staying entirely on GPU
+    @. cache.mlp_gate = Float16(Float32(cache.mlp_gate) * (1.0f0 / (1.0f0 + exp(-Float32(cache.mlp_gate)))) * Float32(cache.mlp_up))
+
+    mul!(cache.branch_out, m.down_weight, cache.mlp_gate)
+
+    return cache.branch_out
 end
 
 function (m::MLP)(x::oneMatrix{Float16})
- # Numerically stable SiLU using Float32 intermediate
- g = Array(mat_mul(m.gate_weight, x))
- u = Array(mat_mul(m.up_weight, x))
- # SiLU: g * sigmoid(g) in Float32
- @. g = g * (Float32(1.0) / (Float32(1.0) + exp(-Float32(g))))
- g .*= u
- return mat_mul(m.down_weight, oneArray(Float16.(g)))
+    # Numerically stable SiLU using Float32 intermediate entirely on GPU
+    g = mat_mul(m.gate_weight, x)
+    u = mat_mul(m.up_weight, x)
+    # SiLU: g * sigmoid(g) * u in Float32
+    @. g = Float16(Float32(g) * (1.0f0 / (1.0f0 + exp(-Float32(g)))) * Float32(u))
+    return mat_mul(m.down_weight, g)
 end
 
 function reset_states!(m::MLP)
@@ -662,9 +654,8 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
         k_rope = rope(k_2d, pos)
 
  # 4. Gate (applied AFTER attention, not to Q)
- gate_raw_cpu = Array(gate_raw)
- @. gate_raw_cpu = Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_raw_cpu))) # sigmoid
- gate_sigmoid = oneArray(Float16.(gate_raw_cpu))
+ # Numerically stable sigmoid entirely on GPU
+ gate_sigmoid = @. Float16(1.0f0 / (1.0f0 + exp(-Float32(gate_raw))))
  q_gated = q_rope
 
     elseif m.architecture == :phi3
@@ -733,7 +724,8 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
         end
 
         combined = m.decode_combined
-        combined .*= gate_sigmoid
+        # gate_sigmoid is (hd, n_heads, 1), combined is (hd*n_heads, 1)
+        combined .*= reshape(gate_sigmoid, :, 1)
         result = mat_mul!(m.decode_wo_buf, m.wo, combined)
 
  else
@@ -777,7 +769,7 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
  end
  end
  combined = oneArray(combined_all)
- combined .*= gate_sigmoid
+ combined .*= reshape(gate_sigmoid, :, seq)
  result = mat_mul(m.wo, combined)
  end
 
