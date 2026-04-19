@@ -1,6 +1,42 @@
 """
 CPU-only inference backend for Inferno.jl
+
 This module provides pure CPU implementations without GPU dependencies.
+Supports both GGUF and Safetensors formats with optional quantization support.
+
+# Key Features
+- SSM (Gated DeltaNet) and Full Attention layers
+- Flash Attention implementation (optional)
+- Speculative Decoding
+- BF16 support
+- Quantized weights (Q4_K, Q5_K, Q6_K, Q8_0)
+- Streaming generation
+
+# Exports
+## Configuration
+- `QwenConfigCPU`: Model configuration struct
+
+## Models
+- `QwenModelCPU`: Main CPU model struct
+- `RMSNormCPU`, `MLPCPU`: Layer types
+- `GatedDeltaNetCPU`: SSM layer
+- `FullAttentionCPU`: Attention layer with optional Flash Attention
+
+## Inference
+- `forward_cpu!`: Forward pass
+- `generate_cpu`: Generate tokens
+- `stream_to_stdout_cpu`: Stream to stdout with token stats
+- `softmax_sample`: Sample from logits
+
+## State Management
+- `init_kv_cache_cpu`: Initialize KV cache
+- `reset_states_cpu!`: Reset model state
+
+# Example
+```julia
+model, tok = load_model_cpu("model.gguf")
+output = stream_to_stdout_cpu(model, tok, "Hello, "; max_tokens=50)
+```
 """
 module ModelCPU
 
@@ -8,6 +44,8 @@ using LinearAlgebra
 using Statistics
 using LoopVectorization
 using ..QuantsCPU
+using ..ArrowLake
+using BFloat16s
 using Printf
 
 export QwenConfigCPU, QwenModelCPU, KVCacheCPU, forward_cpu!, RMSNormCPU, MLPCPU, GatedDeltaNetCPU, FullAttentionCPU, DecoderLayerCPU, RotaryEmbeddingCPU
@@ -15,30 +53,32 @@ export init_kv_cache_cpu, reset_states_cpu!, softmax_sample, generate_cpu, gener
 
 # --- Configuration ---
 Base.@kwdef struct QwenConfigCPU
-    architecture::Symbol = :qwen
-    vocab_size::Int = 151936
-    hidden_size::Int = 1024
-    intermediate_size::Int = 3584
-    num_hidden_layers::Int = 24
-    num_attention_heads::Int = 8
-    num_key_value_heads::Int = 2
-    head_dim::Int = 256
-    rms_norm_eps::Float32 = 1e-6f0
-    rope_theta::Float32 = 10000000.0f0
-    max_position_embeddings::Int = 4096
-    full_attention_interval::Int = 4
-    ssm_inner_size::Int = 2048
-    ssm_state_size::Int = 128
-    ssm_group_count::Int = 16
-    ssm_time_step_rank::Int = 16
-    ssm_conv_kernel::Int = 4
-    partial_rotary_factor::Float32 = 0.25f0  # Only 25% of head_dim gets rotary
-    # MLA (Multi-Head Latent Attention for DeepSeek)
-    q_lora_rank::Int = 0
-    kv_lora_rank::Int = 0
-    qk_rope_head_dim::Int = 0
-    qk_nope_head_dim::Int = 0
-    v_head_dim::Int = 0
+ architecture::Symbol = :qwen
+ vocab_size::Int = 151936
+ hidden_size::Int = 1024
+ intermediate_size::Int = 3584
+ num_hidden_layers::Int = 24
+ num_attention_heads::Int = 8
+ num_key_value_heads::Int = 2
+ head_dim::Int = 256
+ rms_norm_eps::Float32 = 1e-6f0
+ rope_theta::Float32 = 10000000.0f0
+ max_position_embeddings::Int = 4096
+ full_attention_interval::Int = 4
+ ssm_inner_size::Int = 2048
+ ssm_state_size::Int = 128
+ ssm_group_count::Int = 16
+ ssm_time_step_rank::Int = 16
+ ssm_conv_kernel::Int = 4
+ partial_rotary_factor::Float32 = 0.25f0 # Only 25% of head_dim gets rotary
+ # MLA (Multi-Head Latent Attention for DeepSeek)
+ q_lora_rank::Int = 0
+ kv_lora_rank::Int = 0
+ qk_rope_head_dim::Int = 0
+ qk_nope_head_dim::Int = 0
+ v_head_dim::Int = 0
+ # Performance options
+ use_bf16_weights::Bool = has_arrow_lake_features() # Auto-enable: BF16 lm_head saves 50% memory, matches BLAS speed
 end
 
 # Helper functions
@@ -217,8 +257,8 @@ function update_kv_cache!(cache::KVCacheCPU, k::Matrix{Float32}, v::Matrix{Float
 end
 
 # --- MLP ---
-# Union type for weight matrices (either Float32 or quantized)
-const QuantOrFloat32 = Union{Matrix{Float32}, Q4_K_Matrix, Q5_K_Matrix, Q6_K_Matrix, Q8_0_Matrix}
+# Union type for weight matrices (Float32, Quantized, or BFloat16 with Arrow Lake support)
+const QuantOrFloat32 = Union{Matrix{Float32}, Matrix{BFloat16}, Q4_K_Matrix, Q5_K_Matrix, Q6_K_Matrix, Q8_0_Matrix}
 
 struct MLPCPU
  gate_weight::QuantOrFloat32 # (intermediate, hidden) after GGUF reshape+transpose
@@ -237,33 +277,57 @@ function (mlp::MLPCPU)(x::Vector{Float32})
 end
 
 # Helper: multiply quantized matrix by vector (row-wise)
+# FAST PATH: dequantize element-by-element and accumulate (no intermediate Float32 buffer)
 function mul_quant_mat_vec(mat::Q4_K_Matrix, x::Vector{Float32}, out::Vector{Float32})
-    # Dequantize and multiply row by row
-    # mat is stored as (inner_dim, outer_dim), we need to compute mat' * x
-    # which gives us a vector of size outer_dim
-    fill!(out, 0.0f0)
-    
-    block_values = zeros(Float32, 256)
-    
-    for row in 1:mat.outer_dim
-        sum_val = 0.0f0
-        row_start = (row - 1) * mat.inner_dim
-        
-        for block in 0:(mat.inner_dim ÷ 256 - 1)
-            global_block_idx = (row - 1) * (mat.inner_dim ÷ 256) + block
-            block_offset = global_block_idx * QuantsCPU.Q4_K_BLOCK_SIZE + 1
-            
-            # Dequantize this block
-            QuantsCPU.dequantize_q4_k_block!(block_values, mat.data, block_offset)
-            
-            for i in 1:256
-                col_idx = block * 256 + i
-                sum_val += block_values[i] * x[col_idx]
-            end
-        end
-        out[row] = sum_val
-    end
-    return out
+ # mat is stored as (inner_dim, outer_dim), we need to compute mat' * x
+ fill!(out, 0.0f0)
+ 
+ # Pre-dequantize scales for each row to avoid repeated work
+ # But process elements one at a time to avoid 256-float buffer
+ 
+ for row in 1:mat.outer_dim
+ sum_val = 0.0f0
+ 
+ for block in 0:(mat.inner_dim ÷ 256 - 1)
+ global_block_idx = (row - 1) * (mat.inner_dim ÷ 256) + block
+ block_offset = global_block_idx * QuantsCPU.Q4_K_BLOCK_SIZE + 1
+ 
+ # Get block scales and data
+ d = Float32(reinterpret(Float16, mat.data[block_offset:block_offset+1])[1])
+ dmin = Float32(reinterpret(Float16, mat.data[block_offset+2:block_offset+3])[1])
+ scales = @view mat.data[block_offset+4:block_offset+15]
+ qs = @view mat.data[block_offset+16:block_offset+143]
+ 
+ # Process 8 sub-blocks of 32 elements each
+ for j in 0:3
+ is_idx = 2 * j
+ 
+ # Get scale for this sub-block
+ sc1 = UInt8(scales[is_idx + 1] & 63)
+ sc2 = UInt8(scales[is_idx + 2] & 63)
+ m1 = UInt8(scales[is_idx + 5] & 63)
+ m2 = UInt8(scales[is_idx + 6] & 63)
+ 
+ d1 = d * Float32(sc1)
+ d2 = d * Float32(sc2)
+ min1 = dmin * Float32(m1)
+ min2 = dmin * Float32(m2)
+ 
+ # Process 32 elements at a time (one sub-block)
+ base_idx = j * 64
+ for l in 0:31
+ # Low 4 bits
+ ql_val = Int(qs[j * 32 + l + 1] & 0x0f)
+ sum_val += (d1 * Float32(ql_val) - min1) * x[base_idx + l + 1]
+ # High 4 bits  
+ qh_val = Int(qs[j * 32 + l + 1] >> 4)
+ sum_val += (d2 * Float32(qh_val) - min2) * x[base_idx + 32 + l + 1]
+ end
+ end
+ end
+ out[row] = sum_val
+ end
+ return out
 end
 
 function mul_quant_mat_vec(mat::Q5_K_Matrix, x::Vector{Float32}, out::Vector{Float32})
@@ -385,24 +449,20 @@ function mul_quant_or_float32(weight::Q8_0_Matrix, x::Vector{Float32})
  return mul_quant_mat_vec(weight, x, out)
 end
 
-# In-place mat-vec multiplication for attention layers
-function mul!(out::Vector{Float32}, weight::Matrix{Float32}, x::Vector{Float32})
- LinearAlgebra.mul!(out, weight, x)
- return out
-end
-
-function mul!(out::AbstractVector{Float32}, weight::AbstractMatrix{Float32}, x::Vector{Float32})
- LinearAlgebra.mul!(out, weight, x)
- return out
-end
+# In-place mat-vec multiplication for all weight types
+# Float32: BLAS (always fastest, even for small matrices)
+# BFloat16: bulk reinterpret + BLAS
+# Quantized: specialized dequant
 
 function mul!(out::Vector{Float32}, weight::QuantOrFloat32, x::Vector{Float32})
- if weight isa Matrix{Float32}
- LinearAlgebra.mul!(out, weight, x)
- else
- mul_quant_mat_vec(weight, x, out)
- end
- return out
+    if weight isa Matrix{Float32}
+        LinearAlgebra.mul!(out, weight, x)
+    elseif weight isa Matrix{BFloat16}
+        ArrowLake.bf16_matmul_vec!(out, weight, x)
+    else
+        mul_quant_mat_vec(weight, x, out)
+    end
+    return out
 end
 
 # Generic MLP forward pass
@@ -892,11 +952,12 @@ end
 struct QwenModelCPU
  config::QwenConfigCPU
  embed::Matrix{Float32} # (hidden, vocab_size)
- lm_head::Matrix{Float32} # (vocab_size, hidden) or tied to embed
+ lm_head::Union{Matrix{Float32}, Matrix{BFloat16}} # (vocab_size, hidden) or tied to embed
  layers::Vector{DecoderLayerCPU}
  final_norm::RMSNormCPU
  rope::RotaryEmbeddingCPU
  # Pre-allocated buffers to avoid allocations per token
+ embed_buf::Vector{Float32} # embedding lookup buffer (avoids slice copy)
  final_norm_buf::Vector{Float32}
  lm_head_buf::Vector{Float32}
  # Optional MTP head (for models trained with Multi-Token Prediction)
@@ -911,8 +972,11 @@ function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
  for t in 1:seq_len
  tok = tokens[t] # Already 1-indexed from encode()
  curr_pos = pos + t - 1
- # Copy embedding to avoid modifying the embedding matrix
- x = model.embed[:, tok]
+ # Copy embedding to pre-allocated buffer
+ @simd for i in 1:length(model.embed_buf)
+ @inbounds model.embed_buf[i] = model.embed[i, tok]
+ end
+ x = model.embed_buf
  for (i, layer) in enumerate(model.layers)
  x = layer(x, curr_pos, model.rope, caches[i])
  end
@@ -928,8 +992,11 @@ function forward_cpu!(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
  for t in 1:seq_len
  tok = tokens[t] # Already 1-indexed from encode()
  curr_pos = pos + t - 1
- # Copy embedding to avoid modifying the embedding matrix
- x = model.embed[:, tok]
+ # Copy embedding to pre-allocated buffer (avoids slice allocation)
+ @simd for i in 1:length(model.embed_buf)
+ @inbounds model.embed_buf[i] = model.embed[i, tok]
+ end
+ x = model.embed_buf
  for (i, layer) in enumerate(model.layers)
  x = layer(x, curr_pos, model.rope, caches[i])
  end
@@ -970,20 +1037,108 @@ function lm_head_project!(output::Vector{Float32}, weight::Matrix{Float32}, hidd
  vocab_size = size(weight, 1)
  chunk_size = cld(vocab_size, nchunks)
  
+ # Pre-allocate temporary buffers for each chunk
+ chunk_outputs = [Vector{Float32}(undef, chunk_size) for _ in 1:nchunks]
+ 
  # Use spawn+wait instead of @threads to reduce allocations
  tasks = Vector{Task}(undef, nchunks)
  for chunk in 1:nchunks
  i_start = (chunk - 1) * chunk_size + 1
  i_end = min(chunk * chunk_size, vocab_size)
+ actual_size = i_end - i_start + 1
  
  tasks[chunk] = Threads.@spawn begin
- mul!(view(output, i_start:i_end), view(weight, i_start:i_end, :), hidden)
+ buf = view(chunk_outputs[chunk], 1:actual_size)
+ BLAS.gemv!('N', 1.0f0, view(weight, i_start:i_end, :), hidden, 0.0f0, buf)
  end
  end
  
- # Wait for all tasks to complete
+ # Wait for all tasks to complete and copy results
  for task in tasks
  wait(task)
+ end
+ 
+ # Copy results back to output
+ for chunk in 1:nchunks
+ i_start = (chunk - 1) * chunk_size + 1
+ i_end = min(chunk * chunk_size, vocab_size)
+ actual_size = i_end - i_start + 1
+ output[i_start:i_end] .= chunk_outputs[chunk][1:actual_size]
+ end
+end
+
+"""
+ lm_head_project! for BFloat16 weights.
+ Weight is stored transposed: (hidden_size, vocab_size) so each logical "row"
+ (vocab entry) maps to a Julia column, which IS contiguous in memory.
+ Uses C AVX2 BF16 kernel for each contiguous column dot product.
+"""
+function lm_head_project!(output::Vector{Float32}, weight::Matrix{BFloat16}, hidden::Vector{Float32}; nchunks::Int=4)
+ # weight is (hidden_size, vocab_size), stored transposed
+ # output[j] = dot(weight[:,j], hidden) = sum_i weight[i,j] * hidden[i]
+ vocab_size = size(weight, 2)
+ 
+ W_u16 = reinterpret(UInt16, weight)
+ 
+ # Convert F32 activations to BF16 once
+ x_bf16 = Vector{UInt16}(undef, length(hidden))
+ ArrowLake.fp32_to_bf16_c!(x_bf16, hidden)
+ 
+ # Each column weight[:,j] is contiguous (stride 1) in column-major
+ # Use bf16_gemv_c! with the transposed view:
+ # Call with W_u16' conceptually, but physically we just pass the whole matrix
+ # and let the C kernel iterate over columns.
+ # Actually simpler: call bf16_gemv_c! on the full weight
+ # bf16_gemv_c! computes out[i] = dot(W_u16[i,:], x_bf16) for row i
+ # But we want out[j] = dot(W_u16[:,j], x_bf16) for column j
+ # So we use the GEMV kernel on the transposed layout.
+ # 
+ # The simplest correct approach: use the C kernel's bf16_dot_avx2 directly
+ # for each column. But we need a Julia wrapper.
+ # 
+ # Alternative: just use the already-working bf16_gemv_c! on contiguous rows
+ # by reinterpreting the weight matrix layout.
+ # 
+ # Simplest: use bf16_gemv_c! with (vocab_size, hidden_size) row-major view
+ # Since weight is (hidden_size, vocab_size) in Julia column-major,
+ # reinterpreting as (vocab_size, hidden_size) row-major would require
+ # transposing the data.
+ #
+ # ACTUALLY: the transposed weight already makes columns contiguous.
+ # A column view(W_u16, :, j) IS contiguous and IS what we need for dot product.
+ # We just need a Julia-callable bf16_dot_avx2 wrapper.
+ 
+ chunk_size = cld(vocab_size, nchunks)
+ chunk_outputs = [Vector{Float32}(undef, chunk_size) for _ in 1:nchunks]
+ tasks = Vector{Task}(undef, nchunks)
+ for chunk in 1:nchunks
+ j_start = (chunk - 1) * chunk_size + 1
+ j_end = min(chunk * chunk_size, vocab_size)
+ actual_size = j_end - j_start + 1
+ 
+ tasks[chunk] = Threads.@spawn begin
+ # Use the GEMV kernel: treat each column as a "row" for the dot product
+ # Pass a view of contiguous columns to the C kernel
+ # The C kernel bf16_gemv_avx2(out, A, x, m, n, stride) computes:
+ # out[i] = dot(A[i*stride .. i*stride+n-1], x)
+ # We want: out[k] = dot(W_u16[:, j_start+k-1], x_bf16)
+ # Column j of W_u16 starts at W_u16[1,j] = parent[offset + (j-1)*hidden_size]
+ # So we can pass columns as if they were rows with stride=hidden_size
+ ArrowLake.bf16_gemv_c_cols!(
+ view(chunk_outputs[chunk], 1:actual_size),
+ W_u16, x_bf16, j_start, j_end, size(weight, 1))
+ end
+ end
+ 
+ for task in tasks
+ wait(task)
+ end
+ 
+ for chunk in 1:nchunks
+ j_start = (chunk - 1) * chunk_size + 1
+ j_end = min(chunk * chunk_size, vocab_size)
+ actual_size = j_end - j_start + 1
+ output[j_start:j_end] .= chunk_outputs[chunk][1:actual_size]
  end
 end
 
