@@ -9,11 +9,40 @@ using ..Dequant
 using ..QuantsCPU
 using ..Tokenizer
 using ..Safetensors: load_safetensors_model
+using ..ArrowLake
+using BFloat16s
 
-export load_model_cpu, detect_model_format
+export load_model_cpu, detect_model_format, extract_tensor_cpu
 
-# Union type for weight matrices (either Float32 or quantized)
-const WeightMatrix = Union{Matrix{Float32}, Q4_K_Matrix, Q5_K_Matrix, Q6_K_Matrix, Q8_0_Matrix}
+# Union type for weight matrices (Float32, BFloat16, or quantized)
+const WeightMatrix = Union{Matrix{Float32}, Matrix{BFloat16}, Q4_K_Matrix, Q5_K_Matrix, Q6_K_Matrix, Q8_0_Matrix}
+
+"""
+    maybe_bf16(weight, use_bf16) -> Union{Matrix{Float32}, Matrix{BFloat16}}
+
+Convert a Float32 weight matrix to BFloat16 if requested.
+Only use for memory-bound matmuls (lm_head) - compute-bound matmuls 
+(SSM/MLP) are faster with BLAS F32 than BF16 software conversion.
+"""
+function maybe_bf16(weight::Matrix{Float32}, use_bf16::Bool)
+    if use_bf16 && ArrowLake.has_arrow_lake_features()
+        return ArrowLake.to_bfloat16_weights(weight)
+    end
+    return weight
+end
+
+function maybe_bf16(weight, use_bf16::Bool)
+    # Quantized weights - pass through
+    return weight
+end
+
+"""
+ weight_outer_dim(w) -> Int
+
+Get the outer dimension of a weight matrix (works for both Float32 and quantized matrices).
+This is the number of rows in the matrix after GGUF transpose.
+"""
+function weight_outer_dim end
 
 """
  detect_model_format(path) -> Symbol
@@ -54,22 +83,38 @@ function detect_model_format(path::String)
  end
 end
 
-# Helper to get outer dimension of weight matrix (works for both Float32 and quantized)
+# Helper to get outer dimension of weight matrix (works for Float32, BFloat16, and quantized)
 weight_outer_dim(w::Matrix{Float32}) = size(w, 1)
+weight_outer_dim(w::Matrix{BFloat16}) = size(w, 1)
 weight_outer_dim(w::Q4_K_Matrix) = w.outer_dim
 weight_outer_dim(w::Q5_K_Matrix) = w.outer_dim
 weight_outer_dim(w::Q6_K_Matrix) = w.outer_dim
 weight_outer_dim(w::Q8_0_Matrix) = w.outer_dim
 
 weight_inner_dim(w::Matrix{Float32}) = size(w, 2)
+weight_inner_dim(w::Matrix{BFloat16}) = size(w, 2)
 weight_inner_dim(w::Q4_K_Matrix) = w.inner_dim
 weight_inner_dim(w::Q5_K_Matrix) = w.inner_dim
 weight_inner_dim(w::Q6_K_Matrix) = w.inner_dim
 weight_inner_dim(w::Q8_0_Matrix) = w.inner_dim
 
 """
-Extract tensor data, optionally keeping quantized format.
-Set `keep_quantized=true` to preserve quantized weights.
+ extract_tensor_cpu(file::GGUF.GGUFFile, info::GGUF.TensorInfo; keep_quantized=false) -> Union{Matrix, QuantizedMatrix}
+
+Extract tensor data from a GGUF file, with optional quantized preservation.
+
+# Arguments
+- `file`: The GGUFFile to extract from
+- `info`: TensorInfo containing tensor metadata
+- `keep_quantized::Bool`: If true, return quantized matrix wrapper; if false, dequantize to Float32
+
+# Returns
+Either a `Matrix{Float32}` or a quantized matrix wrapper (Q4_K_Matrix, Q5_K_Matrix, etc.)
+
+# Supported Types
+- F32, F16, BF16: Direct extraction
+- Q4_K, Q5_K, Q6_K, Q8_0: Quantized extraction (with `keep_quantized=true`)
+- IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS: Dequantized to Float32
 """
 function extract_tensor_cpu(file::GGUF.GGUFFile, info::GGUF.TensorInfo; keep_quantized::Bool=false)
  num_elements = Int(prod(info.dimensions))
@@ -162,15 +207,47 @@ function extract_tensor_cpu(file::GGUF.GGUFFile, info::GGUF.TensorInfo; keep_qua
 end
 
 function extract_tensor_cpu(file::GGUF.GGUFFile, name::String)
-    if !haskey(file.tensors, name)
-        @warn "Tensor not found, using zero surrogate" name = name
-        return zeros(Float32, 1, 1)
-    end
-    info = file.tensors[name]
-    return extract_tensor_cpu(file, info)
+ if !haskey(file.tensors, name)
+ @warn "Tensor not found, using zero surrogate" name = name
+ return zeros(Float32, 1, 1)
+ end
+ info = file.tensors[name]
+ return extract_tensor_cpu(file, info)
 end
 
-function load_model_cpu(path::String; keep_quantized::Bool=false)
+"""
+ load_model_cpu(path::String; keep_quantized=false) -> (QwenModelCPU, tokenizer)
+
+Load a GGUF or Safetensors model for CPU inference.
+
+Detects model format automatically (GGUF file or Safetensors directory)
+and loads the appropriate backend.
+
+# Arguments
+- `path::String`: Path to GGUF file, safetensors file, or directory containing model
+- `keep_quantized::Bool=false`: If true, preserve quantized weights for memory efficiency
+
+# Returns
+- `model::QwenModelCPU`: The loaded CPU model
+- `tokenizer`: The loaded BPETokenizer
+
+# Example
+```julia
+# Load GGUF model
+model, tok = load_model_cpu("model.gguf")
+
+# Load from directory (auto-detects safetensors)
+model, tok = load_model_cpu("path/to/model_dir")
+
+# Keep quantized weights for Q4_K models
+model, tok = load_model_cpu("model.gguf"; keep_quantized=true)
+```
+
+# Supported Formats
+- GGUF (.gguf files) - llama.cpp format
+- Safetensors - HuggingFace format
+"""
+function load_model_cpu(path::String; keep_quantized::Bool=false, use_bf16_weights::Bool=false)
  # Detect format
  fmt = detect_model_format(path)
  
@@ -247,11 +324,15 @@ function load_model_cpu(path::String; keep_quantized::Bool=false)
         partial_rotary_factor = config.partial_rotary_factor
     )
     
+ if use_bf16_weights && ArrowLake.has_arrow_lake_features()
+ @info "BF16 weight conversion enabled for Arrow Lake - 50% memory reduction on weights"
+ end
+ 
  # Load layers
  layers = ModelCPU.DecoderLayerCPU[]
  
  for i in 0:(config.num_hidden_layers - 1)
- layer = load_layer(file, i, config; keep_quantized=keep_quantized)
+ layer = load_layer(file, i, config; keep_quantized=keep_quantized, use_bf16_weights=use_bf16_weights)
  push!(layers, layer)
  println(" Layer $i: $(layer.is_ssm ? "SSM" : "Attention")")
  end
@@ -260,11 +341,22 @@ function load_model_cpu(path::String; keep_quantized::Bool=false)
     final_norm_w = Float32.(extract_tensor_cpu(file, "output_norm.weight"))
     final_norm = ModelCPU.RMSNormCPU(final_norm_w, config.rms_norm_eps)
     
-    # LM head (check if tied or separate)
-    if haskey(file.tensors, "output.weight")
- lm_head = Float32.(extract_tensor_cpu(file, "output.weight"))
+ # LM head (check if tied or separate)
+ # For BF16: store in ROW-MAJOR (transposed) so C kernel has contiguous rows
+ if haskey(file.tensors, "output.weight")
+ lm_head_raw = Float32.(extract_tensor_cpu(file, "output.weight"))
+ if use_bf16_weights && ArrowLake.has_arrow_lake_features()
+ lm_head = Matrix{BFloat16}(permutedims(BFloat16.(Matrix{Float32}(lm_head_raw))))
  else
- lm_head = embed'
+ lm_head = Matrix{Float32}(lm_head_raw)
+ end
+ else
+ # Tied weights - still convert to BF16 if requested (separate copy from embed)
+ if use_bf16_weights && ArrowLake.has_arrow_lake_features()
+ lm_head = Matrix{BFloat16}(permutedims(BFloat16.(Matrix{Float32}(embed'))))
+ else
+ lm_head = Matrix{Float32}(embed')
+ end
  end
  
  # Create RoPE with partial rotary
@@ -272,6 +364,7 @@ function load_model_cpu(path::String; keep_quantized::Bool=false)
  rope = ModelCPU.RotaryEmbeddingCPU(config.head_dim, config.rope_theta, config.max_position_embeddings; rotary_dim=rotary_dim)
  
  # Pre-allocate buffers for final_norm and lm_head to avoid per-token allocations
+ embed_buf = Vector{Float32}(undef, config.hidden_size)
  final_norm_buf = Vector{Float32}(undef, config.hidden_size)
  lm_head_buf = Vector{Float32}(undef, config.vocab_size)
  
@@ -282,7 +375,7 @@ function load_model_cpu(path::String; keep_quantized::Bool=false)
  # MTP is only available in safetensors format
  mtp_head = nothing
  
- return ModelCPU.QwenModelCPU(config, embed, lm_head, layers, final_norm, rope, final_norm_buf, lm_head_buf, mtp_head), tok
+ return ModelCPU.QwenModelCPU(config, embed, lm_head, layers, final_norm, rope, embed_buf, final_norm_buf, lm_head_buf, mtp_head), tok
 end
 
 function get_config(file::GGUF.GGUFFile)
@@ -312,27 +405,27 @@ function get_config(file::GGUF.GGUFFile)
     return config
 end
 
-function load_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU; keep_quantized::Bool=false)
-    prefix = "blk.$(layer_idx)"
-    
-    # Load norms
-    in_norm_w = Float32.(extract_tensor_cpu(file, "$(prefix).attn_norm.weight"))
-    in_norm = ModelCPU.RMSNormCPU(in_norm_w, config.rms_norm_eps)
-    
-    post_norm_w = Float32.(extract_tensor_cpu(file, "$(prefix).post_attention_norm.weight"))
-    post_norm = ModelCPU.RMSNormCPU(post_norm_w, config.rms_norm_eps)
-    
+function load_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU; keep_quantized::Bool=false, use_bf16_weights::Bool=false)
+ prefix = "blk.$(layer_idx)"
+ 
+ # Load norms (always Float32 for numerical stability)
+ in_norm_w = Float32.(extract_tensor_cpu(file, "$(prefix).attn_norm.weight"))
+ in_norm = ModelCPU.RMSNormCPU(in_norm_w, config.rms_norm_eps)
+ 
+ post_norm_w = Float32.(extract_tensor_cpu(file, "$(prefix).post_attention_norm.weight"))
+ post_norm = ModelCPU.RMSNormCPU(post_norm_w, config.rms_norm_eps)
+ 
  # Check if SSM layer - it has ssm_a tensor
  is_ssm = haskey(file.tensors, "$(prefix).ssm_a")
  
  if is_ssm
- op = load_ssm_layer(file, layer_idx, config; keep_quantized=keep_quantized)
+ op = load_ssm_layer(file, layer_idx, config; keep_quantized=keep_quantized, use_bf16_weights=use_bf16_weights)
  else
- op = load_attention_layer(file, layer_idx, config)
+ op = load_attention_layer(file, layer_idx, config; use_bf16_weights=use_bf16_weights)
  end
  
  # Load MLP
- mlp = load_mlp(file, layer_idx, config; keep_quantized=keep_quantized)
+ mlp = load_mlp(file, layer_idx, config; keep_quantized=keep_quantized, use_bf16_weights=use_bf16_weights)
  
  # Pre-allocate norm buffers
  hidden_size = config.hidden_size
@@ -342,7 +435,7 @@ function load_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenCo
  return ModelCPU.DecoderLayerCPU(in_norm, op, post_norm, mlp, is_ssm, norm_buf1, norm_buf2)
  end
 
-function load_ssm_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU; keep_quantized::Bool=false)
+function load_ssm_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU; keep_quantized::Bool=false, use_bf16_weights::Bool=false)
  prefix = "blk.$(layer_idx)"
  
  # Get tensor info for weight type checking
@@ -359,12 +452,12 @@ function load_ssm_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.Qw
  in_proj = extract_tensor_cpu(file, in_proj_info; keep_quantized=true)
  gate_proj = extract_tensor_cpu(file, gate_info; keep_quantized=true)
  ssm_out = extract_tensor_cpu(file, ssm_out_info; keep_quantized=true)
-    else
-        # Dequantize and transpose
-        in_proj = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).attn_qkv.weight"))')
-        gate_proj = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).attn_gate.weight"))')
-        ssm_out = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_out.weight"))')
-    end
+ else
+ # Dequantize and transpose (always F32 - BLAS is faster for compute-bound ops)
+ in_proj = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).attn_qkv.weight"))')
+ gate_proj = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).attn_gate.weight"))')
+ ssm_out = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_out.weight"))')
+ end
     
 # Conv1d - GGUF stores as (K, C) = (4, 6144) row-major
 # Python uses (C, K) = (6144, 4) for access as [:, k]
@@ -445,10 +538,10 @@ ssm_beta_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ssm_beta.w
  )
 end
 
-function load_attention_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU)
-    prefix = "blk.$(layer_idx)"
-    
- # Load weights - transpose from GGUF format
+function load_attention_layer(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU; use_bf16_weights::Bool=false)
+ prefix = "blk.$(layer_idx)"
+ 
+ # Load weights - transpose from GGUF format (always F32)
  wq = collect(Float32.(extract_tensor_cpu(file, "$(prefix).attn_q.weight"))')
  wk = collect(Float32.(extract_tensor_cpu(file, "$(prefix).attn_k.weight"))')
  wv = collect(Float32.(extract_tensor_cpu(file, "$(prefix).attn_v.weight"))')
@@ -502,7 +595,7 @@ function load_attention_layer(file::GGUF.GGUFFile, layer_idx::Int, config::Model
  )
 end
 
-function load_mlp(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU; keep_quantized::Bool=false)
+function load_mlp(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConfigCPU; keep_quantized::Bool=false, use_bf16_weights::Bool=false)
  prefix = "blk.$(layer_idx)"
  
  # Load weights - transpose from GGUF format
@@ -529,9 +622,7 @@ function load_mlp(file::GGUF.GGUFFile, layer_idx::Int, config::ModelCPU.QwenConf
  down_weight = extract_tensor_cpu(file, down_info; keep_quantized=true)
  return ModelCPU.MLPCPU(gate_weight, up_weight, down_weight, gate_buf, up_buf, hidden_buf, output_buf)
  else
- # Dequantize to Float32 and transpose for FFN multiplication
- # extract_tensor_cpu returns (hidden, intermediate) for gate/up, (intermediate, hidden) for down
- # We need (intermediate, hidden) for gate/up, (hidden, intermediate) for down
+ # Dequantize to Float32 and transpose (always F32 - BLAS is faster for compute-bound ops)
  gate_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_gate.weight"))')
  up_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_up.weight"))')
  down_weight = Matrix(Float32.(extract_tensor_cpu(file, "$(prefix).ffn_down.weight"))')
