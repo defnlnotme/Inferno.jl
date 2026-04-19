@@ -846,8 +846,18 @@ function stream_to_stdout_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, d
         max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p, stop_tokens=stop_tokens)
     
     generated_text = IOBuffer()
+    is_tty = isa(io, Base.TTY)
+    first_token = true
     try
+        if is_tty
+            print(io, "\e[2m...\e[0m")
+            flush(io)
+        end
         for token in stream
+            if first_token && is_tty
+                print(io, "\b\b\b\e[K")
+                first_token = false
+            end
             print(io, token)
             flush(io)
             print(generated_text, token)
@@ -857,6 +867,9 @@ function stream_to_stdout_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, d
         return String(take!(generated_text))
     catch e
         if e isa InterruptException
+            if first_token && is_tty
+                print(io, "\b\b\b\e[K")
+            end
             println(io)
             flush(io)
             return String(take!(generated_text))

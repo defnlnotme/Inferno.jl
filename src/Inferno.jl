@@ -352,8 +352,18 @@ function stream_to_stdout(model, tok, prompt::AbstractString;
             top_k=top_k, presence_penalty=penalty_f16, repetition_penalty=rep_f16, min_p=min_p_f16, stop_token=stop_token)
 
         generated_text = IOBuffer()
+        is_tty = isa(io, Base.TTY)
+        first_token = true
         try
+            if is_tty
+                print(io, "\e[2m...\e[0m")
+                flush(io)
+            end
             for token in stream
+                if first_token && is_tty
+                    print(io, "\b\b\b\e[K")
+                    first_token = false
+                end
                 print(io, token)
                 flush(io)
                 print(generated_text, token)
@@ -363,6 +373,9 @@ function stream_to_stdout(model, tok, prompt::AbstractString;
             return String(take!(generated_text))
         catch e
             if e isa InterruptException
+                if first_token && is_tty
+                    print(io, "\b\b\b\e[K")
+                end
                 # Signal the generator to stop if possible
                 try
                     close(stream)
