@@ -141,50 +141,47 @@ end
 # Writes probabilities back into `probs[1:len, 1]`
 # Uses Float32 for exp() to prevent overflow
 function softmax_kernel!(probs, scores, len, scale)
- # Copy to CPU for computation (avoids scalar indexing on GPU)
- probs_cpu = Array(probs)
- scores_cpu = Array(scores)
+    T = eltype(probs)
+    # Use views to respect the sequence length and keep operations on the GPU
+    ps_v = view(probs, 1:len, 1)
+    sc_v = view(scores, 1:len, 1)
 
- # Compute max in Float32 for stability
- mx = Float32(maximum(scores_cpu[1:len, 1]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:len
- v = exp(Float32(scores_cpu[i, 1] * scale) - mx)
- probs_cpu[i, 1] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:len
- probs_cpu[i, 1] *= inv_s
- end
+    # Compute maximum per column (head) for numerical stability.
+    # Specifying dims=1 ensures the reduction happens on the device and returns a 1x1 array.
+    mx = mapreduce(v -> Float32(v) * Float32(scale), max, sc_v, dims=1)
 
- # Copy back to GPU
- copyto!(probs, Float16.(probs_cpu))
- return nothing
+    # Vectorized exponentiation: exp(x - max).
+    # Use Float32 for intermediate computation to prevent half-precision overflow.
+    @. ps_v = T(exp(Float32(sc_v) * Float32(scale) - mx))
+
+    # Compute sum for normalization (device-side reduction).
+    s = mapreduce(v -> Float32(v), +, ps_v, dims=1)
+
+    # Normalize the probabilities in-place on the GPU.
+    @. ps_v /= T(s)
+
+    return nothing
 end
 
 function batched_softmax_kernel!(probs, scores, total_len, n_heads, scale)
- # Copy to CPU for computation (avoids scalar indexing on GPU)
- probs_cpu = Array(probs)
- scores_cpu = Array(scores)
+    T = eltype(probs)
+    # Operate on the relevant slices of the probability and score matrices
+    ps_v = view(probs, 1:total_len, 1:n_heads)
+    sc_v = view(scores, 1:total_len, 1:n_heads)
 
- for h in 1:n_heads
- mx = Float32(maximum(scores_cpu[1:total_len, h]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:total_len
- v = exp(Float32(scores_cpu[i, h] * scale) - mx)
- probs_cpu[i, h] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:total_len
- probs_cpu[i, h] *= inv_s
- end
- end
+    # Parallel reduction across all heads to find the maximum for each.
+    mx = mapreduce(v -> Float32(v) * Float32(scale), max, sc_v, dims=1)
 
- # Copy back to GPU
- copyto!(probs, Float16.(probs_cpu))
- return nothing
+    # Stable vectorized exponentiation across all heads simultaneously.
+    @. ps_v = T(exp(Float32(sc_v) * Float32(scale) - mx))
+
+    # Parallel reduction across all heads to compute the normalization denominator.
+    s = mapreduce(v -> Float32(v), +, ps_v, dims=1)
+
+    # Final normalization step performed via broadcasting on the GPU.
+    @. ps_v /= T(s)
+
+    return nothing
 end
 
 # Numerically stable sigmoid using Float32 intermediate computation
