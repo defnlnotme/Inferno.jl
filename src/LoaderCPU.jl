@@ -329,13 +329,14 @@ function load_model_cpu(path::String; keep_quantized::Union{Bool,Nothing}=nothin
  @info "BF16 weight conversion enabled for Arrow Lake - 50% memory reduction on weights"
  end
  
- # Auto-detect keep_quantized: default to true when C kernels are available
+ # Auto-detect keep_quantized: default to F32 BLAS unless memory-constrained
+ # C kernels are slower than BLAS for most matrix sizes on this model
  if keep_quantized === nothing
- keep_quantized = QuantizedKernels.quant_kernels_available()
- if keep_quantized
- println("Quantized inference enabled (C SIMD kernels available)")
+ keep_quantized = false
+ if QuantizedKernels.quant_kernels_available()
+ println("Dequantizing to F32 (BLAS is faster for this model size — use keep_quantized=true for memory savings)")
  else
- println("Dequantizing to F32 (C kernels not available — set keep_quantized=true to force)")
+ println("Dequantizing to F32 (C kernels not available)")
  end
  end
  
