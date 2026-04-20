@@ -45,6 +45,7 @@ using Statistics
 using LoopVectorization
 using ..QuantsCPU
 using ..ArrowLake
+using ..QuantizedKernels
 using BFloat16s
 using Printf
 
@@ -277,52 +278,26 @@ function (mlp::MLPCPU)(x::Vector{Float32})
 end
 
 # Helper: multiply quantized matrix by vector (row-wise)
-# FAST PATH: dequantize element-by-element and accumulate (no intermediate Float32 buffer)
+# FAST PATH: Use C AVX2 SIMD kernel (quantize input to Q8_K, integer dot products)
+# FALLBACK: Pure Julia element-by-element dequantize+multiply
+
 function mul_quant_mat_vec(mat::Q4_K_Matrix, x::Vector{Float32}, out::Vector{Float32})
- # mat is stored as (inner_dim, outer_dim), we need to compute mat' * x
+ if QuantizedKernels.quant_kernels_available()
+ QuantizedKernels.q4_k_gemv!(out, mat.data, x, mat.inner_dim, mat.outer_dim)
+ return out
+ end
+ # Julia fallback: use dequantize_q4_k_block! for correct scale unpacking
  fill!(out, 0.0f0)
- 
- # Pre-dequantize scales for each row to avoid repeated work
- # But process elements one at a time to avoid 256-float buffer
- 
+ block_values = zeros(Float32, 256)
  for row in 1:mat.outer_dim
  sum_val = 0.0f0
- 
  for block in 0:(mat.inner_dim ÷ 256 - 1)
  global_block_idx = (row - 1) * (mat.inner_dim ÷ 256) + block
  block_offset = global_block_idx * QuantsCPU.Q4_K_BLOCK_SIZE + 1
- 
- # Get block scales and data
- d = Float32(reinterpret(Float16, mat.data[block_offset:block_offset+1])[1])
- dmin = Float32(reinterpret(Float16, mat.data[block_offset+2:block_offset+3])[1])
- scales = @view mat.data[block_offset+4:block_offset+15]
- qs = @view mat.data[block_offset+16:block_offset+143]
- 
- # Process 8 sub-blocks of 32 elements each
- for j in 0:3
- is_idx = 2 * j
- 
- # Get scale for this sub-block
- sc1 = UInt8(scales[is_idx + 1] & 63)
- sc2 = UInt8(scales[is_idx + 2] & 63)
- m1 = UInt8(scales[is_idx + 5] & 63)
- m2 = UInt8(scales[is_idx + 6] & 63)
- 
- d1 = d * Float32(sc1)
- d2 = d * Float32(sc2)
- min1 = dmin * Float32(m1)
- min2 = dmin * Float32(m2)
- 
- # Process 32 elements at a time (one sub-block)
- base_idx = j * 64
- for l in 0:31
- # Low 4 bits
- ql_val = Int(qs[j * 32 + l + 1] & 0x0f)
- sum_val += (d1 * Float32(ql_val) - min1) * x[base_idx + l + 1]
- # High 4 bits  
- qh_val = Int(qs[j * 32 + l + 1] >> 4)
- sum_val += (d2 * Float32(qh_val) - min2) * x[base_idx + 32 + l + 1]
- end
+ QuantsCPU.dequantize_q4_k_block!(block_values, mat.data, block_offset)
+ for i in 1:256
+ col_idx = block * 256 + i
+ sum_val += block_values[i] * x[col_idx]
  end
  end
  out[row] = sum_val
@@ -331,18 +306,19 @@ function mul_quant_mat_vec(mat::Q4_K_Matrix, x::Vector{Float32}, out::Vector{Flo
 end
 
 function mul_quant_mat_vec(mat::Q5_K_Matrix, x::Vector{Float32}, out::Vector{Float32})
+    if QuantizedKernels.quant_kernels_available()
+        QuantizedKernels.q5_k_gemv!(out, mat.data, x, mat.inner_dim, mat.outer_dim)
+        return out
+    end
+    # Julia fallback
     fill!(out, 0.0f0)
     block_values = zeros(Float32, 256)
-    
     for row in 1:mat.outer_dim
         sum_val = 0.0f0
-        
         for block in 0:(mat.inner_dim ÷ 256 - 1)
             global_block_idx = (row - 1) * (mat.inner_dim ÷ 256) + block
             block_offset = global_block_idx * QuantsCPU.Q5_K_BLOCK_SIZE + 1
-            
             QuantsCPU.dequantize_q5_k_block!(block_values, mat.data, block_offset)
-            
             for i in 1:256
                 col_idx = block * 256 + i
                 sum_val += block_values[i] * x[col_idx]
@@ -354,18 +330,19 @@ function mul_quant_mat_vec(mat::Q5_K_Matrix, x::Vector{Float32}, out::Vector{Flo
 end
 
 function mul_quant_mat_vec(mat::Q6_K_Matrix, x::Vector{Float32}, out::Vector{Float32})
-    fill!(out, 0.0f0)
+	if QuantizedKernels.quant_kernels_available()
+		QuantizedKernels.q6_k_gemv!(out, mat.data, x, mat.inner_dim, mat.outer_dim)
+		return out
+	end
+	# Julia fallback
+	fill!(out, 0.0f0)
     block_values = zeros(Float32, 256)
-    
     for row in 1:mat.outer_dim
         sum_val = 0.0f0
-        
         for block in 0:(mat.inner_dim ÷ 256 - 1)
             global_block_idx = (row - 1) * (mat.inner_dim ÷ 256) + block
             block_offset = global_block_idx * QuantsCPU.Q6_K_BLOCK_SIZE + 1
-            
             QuantsCPU.dequantize_q6_k_block!(block_values, mat.data, block_offset)
-            
             for i in 1:256
                 col_idx = block * 256 + i
                 sum_val += block_values[i] * x[col_idx]
@@ -377,18 +354,19 @@ function mul_quant_mat_vec(mat::Q6_K_Matrix, x::Vector{Float32}, out::Vector{Flo
 end
 
 function mul_quant_mat_vec(mat::Q8_0_Matrix, x::Vector{Float32}, out::Vector{Float32})
+    if QuantizedKernels.quant_kernels_available()
+        QuantizedKernels.q8_0_gemv!(out, mat.data, x, mat.inner_dim, mat.outer_dim)
+        return out
+    end
+    # Julia fallback
     fill!(out, 0.0f0)
     block_values = zeros(Float32, 32)
-    
     for row in 1:mat.outer_dim
         sum_val = 0.0f0
-        
         for block in 0:(mat.inner_dim ÷ 32 - 1)
             global_block_idx = (row - 1) * (mat.inner_dim ÷ 32) + block
             block_offset = global_block_idx * QuantsCPU.Q8_0_BLOCK_SIZE + 1
-            
             QuantsCPU.dequantize_q8_0_block!(block_values, mat.data, block_offset)
-            
             for i in 1:32
                 col_idx = block * 32 + i
                 sum_val += block_values[i] * x[col_idx]
@@ -1309,7 +1287,9 @@ function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, de
  # MTP options
  use_mtp::Bool=false,
  k_toks::Int=4,
- mask_id::Int=151643) # BOS token as default mask
+ mask_id::Int=151643,
+ # Interrupt support
+ interrupt_check::Function=() -> false)
  
  return Channel{String}(32) do chan
  try
@@ -1382,13 +1362,17 @@ function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, de
  curr_pos += 1
  token_counts[next_token] = get(token_counts, next_token, 0) + 1
  
- token_str = decode_fn([next_token])
- put!(chan, token_str)
- 
- last_token = next_token
- tokens_generated += 1
- end
- end
+token_str = decode_fn([next_token])
+  put!(chan, token_str)
+  
+  last_token = next_token
+  tokens_generated += 1
+
+  if interrupt_check()
+  break
+  end
+  end
+  end
  
  catch e
  if !(e isa InvalidStateException)
@@ -1428,13 +1412,16 @@ function stream_to_stdout_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, d
  # MTP options
  use_mtp::Bool=false,
  k_toks::Int=4,
- mask_id::Int=151643)
- 
- stream = generate_stream_cpu(model, prompt_tokens, decode_fn;
- max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, 
- repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, 
- min_p=min_p, stop_tokens=stop_tokens, max_context=max_context,
- use_mtp=use_mtp, k_toks=k_toks, mask_id=mask_id)
+ mask_id::Int=151643,
+ # Interrupt support
+interrupt_check::Function=() -> false)
+   
+  stream = generate_stream_cpu(model, prompt_tokens, decode_fn;
+  max_tokens=max_tokens, temperature=temperature, top_p=top_p, top_k=top_k, 
+  repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, 
+  min_p=min_p, stop_tokens=stop_tokens, max_context=max_context,
+  use_mtp=use_mtp, k_toks=k_toks, mask_id=mask_id,
+  interrupt_check=interrupt_check)
     
     generated_text = IOBuffer()
     try
@@ -1443,15 +1430,18 @@ function stream_to_stdout_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, d
             token_count = 0
         end
         for token in stream
+            if interrupt_check()
+                break
+            end
             print(io, token)
             flush(io)
             print(generated_text, token)
-            if show_tps
-                token_count += 1
-            end
+            token_count += 1
         end
-        println(io)
-        flush(io)
+        if token_count > 0
+            println(io)
+            flush(io)
+        end
         if show_tps
             elapsed = time() - t0
             tps = elapsed > 0 ? token_count / elapsed : 0.0

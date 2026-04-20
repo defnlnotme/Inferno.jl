@@ -7,6 +7,7 @@ using ..ModelCPU
 using ..GGUF
 using ..Dequant
 using ..QuantsCPU
+using ..QuantizedKernels
 using ..Tokenizer
 using ..Safetensors: load_safetensors_model
 using ..ArrowLake
@@ -225,7 +226,7 @@ and loads the appropriate backend.
 
 # Arguments
 - `path::String`: Path to GGUF file, safetensors file, or directory containing model
-- `keep_quantized::Bool=false`: If true, preserve quantized weights for memory efficiency
+- `keep_quantized`: If true, preserve quantized weights for memory efficiency. If nothing (default), auto-detect based on C kernel availability.
 
 # Returns
 - `model::QwenModelCPU`: The loaded CPU model
@@ -247,7 +248,7 @@ model, tok = load_model_cpu("model.gguf"; keep_quantized=true)
 - GGUF (.gguf files) - llama.cpp format
 - Safetensors - HuggingFace format
 """
-function load_model_cpu(path::String; keep_quantized::Bool=false, use_bf16_weights::Bool=false)
+function load_model_cpu(path::String; keep_quantized::Union{Bool,Nothing}=nothing, use_bf16_weights::Bool=false)
  # Detect format
  fmt = detect_model_format(path)
  
@@ -326,6 +327,16 @@ function load_model_cpu(path::String; keep_quantized::Bool=false, use_bf16_weigh
     
  if use_bf16_weights && ArrowLake.has_arrow_lake_features()
  @info "BF16 weight conversion enabled for Arrow Lake - 50% memory reduction on weights"
+ end
+ 
+ # Auto-detect keep_quantized: default to true when C kernels are available
+ if keep_quantized === nothing
+ keep_quantized = QuantizedKernels.quant_kernels_available()
+ if keep_quantized
+ println("Quantized inference enabled (C SIMD kernels available)")
+ else
+ println("Dequantizing to F32 (C kernels not available — set keep_quantized=true to force)")
+ end
  end
  
  # Load layers
