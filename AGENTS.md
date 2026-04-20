@@ -40,16 +40,37 @@ Both GGUF and Safetensors inference for Qwen3.5-0.8B-VL work with coherent gener
 
 ### Phase 2.6: BF16 Support as Default
 
-**Goal:** Add proper BF16 support and make it the default precision for CPU inference.
+**Goal:** Add proper BF16 support for Arrow Lake CPUs (Core Ultra 2 series).
 
-**Status:** See Phase 2.8 - Flash Attention provides bigger gains.
+**Status:** RESEARCHED - BF16 pipeline implemented but **disabled by default**.
 
-**Current state:** All inference currently runs in Float32. BF16 models are loaded and dequantized to F32.
+**Key Finding:** Julia lacks AVX-VNNI-BF16 intrinsics. Without hardware VNNI-BF16 
+instructions (VDPBF16PS), BF16 weights require per-element software conversion to F32 
+which is 23x slower than BLAS F32 matmul. BF16 saves 50% memory but the software 
+conversion cost completely negates the bandwidth savings on CPU.
 
-**Tasks:**
-1. [ ] Add `BFloat16` type alias and conversion functions
-2. [ ] Update dequantization to support BF16 natively (avoid Float32 intermediate)
-3. [ ] Modify matmul/gemm operations to accept BF16 inputs (CPU tensors)
+**What works:**
+- `src/ArrowLake.jl`: CPU feature detection (AVX2, AVX-VNNI, Arrow Lake)
+- `maybe_bf16()`: Weight conversion at load time (F32 -> BF16, 50% memory)
+- `bf16_matmul_vec!()`: Zero-alloc BF16 matmul via UInt16 reinterpret + in-register F32 convert
+- `lm_head_project!()` BF16 variant with chunked parallel execution
+- `QuantOrFloat32` Union type extended with `Matrix{BFloat16}`
+- Auto-detection of Arrow Lake CPUs
+
+**What doesn't work:**
+- BF16 inference is 23x slower than F32 (0.04x speedup) because Julia can't emit
+  VDPBF16PS instructions - each BF16 element must be converted to F32 in software
+- BLAS gemv with F32 is extremely well-optimized; custom @turbo loops are slower
+
+**To enable BF16 for memory-constrained scenarios:**
+```julia
+model, tok = load_model_cpu("model.gguf"; use_bf16_weights=true)
+```
+
+**Future path to BF16 speedup:**
+- Wait for Julia to add VNNI-BF16 intrinsics (LLVM supports them)
+- Or write a C kernel with `_mm_dpbf16_ps` intrinsic and call via ccall
+- Or use GGUF quantization (Q4_K, Q5_K) which IS faster due to better cache utilization
 
 ### Phase 2.7: Flash Attention Integration ✓ COMPLETE
 
@@ -313,3 +334,6 @@ end
 3. Decay formula: `exp(ssm_a * softplus(a + dt_bias))`
 4. L2 norm on Q/K: Qwen3.5 uses L2 norm, not RMSNorm, for attention
 5. Safetensors BF16: dtype=3, need `UInt16 -> UInt32<<16 -> Float32`
+6. Safetensors alpha/beta transpose: stored as (num_v_heads, hidden_size), was incorrectly transposed to (1024,16) causing DimensionMismatch in mul! - should stay as (16, 1024)
+7. **Chat template missing thinking tokens (CRITICAL)**: Qwen3.5 is a hybrid thinking model. The generation prompt MUST include `<think>` and `</think>` tokens. Without them, the model doesn't know whether to think or answer, producing garbled/incoherent output. Default (no-thinking): `<|im_start|>assistant\n<think>\n\n</think>\n\n`. With thinking: `<|im_start|>assistant\n<think>\n`
+8. **Missing `<|im_end|>` stop token**: Without stopping on `<|im_end|>`, the model continues generating past end-of-turn, producing extra conversations
