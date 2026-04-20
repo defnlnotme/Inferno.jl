@@ -62,13 +62,13 @@ function handle_command(input::String, messages::Vector{Pair{String, String}})
         return :exit
     elseif cmd == "/clear" || cmd == "/c"
         empty!(messages)
-        println("🔥 Conversation history cleared.")
+        printstyled("🔥 Conversation history cleared.\n", color=:yellow)
         return :continue
     elseif cmd == "/help" || cmd == "/h"
-        println("\e[1mAvailable commands:\e[0m")
-        println("  \e[33m/exit\e[0m, \e[33m/quit\e[0m, \e[33m/q\e[0m - Exit the chat")
-        println("  \e[33m/clear\e[0m, \e[33m/c\e[0m      - Clear conversation history")
-        println("  \e[33m/help\e[0m, \e[33m/h\e[0m       - Show this help message")
+        printstyled("Available commands:\n", bold=true)
+        print("  "); printstyled("/exit", color=:yellow); print(", "); printstyled("/quit", color=:yellow); print(", "); printstyled("/q", color=:yellow); println(" - Exit the chat")
+        print("  "); printstyled("/clear", color=:yellow); print(", "); printstyled("/c", color=:yellow); println("      - Clear conversation history")
+        print("  "); printstyled("/help", color=:yellow); print(", "); printstyled("/h", color=:yellow); println("       - Show this help message")
         return :continue
     end
     return :none
@@ -77,11 +77,14 @@ end
 function main()
     args = parse_commandline()
     
+    is_stdin_tty = isa(stdin, Base.TTY)
+    is_stdout_tty = isa(stdout, Base.TTY)
+
     device_arg = args["device"] == -1 ? nothing : args["device"]
-    println("\e[1;35m🔥 Inferno Chat Interface 🔥\e[0m")
+    printstyled("🔥 Inferno Chat Interface 🔥\n", color=:magenta, bold=true)
 
     if !ispath(args["model"])
-        println("\e[31mError: Model file not found at $(args["model"])\e[0m")
+        printstyled("Error: Model file not found at $(args["model"])\n", color=:red)
         exit(1)
     end
 
@@ -92,7 +95,7 @@ function main()
         Inferno.load_model(args["model"]; device=device_arg)
     catch e
         if e isa InterruptException
-            println("\n\e[31m[Loading Interrupted]\e[0m")
+            printstyled("\n[Loading Interrupted]\n", color=:red)
             exit(0)
         else
             rethrow(e)
@@ -106,16 +109,30 @@ function main()
         push!(messages, "user" => args["prompt"])
         prompt_text = format_messages(args["system-prompt"], messages)
         
-        print("\n\e[1;32mAssistant:\e[0m ")
+        printstyled("\nAssistant: ", color=:green, bold=true)
         flush(stdout)
+
+        # Show thinking indicator if TTY
+        if is_stdout_tty
+            print("\e[2m...\e[0m")
+            flush(stdout)
+        end
+
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
                                               max_tokens=args["max-tokens"], 
                                               temperature=Float32(args["temperature"]), 
                                               top_p=Float32(args["top-p"]))
         
         full_response = ""
+        first_token = true
         try
             for token_text in stream
+                if first_token
+                    if is_stdout_tty
+                        print("\b\b\b\e[K") # Clear thinking dots
+                    end
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
@@ -123,8 +140,11 @@ function main()
             println()
         catch e
             if e isa InterruptException
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K") # Clear thinking dots if interrupted early
+                end
                 close(stream)
-                println("\n\e[31m[Interrupted]\e[0m")
+                printstyled("\n[Interrupted]\n", color=:red)
                 full_response *= " [Interrupted]"
             else
                 rethrow(e)
@@ -133,13 +153,13 @@ function main()
         push!(messages, "assistant" => full_response)
     end
     
-    println("\nType \e[33m/help\e[0m for commands, or just chat away!")
-    
-    is_tty = isa(stdin, Base.TTY)
+    print("\nType ")
+    printstyled("/help", color=:yellow)
+    println(" for commands, or just chat away!")
     
     # Interactive loop
     while true
-        print("\e[1;36mUser:\e[0m ")
+        printstyled("User: ", color=:cyan, bold=true)
         flush(stdout)
         
         user_input = try
@@ -164,7 +184,7 @@ function main()
             continue
         end
 
-        if !is_tty
+        if !is_stdin_tty
             println(user_input)
         end
 
@@ -181,15 +201,23 @@ function main()
 
         # Handle legacy exit commands (optional but good for transition)
         if lowercase(strip(user_input)) in ["exit", "quit", "\\q"]
-            println("Use \e[33m/exit\e[0m to quit. Goodbye!")
+            print("Use ")
+            printstyled("/exit", color=:yellow)
+            println(" to quit. Goodbye!")
             break
         end
         
         push!(messages, "user" => user_input)
         prompt_text = format_messages(args["system-prompt"], messages)
         
-        print("\e[1;32mAssistant:\e[0m ")
+        printstyled("Assistant: ", color=:green, bold=true)
         flush(stdout)
+
+        # Show thinking indicator if TTY
+        if is_stdout_tty
+            print("\e[2m...\e[0m")
+            flush(stdout)
+        end
         
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
                                               max_tokens=args["max-tokens"], 
@@ -197,8 +225,15 @@ function main()
                                               top_p=Float32(args["top-p"]))
                                               
         full_response = ""
+        first_token = true
         try
             for token_text in stream
+                if first_token
+                    if is_stdout_tty
+                        print("\b\b\b\e[K") # Clear thinking dots
+                    end
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
@@ -206,8 +241,11 @@ function main()
             println()
         catch e
             if e isa InterruptException
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K") # Clear thinking dots
+                end
                 close(stream)
-                println("\n\e[31m[Interrupted]\e[0m")
+                printstyled("\n[Interrupted]\n", color=:red)
                 full_response *= " [Interrupted]"
             else
                 rethrow(e)
