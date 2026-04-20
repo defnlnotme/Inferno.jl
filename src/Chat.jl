@@ -44,7 +44,10 @@ end
 
 function chat(model, tok, messages::Vector{Message}; enable_thinking::Bool=false, kwargs...)
  prompt = build_prompt(messages; enable_thinking=enable_thinking)
- return stream_to_stdout(model, tok, prompt; stop_token=tok.eos_id, kwargs...)
+ # Stop on EOS and <|im_end|> tokens
+ im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
+ stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
+ return stream_to_stdout(model, tok, prompt; stop_tokens=stop_tokens, kwargs...)
 end
 
 const interrupt_flag = Threads.Atomic{Bool}(false)
@@ -345,64 +348,71 @@ function read_line_chat(term, state)
     end
 end
 
-function chat!(model, tok; system_prompt::String="You are a helpful assistant.", kwargs...)
-    messages = [Message(:system, system_prompt)]
-    
-    banner = """
-    ╔═══════════════════════════════════════════════════╗
-    ║           Welcome to Inferno Chat!                ║
-    ╠═══════════════════════════════════════════════════╣
-    ║  Type your message and press Enter to chat.       ║
-    ║  Commands:                                   ║
-    ║    /clear  - Clear conversation history     ║
-    ║    /system - Change system prompt            ║
-    ║    /quit   - Exit chat                      ║
-    ╚═══════════════════════════════════════════════════╝
-    """
-    
-    printstyled(banner, color=:cyan, bold=true)
-    println()
-    flush(stdout)
-    
-    state = ChatState(String[], -1)
-    term = TTYTerminal("/dev/tty", stdin, stdout, stderr)
-    chat_terminal[], term
-    interrupt_flag[], false
-    
-    try
-        raw!(term, true)
-        
-        while true
-            line = read_line_chat(term, state)
-            
-            isempty(line) && continue
-            line == "EXIT_CHAT" && (printstyled("Goodbye!\n", color=:cyan); break)
-            line == "/quit" || line == "/exit" && (printstyled("Goodbye!\n", color=:cyan); break)
-            line == "/clear" && (messages = [Message(:system, system_prompt)]; printstyled("Conversation cleared.\n", color=:yellow); continue)
-            line == "/system" && begin
-                printstyled("New system prompt: ", color=:magenta)
-                raw!(term, false)
-                new_system = readline(stdin)
-                raw!(term, true)
-                !isempty(new_system) && (system_prompt = new_system; messages = [Message(:system, system_prompt)]; printstyled("System prompt updated!\n", color=:green))
-                continue
-            end
-            startswith(line, "/") && (printstyled("Unknown command: $(line)\n", color=:red); continue)
-            
-            push!(state.history, line)
-            push!(messages, Message(:user, line))
-            prompt = build_prompt(messages)
-            
-            # Exit raw mode during generation - makes stdin line-buffered
-            raw!(term, false)
-            
-            response = stream_to_stdout(model, tok, prompt; stop_token=tok.eos_id, kwargs...)
-            
-            # Re-enter raw mode for input
-            raw!(term, true)
-            
-            push!(messages, Message(:assistant, response))
-        end
+function chat!(model, tok; system_prompt::String="You are a helpful assistant.", enable_thinking::Bool=false, kwargs...)
+ messages = [Message(:system, system_prompt)]
+ thinking_mode = enable_thinking
+ 
+ banner = """
+ ╔═══════════════════════════════════════════════════╗
+ ║ Welcome to Inferno Chat! ║
+ ╠═══════════════════════════════════════════════════╣
+ ║ Type your message and press Enter to chat. ║
+ ║ Commands: ║
+ ║ /clear - Clear conversation history ║
+ ║ /system - Change system prompt ║
+ ║ /think - Toggle thinking mode ║
+ ║ /quit - Exit chat ║
+ ╚═══════════════════════════════════════════════════╝
+ """
+ 
+ printstyled(banner, color=:cyan, bold=true)
+ printstyled("Thinking: $(thinking_mode ? "ON" : "OFF")\n", color=:yellow)
+ flush(stdout)
+ 
+ state = ChatState(String[], -1)
+ term = TTYTerminal("/dev/tty", stdin, stdout, stderr)
+ chat_terminal[], term
+ interrupt_flag[], false
+ 
+ # Stop on EOS and <|im_end|>
+ im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
+ stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
+ 
+ try
+ raw!(term, true)
+ 
+ while true
+ line = read_line_chat(term, state)
+ 
+ isempty(line) && continue
+ line == "EXIT_CHAT" && (printstyled("Goodbye!\n", color=:cyan); break)
+ line == "/quit" || line == "/exit" && (printstyled("Goodbye!\n", color=:cyan); break)
+ line == "/clear" && (messages = [Message(:system, system_prompt)]; printstyled("Conversation cleared.\n", color=:yellow); continue)
+ line == "/think" && (thinking_mode = !thinking_mode; printstyled("Thinking: $(thinking_mode ? "ON" : "OFF")\n", color=:yellow); continue)
+ line == "/system" && begin
+ printstyled("New system prompt: ", color=:magenta)
+ raw!(term, false)
+ new_system = readline(stdin)
+ raw!(term, true)
+ !isempty(new_system) && (system_prompt = new_system; messages = [Message(:system, system_prompt)]; printstyled("System prompt updated!\n", color=:green))
+ continue
+ end
+ startswith(line, "/") && (printstyled("Unknown command: $(line)\n", color=:red); continue)
+ 
+ push!(state.history, line)
+ push!(messages, Message(:user, line))
+ prompt = build_prompt(messages; enable_thinking=thinking_mode)
+ 
+ # Exit raw mode during generation - makes stdin line-buffered
+ raw!(term, false)
+ 
+ response = stream_to_stdout(model, tok, prompt; stop_tokens=stop_tokens, kwargs...)
+ 
+ # Re-enter raw mode for input
+ raw!(term, true)
+ 
+ push!(messages, Message(:assistant, response))
+ end
     catch e
         if e isa InterruptException
             println(term)

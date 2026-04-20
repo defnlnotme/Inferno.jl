@@ -1,3 +1,23 @@
+"""
+OpenAI-compatible HTTP server for Inferno.jl.
+
+Provides an HTTP server with streaming and non-streaming chat completions.
+
+# Endpoints
+- `POST /v1/chat/completions`: OpenAI-compatible chat completions
+- `GET /v1/models`: List available models
+- `GET /health`: Health check endpoint
+
+# Authentication
+- If `auth_token` is not provided, looks for `INFERNO_API_KEY` environment variable
+- If neither is set, generates a random 32-character key on startup
+
+# Example
+```julia
+model, tok = load_model("model.gguf")
+start_server(8080; model=model, tokenizer=tok, auth_token="secret-key")
+```
+"""
 module Server
 
 using HTTP
@@ -10,19 +30,43 @@ using ..Tokenizer
 
 # ─── OpenAI-compatible schemas ───────────────────────────────────────────────
 
+"""
+Message(role, content)
+
+Represents a chat message in OpenAI API format.
+
+# Fields
+- `role::String`: Message role ("system", "user", "assistant")
+- `content::String`: Message content
+"""
 struct Message
-    role::String
-    content::String
+ role::String
+ content::String
 end
 
+"""
+ChatCompletionRequest
+
+OpenAI-compatible request structure for chat completions.
+
+# Fields
+- `model::String`: Model identifier
+- `messages::Vector{Message}`: Conversation history
+- `max_tokens::Union{Int,Nothing}`: Maximum tokens to generate
+- `temperature::Union{Float64,Nothing}`: Sampling temperature (0.0-2.0)
+- `top_p::Union{Float64,Nothing}`: Nucleus sampling threshold
+- `top_k::Union{Int,Nothing}`: Top-k sampling parameter
+- `stream::Union{Bool,Nothing}`: Whether to stream the response
+"""
 struct ChatCompletionRequest
-    model::String
-    messages::Vector{Message}
-    max_tokens::Union{Int,Nothing}
-    temperature::Union{Float64,Nothing}
-    top_p::Union{Float64,Nothing}
-    top_k::Union{Int,Nothing}
-    stream::Union{Bool,Nothing}
+ model::String
+ messages::Vector{Message}
+ max_tokens::Union{Int,Nothing}
+ temperature::Union{Float64,Nothing}
+ top_p::Union{Float64,Nothing}
+ top_k::Union{Int,Nothing}
+ stream::Union{Bool,Nothing}
+ enable_thinking::Union{Bool,Nothing}
 end
 
 struct Choice
@@ -77,19 +121,26 @@ function check_auth(stream::HTTP.Stream)
     return false
 end
 
-function build_prompt(messages::Vector{Message})
-    parts = String[]
-    for msg in messages
-        if msg.role == "system"
-            push!(parts, "<|im_start|>system\n$(msg.content)<|im_end|>")
-        elseif msg.role == "user"
-            push!(parts, "<|im_start|>user\n$(msg.content)<|im_end|>")
-        elseif msg.role == "assistant"
-            push!(parts, "<|im_start|>assistant\n$(msg.content)<|im_end|>")
-        end
-    end
-    push!(parts, "<|im_start|>assistant\n")
-    return join(parts, "\n")
+function build_prompt(messages::Vector{Message}; enable_thinking::Bool=false)
+ parts = String[]
+ for msg in messages
+ if msg.role == "system"
+ push!(parts, "<|im_start|>system\n$(msg.content)<|im_end|>")
+ elseif msg.role == "user"
+ push!(parts, "<|im_start|>user\n$(msg.content)<|im_end|>")
+ elseif msg.role == "assistant"
+ push!(parts, "<|im_start|>assistant\n$(msg.content)<|im_end|>")
+ end
+ end
+ # Qwen3.5 chat template: includes thinking tokens
+ # Default (enable_thinking=false): empty think block, model answers directly
+ # With thinking: open think block, model produces chain-of-thought
+ if enable_thinking
+ push!(parts, "<|im_start|>assistant\n<think>\n")
+ else
+ push!(parts, "<|im_start|>assistant\n<think>\n\n</think>\n\n")
+ end
+ return join(parts, "\n")
 end
 
 function handle_chat(stream::HTTP.Stream)
@@ -132,11 +183,11 @@ function handle_chat(stream::HTTP.Stream)
             return
         end
 
-        prompt = build_prompt(body.messages)
-        max_tokens = something(body.max_tokens, 128)
-        temperature = Float16(something(body.temperature, 0.7))
-        top_p = Float16(something(body.top_p, 0.8))
-        top_k = Int(something(body.top_k, 20))
+ prompt = build_prompt(body.messages; enable_thinking=something(body.enable_thinking, false))
+ max_tokens = something(body.max_tokens, 128)
+ temperature = Float16(something(body.temperature, 0.7))
+ top_p = Float16(something(body.top_p, 0.8))
+ top_k = Int(something(body.top_k, 20))
         do_stream = something(body.stream, false)
 
         if do_stream
@@ -258,6 +309,36 @@ end
 
 # ─── Server startup ─────────────────────────────────────────────────────────
 
+"""
+ start_server(port=8080; model, tokenizer, auth_token)
+
+Start an OpenAI-compatible HTTP server for chat completions.
+
+# Arguments
+- `port::Int=8080`: Port to listen on
+- `model`: The loaded QwenModel (GPU) or QwenModelCPU (CPU)
+- `tokenizer::BPETokenizer`: The tokenizer
+- `auth_token::Union{String,Nothing}=nothing`: Optional bearer token for authentication
+
+# Endpoints
+- `POST /v1/chat/completions`: Chat completions (streaming and non-streaming)
+- `GET /v1/models`: List models
+- `GET /health`: Health check
+
+# Authentication
+If `auth_token` is not provided:
+1. Looks for `INFERNO_API_KEY` environment variable
+2. If not found, generates a random 32-character key
+
+# Example
+```julia
+model, tok = load_model("model.gguf")
+start_server(8080; model=model, tokenizer=tok)
+
+# With authentication
+start_server(8080; model=model, tokenizer=tok, auth_token="secret-key")
+```
+"""
 function start_server(port::Int=8080;
     model::Union{QwenModel,Nothing}=nothing,
     tokenizer::Union{BPETokenizer,Nothing}=nothing,
