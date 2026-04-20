@@ -10,8 +10,11 @@ end
 
 include("QuantsData.jl")
 include("Dequant.jl")
+include("AMXBF16.jl")
+include("ArrowLake.jl")
 include("QuantsCPU.jl")
 include("QuantMV.jl")
+include("QuantizedKernels.jl")
 include("GGUF.jl")
 include("Model.jl")
 include("BF16Support.jl")
@@ -26,6 +29,8 @@ include("Generate.jl")
 
 using .QuantsData
 using .Dequant
+using .AMXBF16
+using .ArrowLake
 using .QuantsCPU
 using .QuantMV
 using .GGUF
@@ -42,15 +47,23 @@ using .Generate
 
 export load_model, load_model_cpu, start_server, non_nothing_fields, stream_to_stdout, stream_to_stdout_cpu
 export LoaderCPU, ModelCPU, generate_stream_cpu, generate_cpu, softmax_sample, BF16Support
-export generate_text, chat
+export generate_text
 export chat!, start_chat, Message, build_prompt
 export load_safetensors_model, Safetensors, detect_model_format
 export set_inference_precision!, get_inference_precision, should_use_bf16
 
 """
-    non_nothing_fields(obj) -> NamedTuple
+ non_nothing_fields(obj) -> NamedTuple
 
 Return a NamedTuple containing all fields of `obj` that are not `nothing`.
+Useful for debugging and inspecting model structures.
+
+# Example
+```julia
+model = load_model_cpu("model.gguf")
+fields = non_nothing_fields(model)
+println("Loaded model has ", length(fields), " non-nothing fields")
+```
 """
 function non_nothing_fields(obj)
     fns = fieldnames(typeof(obj))
@@ -120,10 +133,29 @@ function select_device!(devs, requested_device)
 end
 
 """
-    load_model(path; device=nothing, mmproj=nothing)
+ load_model(path; device=nothing, mmproj=nothing, backend=:auto) -> (model, tokenizer)
 
-Load a GGUF model file and return the constructed model + tokenizer.
-Optional `mmproj` path for multimodal projection weights (auto-discovered if not provided).
+Load a GGUF or Safetensors model file and return the constructed model + tokenizer.
+
+# Arguments
+- `path::String`: Path to the model file (.gguf) or directory (.safetensors)
+- `device::Union{Int,Nothing}`: GPU device index to use (nothing for auto-detect)
+- `mmproj::Union{String,Nothing}`: Path to multimodal projection weights (auto-discovered if not provided)
+- `backend::Symbol`: Backend to use (`:auto`, `:cpu`, or `:gpu`)
+
+# Returns
+- `model`: The loaded QwenModel (GPU) or QwenModelCPU (CPU)
+- `tokenizer`: The loaded BPETokenizer
+
+# Example
+```julia
+model, tok = load_model("path/to/model.gguf")
+model, tok = load_model("path/to/model_dir"; backend=:cpu)  # Force CPU
+```
+
+# Notes
+- Safetensors format only supports CPU backend currently
+- GPU backend requires oneAPI-compatible Intel GPU
 """
 function find_related_file(model_path::String, pattern::String)
     model_dir = dirname(model_path)
@@ -277,9 +309,22 @@ function load_model(path::String; device::Union{Int, Nothing}=nothing,
 end
 
 """
-    main(model_path; port=8080, device=nothing, auth_token=nothing)
+ main(model_path; port=8080, device=nothing, auth_token=nothing, backend=:auto)
 
-Load model and start the HTTP server.
+Load model and start the HTTP OpenAI-compatible API server.
+
+# Arguments
+- `model_path::String`: Path to the model file or directory
+- `port::Int=8080`: Port to listen on
+- `device::Union{Int,Nothing}=nothing`: GPU device index (nil for auto-detect)
+- `auth_token::Union{String,Nothing}=nothing`: Optional bearer token for authentication
+- `backend::Symbol=:auto`: Backend selection (`:auto`, `:cpu`, `:gpu`)
+
+# Example
+```julia
+main("model.gguf"; port=8080)
+main("model.gguf"; port=8080, auth_token="secret123")
+```
 """
 function main(model_path::String; port::Int=8080, device::Union{Int, Nothing}=nothing, auth_token::Union{String, Nothing}=nothing, backend::Symbol=:auto)
     model, tok = load_model(model_path; device=device, backend=backend)
@@ -287,9 +332,12 @@ function main(model_path::String; port::Int=8080, device::Union{Int, Nothing}=no
 end
 
 """
-    to_float16(x) -> Float16
+ to_float16(x) -> Float16
 
-Convert any real number to Float16. Handles Float32, Float64, and Int types.
+Convert any real number to Float16. Handles Float32, Float64, and Integer types.
+
+This is an internal helper function used for converting sampling parameters
+to Float16 for GPU backend compatibility.
 """
 to_float16(x::Float16) = x
 to_float16(x::Float32) = Float16(x)
@@ -298,7 +346,7 @@ to_float16(x::Integer) = Float16(x)
 to_float16(x::AbstractFloat) = Float16(x)
 
 """
-    stream_to_stdout(model, tok, prompt; kwargs...)
+ stream_to_stdout(model, tok, prompt; kwargs...)
 
 Generate text from a prompt and stream tokens to stdout as they are generated.
 Returns the complete generated text as a string.
@@ -317,6 +365,7 @@ parameters to Float16 for compatibility with the GPU inference engine.
 - `presence_penalty`: Penalty for repeated tokens (default: 0.0) - accepts Float16/Float32/Float64
 - `repetition_penalty`: Multiplicative repetition penalty (default: 1.0) - accepts Float16/Float32/Float64
 - `io`: Output IO stream (default: stdout)
+- `use_bf16`: Use BF16 precision for weights on CPU (default: false). Requires BF16 model.
 
 # Presence & Repetition Penalties
 - `presence_penalty` is an additive penalty applied proportional to how many times a token has appeared.
@@ -332,20 +381,25 @@ result = stream_to_stdout(model, tok, "Hello"; temperature=0.7f0, repetition_pen
 
 # Using Float16 directly
 result = stream_to_stdout(model, tok, "Hello"; temperature=Float16(0.7), repetition_penalty=Float16(1.1))
+
+# Using BF16 precision (CPU only, requires BF16 model)
+result = stream_to_stdout(model, tok, "Hello"; use_bf16=true, temperature=0.7f0)
 ```
 """
 function stream_to_stdout(model, tok, prompt::AbstractString;
-    backend::Symbol=:auto,
-    max_tokens::Int=100,
-    temperature=0.7,
-    top_p=0.8,
-    top_k::Int=20,
-    presence_penalty=0.0,
-    repetition_penalty=1.0,
-    min_p=0.0,
-    stop_token::Union{Int,Nothing}=nothing,
-    show_tps::Bool=false,
-    io::IO=stdout)
+ backend::Symbol=:auto,
+ max_tokens::Int=100,
+ temperature=0.7,
+ top_p=0.8,
+ top_k::Int=20,
+ presence_penalty=0.0,
+ repetition_penalty=1.0,
+ min_p=0.0,
+ stop_token::Union{Int,Nothing}=nothing,
+ show_tps::Bool=false,
+ use_bf16::Bool=false,
+ io::IO=stdout,
+ interrupt_check::Function=() -> false)
     
     # Auto-select backend when not specified, prefer model type
     chosen_backend = backend
@@ -418,22 +472,31 @@ function stream_to_stdout(model, tok, prompt::AbstractString;
                 rethrow(e)
             end
         end
-    elseif chosen_backend == :cpu
-        # CPU backend accepts BPETokenizer directly
-        if !(tok isa Tokenizer.BPETokenizer)
-            error("CPU backend requires a Tokenizer.BPETokenizer. Provided tokenizer is $(typeof(tok)).")
-        end
+elseif chosen_backend == :cpu
+ # CPU backend accepts BPETokenizer directly
+ if !(tok isa Tokenizer.BPETokenizer)
+ error("CPU backend requires a Tokenizer.BPETokenizer. Provided tokenizer is $(typeof(tok)).")
+ end
 
-        # Convert float params to Float32 for CPU backend
-        temp_f32 = Float32(temperature)
-        top_p_f32 = Float32(top_p)
-        penalty_f32 = Float32(presence_penalty)
-        rep_f32 = Float32(repetition_penalty)
-        min_p_f32 = Float32(min_p)
-        stop_tokens = stop_token === nothing ? Set{Int}() : Set([stop_token])
-        return ModelCPU.stream_to_stdout_cpu(model, tok, prompt;
-            max_tokens=max_tokens, temperature=temp_f32, top_p=top_p_f32, top_k=top_k,
-            presence_penalty=penalty_f32, repetition_penalty=rep_f32, min_p=min_p_f32, stop_tokens=stop_tokens, show_tps=show_tps, io=io)
+ # Enable BF16 if requested
+ if use_bf16
+ set_inference_precision!(:bf16)
+ @info "BF16 inference enabled for CPU backend"
+ else
+ set_inference_precision!(:f32)
+ end
+
+ # Convert float params to Float32 for CPU backend
+ temp_f32 = Float32(temperature)
+ top_p_f32 = Float32(top_p)
+ penalty_f32 = Float32(presence_penalty)
+ rep_f32 = Float32(repetition_penalty)
+ min_p_f32 = Float32(min_p)
+stop_tokens = stop_token === nothing ? Set{Int}() : Set([stop_token])
+  return ModelCPU.stream_to_stdout_cpu(model, tok, prompt;
+  max_tokens=max_tokens, temperature=temp_f32, top_p=top_p_f32, top_k=top_k,
+  presence_penalty=penalty_f32, repetition_penalty=rep_f32, min_p=min_p_f32, stop_tokens=stop_tokens, show_tps=show_tps, io=io,
+  interrupt_check=interrupt_check)
     else
         error("Unsupported backend: $(backend). Use :cpu or :gpu.")
     end

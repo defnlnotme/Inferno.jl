@@ -1374,10 +1374,10 @@ token_str = decode_fn([next_token])
   end
   end
  
- catch e
- if !(e isa InvalidStateException)
- @error "ERROR during CPU generation stream" exception=(e, catch_backtrace())
- end
+catch e
+  if !(e isa InvalidStateException) && !(e isa InterruptException)
+  @error "ERROR during CPU generation stream" exception=(e, catch_backtrace())
+  end
  finally
  try
  close(chan)
@@ -1425,10 +1425,8 @@ interrupt_check::Function=() -> false)
     
     generated_text = IOBuffer()
     try
-        if show_tps
-            t0 = time()
-            token_count = 0
-        end
+        t0 = time()
+        token_count = 0
         for token in stream
             if interrupt_check()
                 break

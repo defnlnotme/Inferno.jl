@@ -1,9 +1,15 @@
+"""
+Interactive chat module for Inferno.jl.
+
+Provides a REPL-like chat interface with conversation history management.
+"""
 module Chat
 
-using REPL
+using Base.Terminals
+using Base: join
 using ..Inferno: stream_to_stdout
 
-export chat, chat!, start_chat, Message, build_prompt
+export chat!, start_chat, Message, build_prompt
 
 struct Message
     role::String
@@ -12,30 +18,334 @@ end
 
 Message(role::Symbol, content) = Message(String(role), String(content))
 
-function build_prompt(messages::Vector{Message})
-    parts = String[]
-    for msg in messages
-        if msg.role == "system"
-            push!(parts, "<|im_start|>system\n$(msg.content)<|im_end|>")
-        elseif msg.role == "user"
-            push!(parts, "<|im_start|>user\n$(msg.content)<|im_end|>")
-        elseif msg.role == "assistant"
-            push!(parts, "<|im_start|>assistant\n$(msg.content)<|im_end|>")
+function build_prompt(messages::Vector{Message}; enable_thinking::Bool=false)
+ parts = String[]
+ for msg in messages
+ if msg.role == "system"
+ push!(parts, "<|im_start|>system\n$(msg.content)<|im_end|>")
+ elseif msg.role == "user"
+ push!(parts, "<|im_start|>user\n$(msg.content)<|im_end|>")
+ elseif msg.role == "assistant"
+ push!(parts, "<|im_start|>assistant\n$(msg.content)<|im_end|>")
+ end
+ end
+ # Qwen3.5 chat template: generation prompt includes <think> tokens
+ # Default (enable_thinking=false): skip thinking, go straight to answer
+ #   <think>\n\n</think>\n\n  (empty think block tells model to answer directly)
+ # With thinking: model will produce chain-of-thought in <think> block
+ #   <think>\n  (open think block, model continues thinking then closes with </think>)
+ if enable_thinking
+ push!(parts, "<|im_start|>assistant\n<think>\n")
+ else
+ push!(parts, "<|im_start|>assistant\n<think>\n\n</think>\n\n")
+ end
+ return join(parts, "\n")
+end
+
+function chat(model, tok, messages::Vector{Message}; enable_thinking::Bool=false, kwargs...)
+ prompt = build_prompt(messages; enable_thinking=enable_thinking)
+ return stream_to_stdout(model, tok, prompt; stop_token=tok.eos_id, kwargs...)
+end
+
+const interrupt_flag = Threads.Atomic{Bool}(false)
+const chat_terminal = Ref{Any}(nothing)
+
+function check_interrupt()
+    if interrupt_flag[]
+        interrupt_flag[], false
+        return true
+    end
+    # Try to check if there's input available on terminal
+    if chat_terminal[] !== nothing
+        try
+            t = chat_terminal[]
+            if bytesavailable(t) > 0
+                c = read(t, Char)
+                if c == '\x03'
+                    return true
+                end
+            end
+        catch e
+            # Ignore errors - might not be available
         end
     end
-    push!(parts, "<|im_start|>assistant\n")
-    return join(parts, "\n")
+    # Also try stdin directly (might work in some cases)
+    try
+        if bytesavailable(stdin) > 0
+            c = read(stdin, Char)
+            if c == '\x03'
+                return true
+            end
+        end
+    catch e
+        # Ignore
+    end
+    return false
 end
 
-function chat(model, tok, messages::Vector{Message}; kwargs...)
-    prompt = build_prompt(messages)
-    return stream_to_stdout(model, tok, prompt; stop_token=tok.eos_id, kwargs...)
+mutable struct ChatState
+    history::Vector{String}
+    hist_pos::Int
 end
 
-function chat!(model, tok; 
-    system_prompt::String="You are a helpful assistant.",
-    kwargs...)
+function iswordchar(c::Char)
+    c != ' ' && c != '\t'
+end
+
+function backward_word(cursor::Int, buffer::Vector{Char})
+    cursor <= 1 && return 1
+    len = length(buffer)
+    pos = min(cursor - 1, len)
+    pos <= 0 && return 1
     
+    if iswordchar(buffer[pos])
+        while pos > 1 && iswordchar(buffer[pos-1])
+            pos -= 1
+        end
+        return pos
+    end
+    
+    while pos >= 1 && !iswordchar(buffer[pos])
+        pos -= 1
+    end
+    while pos >= 1 && iswordchar(buffer[pos])
+        pos -= 1
+    end
+    return max(1, pos + 1)
+end
+
+function forward_word(cursor::Int, buffer::Vector{Char})
+    len = length(buffer)
+    cursor > len && return len + 1
+    pos = cursor
+    while pos <= len && iswordchar(buffer[pos])
+        pos += 1
+    end
+    while pos <= len && !iswordchar(buffer[pos])
+        pos += 1
+    end
+    return pos
+end
+
+function clear_line(term, prompt)
+    print(term, "\r" * " "^80 * "\r" * prompt)
+end
+
+function refresh_line(term, prompt, buffer, cursor)
+    print(term, "\r" * " "^80 * "\r" * prompt * String(buffer) * "\r")
+    print(term, "\r" * prompt)
+    for i in 1:cursor-1
+        print(term, buffer[i])
+    end
+end
+
+function read_line_chat(term, state)
+    print(term, "You> ")
+    flush(term)
+    
+    buffer = Char[]
+    cursor = 1
+    state.hist_pos = -1
+    
+    while true
+        c = try
+            read(term, Char)
+        catch e
+            if e isa EOFError
+                return "EXIT_CHAT"
+            else
+                rethrow(e)
+            end
+        end
+        
+        # Skip escape sequences ( CSI, OSC, DCS, etc. )
+        if c == '\e'
+            # This is start of escape sequence - consume and discard
+            continue
+        end
+        
+        if c == '\x04'
+            isempty(buffer) && return "EXIT_CHAT"
+            println(term)
+            result = String(buffer)
+            !isempty(result) && push!(state.history, result)
+            return result
+        elseif c == '\x03'
+            println(term)
+            return ""
+        elseif c == '\x10'  # Ctrl+P = previous history
+            if !isempty(state.history)
+                if state.hist_pos < length(state.history) - 1
+                    state.hist_pos += 1
+                elseif state.hist_pos == -1
+                    state.hist_pos = 0
+                end
+                buffer = collect(state.history[end - state.hist_pos])
+                cursor = length(buffer) + 1
+                refresh_line(term, "You> ", buffer, cursor)
+            end
+        elseif c == '\x0e'  # Ctrl+N = next history
+            if state.hist_pos > 0
+                state.hist_pos -= 1
+            elseif state.hist_pos == 0
+                state.hist_pos = -1
+            end
+            if state.hist_pos >= 0 && state.hist_pos < length(state.history)
+                buffer = collect(state.history[end - state.hist_pos])
+            else
+                buffer = Char[]
+            end
+            cursor = length(buffer) + 1
+            refresh_line(term, "You> ", buffer, cursor)
+        elseif c == '\r' || c == '\n'
+            # Check if this might be part of a paste operation
+            # Try to read more characters - if we get multiple quickly, it's paste
+            potential_paste = Char[]
+            try
+                # Non-blocking check for more input
+                start_time = time()
+                while time() - start_time < 0.01  # 10ms window
+                    if bytesavailable(term) > 0
+                        push!(potential_paste, read(term, Char))
+                    else
+                        sleep(0.001)
+                    end
+                end
+            catch
+            end
+            
+            if !isempty(potential_paste)
+                # This appears to be paste - include in buffer but don't render
+                paste_len = length(potential_paste)
+                truncate_msg = paste_len > 100 ? "[$paste_len chars truncated]" : "[$paste_len chars pasted]"
+                println(term)
+                printstyled(truncate_msg, color=:cyan)
+                print(term, "\r\nYou> ")
+                flush(term)
+                # Add to buffer but don't print each char
+                for pc in potential_paste
+                    push!(buffer, pc)
+                end
+                # Continue editing - reset state and continue the input loop
+                cursor = length(buffer) + 1
+                refresh_line(term, "You> ", buffer, cursor)
+            else
+                # Normal enter - submit
+                println(term)
+                result = String(buffer)
+                !isempty(result) && push!(state.history, result)
+                return result
+            end
+        elseif c == '\e'
+            next = read(term, Char)
+            if next == '['
+                seq = read(term, Char)
+                if seq == 'A' && !isempty(state.history)
+                    if state.hist_pos < length(state.history) - 1
+                        state.hist_pos += 1
+                    elseif state.hist_pos == -1
+                        state.hist_pos = 0
+                    end
+                    buffer = collect(state.history[end - state.hist_pos])
+                    cursor = length(buffer) + 1
+                    refresh_line(term, "You> ", buffer, cursor)
+                elseif seq == 'B'
+                    if state.hist_pos > 0
+                        state.hist_pos -= 1
+                    elseif state.hist_pos == 0
+                        state.hist_pos = -1
+                    end
+                    if state.hist_pos >= 0 && state.hist_pos < length(state.history)
+                        buffer = collect(state.history[end - state.hist_pos])
+                    else
+                        buffer = Char[]
+                    end
+                    cursor = length(buffer) + 1
+                    refresh_line(term, "You> ", buffer, cursor)
+                elseif seq == 'C'
+                    if cursor <= length(buffer)
+                        print(term, buffer[cursor])
+                        cursor += 1
+                    end
+                elseif seq == 'D'
+                    if cursor > 1
+                        cursor -= 1
+                        print(term, "\b")
+                    end
+                end
+            elseif next == '\x7f'
+                new_cursor = backward_word(cursor, buffer)
+                if new_cursor < cursor
+                    deleteat!(buffer, new_cursor:cursor-1)
+                    cursor = new_cursor
+                    refresh_line(term, "You> ", buffer, cursor)
+                end
+            elseif next == 'b'
+                cursor = backward_word(cursor, buffer)
+                refresh_line(term, "You> ", buffer, cursor)
+            elseif next == 'f'
+                cursor = forward_word(cursor, buffer)
+                refresh_line(term, "You> ", buffer, cursor)
+            elseif next == 'd'
+                word_end = forward_word(cursor, buffer)
+                if word_end > cursor
+                    deleteat!(buffer, cursor:word_end-1)
+                    refresh_line(term, "You> ", buffer, cursor)
+                end
+            end
+            continue
+        elseif c == '\x01'
+            cursor = 1
+            refresh_line(term, "You> ", buffer, cursor)
+            continue
+        elseif c == '\x05'
+            for i in cursor:length(buffer)
+                print(term, buffer[i])
+            end
+            cursor = min(length(buffer) + 1, cursor)
+            continue
+        elseif c == '\x02'
+            if cursor > 1
+                cursor -= 1
+                print(term, "\b")
+            end
+            continue
+        elseif c == '\x06'
+            if cursor <= length(buffer)
+                print(term, buffer[cursor])
+                cursor += 1
+            end
+            continue
+        elseif c == '\x0b'
+            buffer = buffer[1:cursor-1]
+            refresh_line(term, "You> ", buffer, cursor)
+            continue
+        elseif c == '\x15'
+            buffer = buffer[cursor:end]
+            cursor = 1
+            refresh_line(term, "You> ", buffer, cursor)
+            continue
+        elseif c == '\x7f'
+            if cursor > 1
+                deleteat!(buffer, cursor - 1)
+                cursor -= 1
+                refresh_line(term, "You> ", buffer, cursor)
+            end
+            continue
+        else
+            if cursor <= length(buffer)
+                insert!(buffer, cursor, c)
+                refresh_line(term, "You> ", buffer, cursor)
+            else
+                push!(buffer, c)
+                print(term, c)
+            end
+            cursor += 1
+        end
+    end
+end
+
+function chat!(model, tok; system_prompt::String="You are a helpful assistant.", kwargs...)
     messages = [Message(:system, system_prompt)]
     
     banner = """
@@ -43,56 +353,65 @@ function chat!(model, tok;
     ║           Welcome to Inferno Chat!                ║
     ╠═══════════════════════════════════════════════════╣
     ║  Type your message and press Enter to chat.       ║
-    ║  Commands:                                         ║
-    ║    /clear  - Clear conversation history           ║
-    ║    /system - Change system prompt                 ║
-    ║    /quit   - Exit chat                             ║
+    ║  Commands:                                   ║
+    ║    /clear  - Clear conversation history     ║
+    ║    /system - Change system prompt            ║
+    ║    /quit   - Exit chat                      ║
     ╚═══════════════════════════════════════════════════╝
     """
     
     printstyled(banner, color=:cyan, bold=true)
     println()
+    flush(stdout)
     
-    while true
-        printstyled("You> ", color=:green, bold=true)
-        line = chomp(readline(stdin))
+    state = ChatState(String[], -1)
+    term = TTYTerminal("/dev/tty", stdin, stdout, stderr)
+    chat_terminal[], term
+    interrupt_flag[], false
+    
+    try
+        raw!(term, true)
         
-        if isempty(line)
-            continue
-        end
-        
-        if line == "/quit" || line == "/exit"
-            printstyled("Goodbye!\n", color=:cyan)
-            break
-        elseif line == "/clear"
-            messages = [Message(:system, system_prompt)]
-            printstyled("Conversation cleared.\n", color=:yellow)
-            continue
-        elseif line == "/system"
-            printstyled("New system prompt: ", color=:magenta)
-            new_system = chomp(readline(stdin))
-            if !isempty(new_system)
-                system_prompt = new_system
-                messages = [Message(:system, system_prompt)]
-                printstyled("System prompt updated!\n", color=:green)
+        while true
+            line = read_line_chat(term, state)
+            
+            isempty(line) && continue
+            line == "EXIT_CHAT" && (printstyled("Goodbye!\n", color=:cyan); break)
+            line == "/quit" || line == "/exit" && (printstyled("Goodbye!\n", color=:cyan); break)
+            line == "/clear" && (messages = [Message(:system, system_prompt)]; printstyled("Conversation cleared.\n", color=:yellow); continue)
+            line == "/system" && begin
+                printstyled("New system prompt: ", color=:magenta)
+                raw!(term, false)
+                new_system = readline(stdin)
+                raw!(term, true)
+                !isempty(new_system) && (system_prompt = new_system; messages = [Message(:system, system_prompt)]; printstyled("System prompt updated!\n", color=:green))
+                continue
             end
-            continue
-        elseif startswith(line, "/")
-            printstyled("Unknown command: $(line)\n", color=:red)
-            continue
+            startswith(line, "/") && (printstyled("Unknown command: $(line)\n", color=:red); continue)
+            
+            push!(state.history, line)
+            push!(messages, Message(:user, line))
+            prompt = build_prompt(messages)
+            
+            # Exit raw mode during generation - makes stdin line-buffered
+            raw!(term, false)
+            
+            response = stream_to_stdout(model, tok, prompt; stop_token=tok.eos_id, kwargs...)
+            
+            # Re-enter raw mode for input
+            raw!(term, true)
+            
+            push!(messages, Message(:assistant, response))
         end
-        
-        push!(messages, Message(:user, line))
-        
-        prompt = build_prompt(messages)
-        
-        printstyled("\nAssistant> ", color=:blue, bold=true)
-        
-        response = stream_to_stdout(model, tok, prompt; stop_token=tok.eos_id, kwargs...)
-        
-        println()
-        
-        push!(messages, Message(:assistant, response))
+    catch e
+        if e isa InterruptException
+            println(term)
+            interrupt_flag[], false
+        else
+            rethrow(e)
+        end
+    finally
+        raw!(term, false)
     end
 end
 
