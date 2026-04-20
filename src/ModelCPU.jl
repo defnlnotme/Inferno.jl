@@ -1477,10 +1477,19 @@ tok = SimpleTokenizer(file)
 stream_to_stdout_cpu(model, tok, "Hello, how are you?")
 ```
 """
-function stream_to_stdout_cpu(model::QwenModelCPU, tok, prompt::String; kwargs...)
-    prompt_tokens = encode_prompt(tok, prompt)
-    decode_fn = (ids) -> decode_tokens(tok, ids)
-    return stream_to_stdout_cpu(model, prompt_tokens, decode_fn; kwargs...)
+function stream_to_stdout_cpu(model::QwenModelCPU, tok, prompt::String; stop_tokens::Set{Int}=Set{Int}(), kwargs...)
+ prompt_tokens = encode_prompt(tok, prompt)
+ decode_fn = (ids) -> decode_tokens(tok, ids)
+ # Add default stop tokens for Qwen3.5: EOS + <|im_end|>
+ if isempty(stop_tokens) && hasfield(typeof(tok), :token_to_id)
+ im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
+ eos_id = hasfield(typeof(tok), :eos_id) ? tok.eos_id : 0
+ default_stops = Set(filter(!=(0), [eos_id, im_end_id]))
+ if !isempty(default_stops)
+ stop_tokens = default_stops
+ end
+ end
+ return stream_to_stdout_cpu(model, prompt_tokens, decode_fn; stop_tokens=stop_tokens, kwargs...)
 end
 
 # Helper functions for tokenization
