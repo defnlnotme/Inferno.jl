@@ -141,107 +141,89 @@ end
 # Writes probabilities back into `probs[1:len, 1]`
 # Uses Float32 for exp() to prevent overflow
 function softmax_kernel!(probs, scores, len, scale)
- # Copy to CPU for computation (avoids scalar indexing on GPU)
- probs_cpu = Array(probs)
- scores_cpu = Array(scores)
+    T = eltype(probs)
+    sc_view = view(scores, 1:len, 1)
+    pr_view = view(probs, 1:len, 1)
 
- # Compute max in Float32 for stability
- mx = Float32(maximum(scores_cpu[1:len, 1]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:len
- v = exp(Float32(scores_cpu[i, 1] * scale) - mx)
- probs_cpu[i, 1] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:len
- probs_cpu[i, 1] *= inv_s
- end
+    # Compute max on GPU in Float32 for stability (returns a 1x1 oneArray)
+    mx = maximum(v -> Float32(v) * Float32(scale), sc_view, dims=1)
 
- # Copy back to GPU
- copyto!(probs, Float16.(probs_cpu))
- return nothing
+    # Exponential on GPU (vectorized broadcast)
+    @. pr_view = exp(Float32(sc_view) * Float32(scale) - mx)
+
+    # Sum on GPU (returns a 1x1 oneArray)
+    s = sum(pr_view, dims=1)
+
+    # Normalize on GPU (vectorized broadcast)
+    @. pr_view = T(Float32(pr_view) / s)
+
+    return nothing
 end
 
 function batched_softmax_kernel!(probs, scores, total_len, n_heads, scale)
- # Copy to CPU for computation (avoids scalar indexing on GPU)
- probs_cpu = Array(probs)
- scores_cpu = Array(scores)
+    T = eltype(probs)
+    sc_view = view(scores, 1:total_len, 1:n_heads)
+    pr_view = view(probs, 1:total_len, 1:n_heads)
 
- for h in 1:n_heads
- mx = Float32(maximum(scores_cpu[1:total_len, h]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:total_len
- v = exp(Float32(scores_cpu[i, h] * scale) - mx)
- probs_cpu[i, h] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:total_len
- probs_cpu[i, h] *= inv_s
- end
- end
+    # Compute max per column on GPU in Float32 (returns a 1xN oneArray)
+    mx = maximum(v -> Float32(v) * Float32(scale), sc_view, dims=1)
 
- # Copy back to GPU
- copyto!(probs, Float16.(probs_cpu))
- return nothing
+    # Exponential on GPU (vectorized broadcast)
+    @. pr_view = exp(Float32(sc_view) * Float32(scale) - mx)
+
+    # Sum per column on GPU (returns a 1xN oneArray)
+    s = sum(pr_view, dims=1)
+
+    # Normalize on GPU (vectorized broadcast)
+    @. pr_view = T(Float32(pr_view) / s)
+
+    return nothing
 end
 
 # Numerically stable sigmoid using Float32 intermediate computation
 # Float16 exp() overflows/underflows for |x| > 6.5
 function sigmoid_kernel!(out, x, N)
- for i in 1:N
- # Use Float32 for exp() to avoid overflow/underflow
- x_f32 = Float32(x[i])
- sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-x_f32))
- out[i] = Float16(sigmoid_f32)
- end
- return nothing
+    T = eltype(out)
+    out_v = view(out, 1:N)
+    x_v = view(x, 1:N)
+    @. out_v = T(1.0f0 / (1.0f0 + exp(-Float32(x_v))))
+    return nothing
 end
 
 # Numerically stable softplus using Float32 intermediate computation
 function softplus_kernel!(out, x, bias, N)
- for i in 1:N
- # Use Float32 for exp() to avoid overflow/underflow
- x_f32 = Float32(x[i] + bias[i])
- # Use softplus identity: log(1 + exp(x)) ≈ max(x, 0) + log(1 + exp(-|x|))
- # This is numerically stable for all x
- if x_f32 > 20.0f0
- # For large x, log(1 + exp(x)) ≈ x
- softplus_f32 = x_f32
- elseif x_f32 < -20.0f0
- # For large negative x, log(1 + exp(x)) ≈ 0
- softplus_f32 = 0.0f0
- else
- softplus_f32 = log(1.0f0 + exp(x_f32))
- end
- out[i] = Float16(softplus_f32)
- end
- return nothing
+    T = eltype(out)
+    out_v = view(out, 1:N)
+    x_v = view(x, 1:N)
+    b_v = view(bias, 1:N)
+
+    # Use vectorized broadcast for stable softplus
+    # Use softplus identity: log(1 + exp(x)) = max(x, 0) + log(1 + exp(-|x|))
+    @. out_v = T(let v = Float32(x_v + b_v)
+        max(v, 0.0f0) + log(1.0f0 + exp(-abs(v)))
+    end)
+    return nothing
 end
 
 # Numerically stable SiLU (Swish) using Float32 intermediate computation
 # SiLU(x) = x * sigmoid(x)
 function silu_kernel!(out, x, N)
- for i in 1:N
- x_f32 = Float32(x[i])
- sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-x_f32))
- silu_f32 = x_f32 * sigmoid_f32
- out[i] = Float16(silu_f32)
- end
- return nothing
+    T = eltype(out)
+    out_v = view(out, 1:N)
+    x_v = view(x, 1:N)
+    @. out_v = T(Float32(x_v) * (1.0f0 / (1.0f0 + exp(-Float32(x_v)))))
+    return nothing
 end
 
 # Numerically stable SiLU gating with Float32 intermediate computation
 # SiLU_gating(z, normed) = z * sigmoid(z) * normed
 function silu_gating_kernel!(out, z, normed, N)
- for i in 1:N
- z_f32 = Float32(z[i])
- sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-z_f32))
- silu_f32 = z_f32 * sigmoid_f32 * Float32(normed[i])
- out[i] = Float16(silu_f32)
- end
- return nothing
+    T = eltype(out)
+    out_v = view(out, 1:N)
+    z_v = view(z, 1:N)
+    n_v = view(normed, 1:N)
+    @. out_v = T(Float32(z_v) * (1.0f0 / (1.0f0 + exp(-Float32(z_v)))) * Float32(n_v))
+    return nothing
 end
 
 # --- SiLU ---
@@ -438,34 +420,27 @@ function MLP(index::Int, gate_weight, up_weight, down_weight)
 end
 
 function (m::MLP)(x::oneMatrix{Float16}, cache::KVCache)
- # GPU path - use numerically stable SiLU with Float32 intermediate
- mul!(cache.mlp_gate, m.gate_weight, x)
- mul!(cache.mlp_up, m.up_weight, x)
- 
- # Numerically stable SiLU: gate * sigmoid(gate)
- # Use Float32 for exp() to avoid overflow/underflow
- gate_cpu = Array(cache.mlp_gate)
- up_cpu = Array(cache.mlp_up)
- 
- # Apply SiLU in Float32 for numerical stability
- @. gate_cpu = gate_cpu * (Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_cpu))))
- gate_cpu .*= up_cpu
- 
- # Copy back to GPU
- copyto!(cache.mlp_gate, Float16.(gate_cpu))
- mul!(cache.branch_out, m.down_weight, cache.mlp_gate)
+    # GPU path - use numerically stable SiLU with Float32 intermediate
+    mul!(cache.mlp_gate, m.gate_weight, x)
+    mul!(cache.mlp_up, m.up_weight, x)
 
- return cache.branch_out
+    # Numerically stable SiLU: gate * sigmoid(gate) * up
+    # Use Float32 for exp() to avoid overflow/underflow, all on GPU
+    @. cache.mlp_gate = Float16(Float32(cache.mlp_gate) * (1.0f0 / (1.0f0 + exp(-Float32(cache.mlp_gate)))) * Float32(cache.mlp_up))
+
+    mul!(cache.branch_out, m.down_weight, cache.mlp_gate)
+    return cache.branch_out
 end
 
 function (m::MLP)(x::oneMatrix{Float16})
- # Numerically stable SiLU using Float32 intermediate
- g = Array(mat_mul(m.gate_weight, x))
- u = Array(mat_mul(m.up_weight, x))
- # SiLU: g * sigmoid(g) in Float32
- @. g = g * (Float32(1.0) / (Float32(1.0) + exp(-Float32(g))))
- g .*= u
- return mat_mul(m.down_weight, oneArray(Float16.(g)))
+    # GPU path - use numerically stable SiLU with Float32 intermediate
+    g = mat_mul(m.gate_weight, x)
+    u = mat_mul(m.up_weight, x)
+
+    # Numerically stable SiLU: g * sigmoid(g) * u in Float32, all on GPU
+    @. g = Float16(Float32(g) * (1.0f0 / (1.0f0 + exp(-Float32(g)))) * Float32(u))
+
+    return mat_mul(m.down_weight, g)
 end
 
 function reset_states!(m::MLP)
@@ -512,12 +487,14 @@ function (m::MoE)(x::oneMatrix{Float16}, cache::KVCache)
  xt = @view x[:, t:t]
 
  for (i, expert_idx) in enumerate(top_k_indices)
- g = Array(mat_mul(m.experts_gate[expert_idx], xt))
- u = Array(mat_mul(m.experts_up[expert_idx], xt))
- # Numerically stable SiLU in Float32
- @. g = g * (Float32(1.0) / (Float32(1.0) + exp(-Float32(g))))
- g .*= u
- res = mat_mul(m.experts_down[expert_idx], oneArray(Float16.(g)))
+ # Experts on GPU
+ g = mat_mul(m.experts_gate[expert_idx], xt)
+ u = mat_mul(m.experts_up[expert_idx], xt)
+
+ # Numerically stable SiLU in Float32 on GPU
+ @. g = Float16(Float32(g) * (1.0f0 / (1.0f0 + exp(-Float32(g)))) * Float32(u))
+
+ res = mat_mul(m.experts_down[expert_idx], g)
 
  prob = top_k_probs[i]
  out_view = @view output[:, t:t]
@@ -545,12 +522,14 @@ function (m::MoE)(x::oneMatrix{Float16})
 
  xt = @view x[:, t:t]
  for (i, expert_idx) in enumerate(top_k_indices)
- g = Array(mat_mul(m.experts_gate[expert_idx], xt))
- u = Array(mat_mul(m.experts_up[expert_idx], xt))
- # Numerically stable SiLU in Float32
- @. g = g * (Float32(1.0) / (Float32(1.0) + exp(-Float32(g))))
- g .*= u
- res = mat_mul(m.experts_down[expert_idx], oneArray(Float16.(g)))
+ # Experts on GPU
+ g = mat_mul(m.experts_gate[expert_idx], xt)
+ u = mat_mul(m.experts_up[expert_idx], xt)
+
+ # Numerically stable SiLU in Float32 on GPU
+ @. g = Float16(Float32(g) * (1.0f0 / (1.0f0 + exp(-Float32(g)))) * Float32(u))
+
+ res = mat_mul(m.experts_down[expert_idx], g)
  prob = top_k_probs[i]
  out_view = @view output[:, t:t]
  @. out_view += prob * res
@@ -662,9 +641,8 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
         k_rope = rope(k_2d, pos)
 
  # 4. Gate (applied AFTER attention, not to Q)
- gate_raw_cpu = Array(gate_raw)
- @. gate_raw_cpu = Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_raw_cpu))) # sigmoid
- gate_sigmoid = oneArray(Float16.(gate_raw_cpu))
+ # Numerically stable sigmoid on GPU
+ gate_sigmoid = @. Float16(1.0f0 / (1.0f0 + exp(-Float32(gate_raw))))
  q_gated = q_rope
 
     elseif m.architecture == :phi3
