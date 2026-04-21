@@ -52,7 +52,7 @@ const chat_terminal = Ref{Any}(nothing)
 
 function check_interrupt()
     if interrupt_flag[]
-        interrupt_flag[], false
+        interrupt_flag[] = false
         return true
     end
     # Try to check if there's input available on terminal
@@ -156,12 +156,6 @@ function read_line_chat(term, state)
             else
                 rethrow(e)
             end
-        end
-        
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
-            continue
         end
         
         if c == '\x04'
@@ -366,8 +360,8 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
     
     state = ChatState(String[], -1)
     term = TTYTerminal("/dev/tty", stdin, stdout, stderr)
-    chat_terminal[], term
-    interrupt_flag[], false
+    chat_terminal[] = term
+    interrupt_flag[] = false
     
     try
         raw!(term, true)
@@ -406,7 +400,7 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
     catch e
         if e isa InterruptException
             println(term)
-            interrupt_flag[], false
+            interrupt_flag[] = false
         else
             rethrow(e)
         end

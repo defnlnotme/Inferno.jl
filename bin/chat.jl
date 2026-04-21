@@ -77,11 +77,12 @@ end
 function main()
     args = parse_commandline()
     
+    is_stdout_tty = isa(stdout, Base.TTY)
     device_arg = args["device"] == -1 ? nothing : args["device"]
-    println("\e[1;35m🔥 Inferno Chat Interface 🔥\e[0m")
+    printstyled("🔥 Inferno Chat Interface 🔥\n", color=:magenta, bold=true)
 
     if !ispath(args["model"])
-        println("\e[31mError: Model file not found at $(args["model"])\e[0m")
+        printstyled("Error: Model file not found at $(args["model"])\n", color=:red)
         exit(1)
     end
 
@@ -106,7 +107,8 @@ function main()
         push!(messages, "user" => args["prompt"])
         prompt_text = format_messages(args["system-prompt"], messages)
         
-        print("\n\e[1;32mAssistant:\e[0m ")
+        println()
+        printstyled("Assistant: ", color=:green, bold=true)
         flush(stdout)
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
                                               max_tokens=args["max-tokens"], 
@@ -114,8 +116,17 @@ function main()
                                               top_p=Float32(args["top-p"]))
         
         full_response = ""
+        first_token = true
         try
+            if is_stdout_tty
+                print("\e[2m...\e[0m")
+                flush(stdout)
+            end
             for token_text in stream
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
@@ -123,8 +134,11 @@ function main()
             println()
         catch e
             if e isa InterruptException
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                end
                 close(stream)
-                println("\n\e[31m[Interrupted]\e[0m")
+                printstyled("\n[Interrupted]\n", color=:red)
                 full_response *= " [Interrupted]"
             else
                 rethrow(e)
@@ -139,7 +153,7 @@ function main()
     
     # Interactive loop
     while true
-        print("\e[1;36mUser:\e[0m ")
+        printstyled("User: ", color=:cyan, bold=true)
         flush(stdout)
         
         user_input = try
@@ -188,7 +202,7 @@ function main()
         push!(messages, "user" => user_input)
         prompt_text = format_messages(args["system-prompt"], messages)
         
-        print("\e[1;32mAssistant:\e[0m ")
+        printstyled("Assistant: ", color=:green, bold=true)
         flush(stdout)
         
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
@@ -197,8 +211,17 @@ function main()
                                               top_p=Float32(args["top-p"]))
                                               
         full_response = ""
+        first_token = true
         try
+            if is_stdout_tty
+                print("\e[2m...\e[0m")
+                flush(stdout)
+            end
             for token_text in stream
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
@@ -206,8 +229,11 @@ function main()
             println()
         catch e
             if e isa InterruptException
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                end
                 close(stream)
-                println("\n\e[31m[Interrupted]\e[0m")
+                printstyled("\n[Interrupted]\n", color=:red)
                 full_response *= " [Interrupted]"
             else
                 rethrow(e)

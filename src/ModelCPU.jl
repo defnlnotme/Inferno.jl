@@ -1424,12 +1424,23 @@ interrupt_check::Function=() -> false)
   interrupt_check=interrupt_check)
     
     generated_text = IOBuffer()
+    is_stdout_tty = isa(io, Base.TTY)
+    first_token = true
     try
+        if is_stdout_tty
+            print(io, "\e[2m...\e[0m")
+            flush(io)
+        end
+
         t0 = time()
         token_count = 0
         for token in stream
             if interrupt_check()
                 break
+            end
+            if first_token && is_stdout_tty
+                print(io, "\b\b\b\e[K")
+                first_token = false
             end
             print(io, token)
             flush(io)
@@ -1449,6 +1460,9 @@ interrupt_check::Function=() -> false)
         return String(take!(generated_text))
     catch e
         if e isa InterruptException
+            if first_token && is_stdout_tty
+                print(io, "\b\b\b\e[K")
+            end
             println(io)
             flush(io)
             if show_tps
