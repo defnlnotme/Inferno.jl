@@ -23,12 +23,17 @@ include("Tokenizer.jl")
 include("Loader.jl")
 include("Safetensors.jl")
 include("LoaderCPU.jl")
+include("Gemma4.jl")
+include("Gemma4Loader.jl")
 include("Engine.jl")
 include("Server.jl")
 include("Generate.jl")
 
 using .QuantsData
 using .Dequant
+using .Gemma4
+using .Gemma4Loader
+using .Engine
 using .AMXBF16
 using .ArrowLake
 using .QuantsCPU
@@ -41,7 +46,6 @@ using .Tokenizer
 using .Loader
 using .LoaderCPU
 using .Safetensors
-using .Engine
 using .Server
 using .Generate
 

@@ -1,6 +1,21 @@
 """
 Safetensors loader for Inferno.jl
+
 Loads model weights from HuggingFace safetensors format.
+Safetensors is a safe tensor serialization format that prevents arbitrary code execution
+and provides memory-mapped lazy loading.
+
+# Exports
+- `load_safetensors_model`: Load a complete model from safetensors
+- `SafetensorsFile`: The parsed safetensors file struct
+- `parse_safetensors`: Parse a safetensors file header
+- `get_tensor`: Extract a specific tensor
+- `list_tensors`: List tensors matching a pattern
+
+# Example
+```julia
+model, tok = load_safetensors_model("path/to/model_dir")
+```
 """
 module Safetensors
 
@@ -12,14 +27,44 @@ using ..Tokenizer
 export load_safetensors_model, SafetensorsFile
 
 struct SafetensorsFile
-    path::String
-    metadata::Dict{String, Any}
-    tensors::Dict{String, Tuple{Int, Int, Vector{Int}}}  # name -> (offset, dtype, shape)
-    data::Vector{UInt8}
+ """
+ SafetensorsFile struct containing parsed safetensors data.
+ 
+ # Fields
+ - `path::String`: Path to the file
+ - `metadata::Dict{String,Any}`: File metadata (if any)
+ - `tensors::Dict{String,Tuple{Int,Int,Vector{Int}}}`: Tensor info (name -> (offset, dtype, shape))
+ - `data::Vector{UInt8}`: Raw tensor data
+ """
+ path::String
+ metadata::Dict{String, Any}
+ tensors::Dict{String, Tuple{Int, Int, Vector{Int}}} # name -> (offset, dtype, shape)
+ data::Vector{UInt8}
 end
 
 """
-Parse safetensors file header and return tensor info.
+ parse_safetensors(path::String) -> SafetensorsFile
+
+Parse a safetensors file header and return tensor metadata.
+
+Safetensors files have a binary format:
+1. First 8 bytes: header size (little-endian uint64)
+2. Header: JSON object with tensor metadata (names, shapes, offsets)
+3. Data: Raw tensor data following the header
+
+This function parses the header and prepares the file for lazy tensor loading.
+
+# Arguments
+- `path::String`: Path to the .safetensors file
+
+# Returns
+`SafetensorsFile` containing parsed metadata and raw data buffer
+
+# Example
+```julia
+sf = parse_safetensors("model.safetensors")
+embed = get_tensor(sf, "model.language_model.embed_tokens.weight")
+```
 """
 function parse_safetensors(path::String)
     data = read(path)
@@ -60,13 +105,42 @@ function parse_safetensors(path::String)
         tensors[name] = (data_offset + offsets[1] + 1, dtype, shape)
     end
     
-    metadata = get(header, "__metadata__", Dict{String, Any}())
+    metadata_raw = get(header, "__metadata__", nothing)
+ metadata = if metadata_raw === nothing
+     Dict{String, Any}()
+ else
+     Dict{String, Any}(String(k) => v for (k, v) in pairs(metadata_raw))
+ end
     
     return SafetensorsFile(path, metadata, tensors, data)
 end
 
 """
-Get tensor data from safetensors file.
+ get_tensor(sf::SafetensorsFile, name::String) -> Union{Matrix, Nothing}
+
+Get tensor data from a parsed safetensors file.
+
+Converts row-major (safetensors) to column-major (Julia) automatically.
+Handles Float32, Float16, and BFloat16 data types.
+
+# Arguments
+- `sf::SafetensorsFile`: The parsed safetensors file
+- `name::String`: Tensor name/key
+
+# Returns
+- `Matrix{Float32}` if tensor exists and is loaded successfully
+- `nothing` if tensor does not exist
+
+# Supported Data Types
+- F32 (dtype=1): Direct Float32 extraction
+- F16 (dtype=2): Converted to Float32
+- BF16 (dtype=3): Converted to Float32 via bit manipulation
+
+# Example
+```julia
+sf = parse_safetensors("model.safetensors")
+embedding = get_tensor(sf, "model.language_model.embed_tokens.weight")
+```
 """
 function get_tensor(safetensors::SafetensorsFile, name::String)
  if !haskey(safetensors.tensors, name)
@@ -133,7 +207,16 @@ function get_tensor(safetensors::SafetensorsFile, name::String)
 end
 
 """
-List all tensor names matching a pattern.
+ list_tensors(safetensors::SafetensorsFile, pattern::Regex) -> Vector{String}
+
+List all tensor names matching a regex pattern.
+
+# Example
+```julia
+sf = parse_safetensors("model.safetensors")
+# Find all attention weights
+attention_weights = list_tensors(sf, r"attention.*weight")
+```
 """
 function list_tensors(safetensors::SafetensorsFile, pattern::Regex)
     return filter(name -> occursin(pattern, name), keys(safetensors.tensors))
@@ -298,7 +381,7 @@ final_norm = ModelCPU.RMSNormCPU(vec(Float32.(final_norm_w) .+ 1.0f0), model_con
  println("\nFinal norm weight mean: ", sum(final_norm.weight) / length(final_norm.weight))
  
  # LM head (tied with embedding for Qwen)
- lm_head = embed'
+ lm_head = Matrix{Float32}(embed')
  
  # Create RoPE
  rotary_dim = round(Int, model_config.head_dim * model_config.partial_rotary_factor)
@@ -314,10 +397,11 @@ final_norm = ModelCPU.RMSNormCPU(vec(Float32.(final_norm_w) .+ 1.0f0), model_con
  tokenizer = load_hf_tokenizer(model_dir)
  
  # Pre-allocate buffers
+ embed_buf = Vector{Float32}(undef, model_config.hidden_size)
  final_norm_buf = Vector{Float32}(undef, model_config.hidden_size)
  lm_head_buf = Vector{Float32}(undef, model_config.vocab_size)
  
- return ModelCPU.QwenModelCPU(model_config, embed, lm_head, layers, final_norm, rope, final_norm_buf, lm_head_buf, mtp_head), tokenizer
+ return ModelCPU.QwenModelCPU(model_config, embed, lm_head, layers, final_norm, rope, embed_buf, final_norm_buf, lm_head_buf, mtp_head), tokenizer
 end
 
 """Load MTP (Multi-Token Prediction) head from safetensors if present."""
@@ -523,15 +607,15 @@ function load_ssm_layer_safetensors(sf::SafetensorsFile, layer_idx::Int, config:
             tensor = get_tensor(sf, name)
             gate_proj = Matrix{Float32}(tensor)  # (2048, 1024) - no transpose needed
  elseif occursin("linear_attn.in_proj_a", name)
- tensor = get_tensor(sf, name)
- # Safetensors stores as (num_v_heads, hidden_size) = (16, 1024)
- # ModelCPU expects (hidden_size, num_v_heads) = (1024, 16) for: weight' * x
- # Need to transpose
- alpha_weight = Matrix{Float32}(tensor') # Transpose to (1024, 16)
+  tensor = get_tensor(sf, name)
+  # Safetensors stores as (num_v_heads, hidden_size) = (16, 1024)
+  # Forward pass does: mul!(buf, weight, x) where weight * x
+  # Need (num_v_heads, hidden_size) = (16, 1024) so (16,1024) * (1024,) = (16,)
+  alpha_weight = Matrix{Float32}(tensor) # Already (16, 1024), no transpose needed
  elseif occursin("linear_attn.in_proj_b", name)
- tensor = get_tensor(sf, name)
- # Same as alpha - transpose to match ModelCPU expectation
- beta_weight = Matrix{Float32}(tensor') # Transpose to (1024, 16)
+  tensor = get_tensor(sf, name)
+  # Same as alpha - keep as (num_v_heads, hidden_size) = (16, 1024)
+  beta_weight = Matrix{Float32}(tensor) # Already (16, 1024), no transpose needed
         elseif occursin("linear_attn.out_proj", name)
             tensor = get_tensor(sf, name)
             ssm_out = Matrix{Float32}(tensor)  # (1024, 2048) - no transpose needed
