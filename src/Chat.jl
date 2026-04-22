@@ -7,7 +7,7 @@ module Chat
 
 using Base.Terminals
 using Base: join
-using ..Inferno: stream_to_stdout, generate_cpu
+using ..Inferno: stream_to_stdout, generate_cpu, generate_stream_cpu
 
 export chat!, start_chat, Message, build_prompt
 
@@ -43,43 +43,79 @@ function build_prompt(messages::Vector{Message}; enable_thinking::Bool=false)
 end
 
 function render_with_thinking_color(response::String, term)
-    # Find thinking blocks and render them in gray
-    # The model outputs: <think> ... thinking content ... </think>
-    thinking_start = "<think>"
-    thinking_end = "</think>"
-    
-    # Check if response contains thinking blocks
-    if !occursin(thinking_start, response)
-        # No thinking blocks, just print normally
+    # No thinking blocks - print normally
+    if !occursin("<think>", response)
         print(term, response)
+        println(term)
         return response
     end
     
-    # Use regex to find and replace thinking blocks with colored versions
-    # Pattern matches <think> followed by anything up to </think>
-    pattern = Regex("<think>(.*?)</think>", "s")
+    # Split response into parts around think blocks
+    parts = split(response, "<think>")
+    buffer = IOBuffer()
     
-    # Find all matches and their positions
-    result = IOBuffer()
-    last_end = 1
-    
-    for m in eachmatch(pattern, response)
-        # Print text before this think block
-        print(result, response[last_end:prevind(response, m.offset)])
-        # Print think block in gray
-        printstyled(result, "<think>", color=:light_black)
-        printstyled(result, m[1], color=:light_black)
-        printstyled(result, "</think>", color=:light_black)
-        last_end = nextind(response, m.offset + length(m.match) - 1)
+    for (i, part) in enumerate(parts)
+        if i == 1
+            # Before first think block - print normally
+            write(buffer, part)
+        else
+            # Inside think block - find where it ends
+            if occursin("</think>", part)
+                subparts = split(part, "</think>")
+                think_content = subparts[1]
+                remaining = join(subparts[2:end], "</think>")
+                
+                # Print think block in gray
+                printstyled(buffer, "<think>", color=:light_black)
+                printstyled(buffer, think_content, color=:light_black)
+                printstyled(buffer, "</think>", color=:light_black)
+                
+                # Print remaining normally
+                write(buffer, remaining)
+            else
+                # Unclosed think block - print in gray
+                printstyled(buffer, "<think>", color=:light_black)
+                printstyled(buffer, part, color=:light_black)
+            end
+        end
     end
     
-    # Print remaining text after last think block
-    print(result, response[last_end:end])
-    
-    # Now print the whole colored result
-    print(term, String(take!(result)))
+    print(term, String(take!(buffer)))
     println(term)
     flush(term)
+    return response
+end
+
+function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{Int}=Set{Int}(), max_tokens::Int=512, kwargs...)
+    # Stream generation with thinking block color tracking
+    prompt_tokens = encode(tok, prompt)
+    is_thinking = false
+    token_buffer = ""
+    
+    for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids); max_tokens=max_tokens, stop_tokens=stop_tokens, kwargs...)
+        token_buffer *= token
+        
+        # Track thinking state
+        if occursin("<think>", token_buffer)
+            is_thinking = true
+        end
+        
+        # Print with appropriate color
+        if is_thinking
+            printstyled(io, token, color=:light_black)
+        else
+            print(io, token)
+        end
+        flush(io)
+        
+        # Check if think block closed
+        if occursin("</think>", token_buffer)
+            is_thinking = false
+            token_buffer = ""
+        end
+    end
+    
+    return String(take!(IOBuffer()))
     return response
 end
 
@@ -447,10 +483,10 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
 # Exit raw mode during generation - makes stdin line-buffered
   raw!(term, false)
   
-  # Generate to IOBuffer (captures output), then render with thinking colors
-  io_buf = IOBuffer()
-  response = stream_to_stdout(model, tok, prompt; io=io_buf, stop_token=stop_token, max_tokens=div(model.config.max_position_embeddings, 2), kwargs...)
-  render_with_thinking_color(response, term)
+  # Generate and stream with thinking colors
+  im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
+  stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
+  stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, kwargs...)
   
   # Re-enter raw mode for input
   raw!(term, true)
