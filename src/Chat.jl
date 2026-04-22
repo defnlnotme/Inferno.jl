@@ -46,8 +46,8 @@ function chat(model, tok, messages::Vector{Message}; enable_thinking::Bool=false
  prompt = build_prompt(messages; enable_thinking=enable_thinking)
  # Stop on EOS and <|im_end|> tokens
  im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
- stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
- return stream_to_stdout(model, tok, prompt; stop_tokens=stop_tokens, kwargs...)
+ stop_token = im_end_id != 0 ? im_end_id : tok.eos_id
+ return stream_to_stdout(model, tok, prompt; stop_token=stop_token, kwargs...)
 end
 
 const interrupt_flag = Threads.Atomic{Bool}(false)
@@ -374,9 +374,9 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  chat_terminal[], term
  interrupt_flag[], false
  
- # Stop on EOS and <|im_end|>
- im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
- stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
+# Stop on EOS and <|im_end|>
+  im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
+  stop_token = im_end_id != 0 ? im_end_id : tok.eos_id
  
  try
  raw!(term, true)
@@ -403,13 +403,13 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  push!(messages, Message(:user, line))
  prompt = build_prompt(messages; enable_thinking=thinking_mode)
  
- # Exit raw mode during generation - makes stdin line-buffered
- raw!(term, false)
- 
- response = stream_to_stdout(model, tok, prompt; stop_tokens=stop_tokens, kwargs...)
- 
- # Re-enter raw mode for input
- raw!(term, true)
+# Exit raw mode during generation - makes stdin line-buffered
+  raw!(term, false)
+  
+  response = stream_to_stdout(model, tok, prompt; stop_token=tok.eos_id, kwargs...)
+  
+  # Re-enter raw mode for input
+  raw!(term, true)
  
  push!(messages, Message(:assistant, response))
  end
