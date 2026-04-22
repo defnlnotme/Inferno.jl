@@ -406,7 +406,7 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
 # Exit raw mode during generation - makes stdin line-buffered
   raw!(term, false)
   
-  response = stream_to_stdout(model, tok, prompt; stop_token=tok.eos_id, kwargs...)
+  response = stream_to_stdout(model, tok, prompt; stop_token=tok.eos_id, max_tokens=512, kwargs...)
   
   # Re-enter raw mode for input
   raw!(term, true)
