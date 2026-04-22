@@ -8,6 +8,7 @@ module Chat
 using Base.Terminals
 using Base: join
 using ..Inferno: stream_to_stdout, generate_cpu, generate_stream_cpu
+using ..Inferno.Tokenizer: encode, decode
 
 export chat!, start_chat, Message, build_prompt
 
