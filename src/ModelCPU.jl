@@ -1424,12 +1424,26 @@ interrupt_check::Function=() -> false)
   interrupt_check=interrupt_check)
     
     generated_text = IOBuffer()
+    is_stdout_tty = isa(io, Base.TTY)
+    first_token = true
+
     try
+        if is_stdout_tty
+            print(io, "\e[2m...\e[0m")
+            flush(io)
+        end
+
         t0 = time()
         token_count = 0
         for token in stream
             if interrupt_check()
                 break
+            end
+            if first_token
+                if is_stdout_tty
+                    print(io, "\b\b\b\e[K")
+                end
+                first_token = false
             end
             print(io, token)
             flush(io)
@@ -1448,8 +1462,12 @@ interrupt_check::Function=() -> false)
         end
         return String(take!(generated_text))
     catch e
+        if is_stdout_tty && first_token
+            print(io, "\b\b\b\e[K")
+            flush(io)
+        end
         if e isa InterruptException
-            println(io)
+            printstyled(io, "\n[Interrupted]\n", color=:red)
             flush(io)
             if show_tps
                 elapsed = time() - t0
@@ -1457,7 +1475,7 @@ interrupt_check::Function=() -> false)
                 @printf(io, "[t/s] %.2f tokens/s — %d tokens in %.3fs\n", tps, token_count, elapsed)
                 flush(io)
             end
-            return String(take!(generated_text))
+            return String(take!(generated_text)) * " [Interrupted]"
         else
             rethrow(e)
         end
