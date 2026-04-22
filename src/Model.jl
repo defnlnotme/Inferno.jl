@@ -139,52 +139,43 @@ end
 # --- GPU Softmax Kernel ---
 # Stable softmax on a 1D slice of length `len` stored in `scores[1:len, 1]`
 # Writes probabilities back into `probs[1:len, 1]`
-# Uses Float32 for exp() to prevent overflow
+# Uses Float32 for exp() to prevent overflow and stays entirely on GPU.
 function softmax_kernel!(probs, scores, len, scale)
- # Copy to CPU for computation (avoids scalar indexing on GPU)
- probs_cpu = Array(probs)
- scores_cpu = Array(scores)
+    sc_view = view(scores, 1:len, 1)
+    pr_view = view(probs, 1:len, 1)
 
- # Compute max in Float32 for stability
- mx = Float32(maximum(scores_cpu[1:len, 1]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:len
- v = exp(Float32(scores_cpu[i, 1] * scale) - mx)
- probs_cpu[i, 1] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:len
- probs_cpu[i, 1] *= inv_s
- end
+    # 1. Find max for numerical stability (stays on GPU)
+    mx = mapreduce(v -> Float32(v) * Float32(scale), max, sc_view, dims=1)
 
- # Copy back to GPU
- copyto!(probs, Float16.(probs_cpu))
- return nothing
+    # 2. Compute exp(x - mx)
+    @. pr_view = Float16(exp(Float32(sc_view) * Float32(scale) - mx))
+
+    # 3. Sum of exponents
+    s = mapreduce(v -> Float32(v), +, pr_view, dims=1)
+
+    # 4. Normalize
+    @. pr_view /= Float16(s)
+
+    return nothing
 end
 
 function batched_softmax_kernel!(probs, scores, total_len, n_heads, scale)
- # Copy to CPU for computation (avoids scalar indexing on GPU)
- probs_cpu = Array(probs)
- scores_cpu = Array(scores)
+    sc_view = view(scores, 1:total_len, 1:n_heads)
+    pr_view = view(probs, 1:total_len, 1:n_heads)
 
- for h in 1:n_heads
- mx = Float32(maximum(scores_cpu[1:total_len, h]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:total_len
- v = exp(Float32(scores_cpu[i, h] * scale) - mx)
- probs_cpu[i, h] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:total_len
- probs_cpu[i, h] *= inv_s
- end
- end
+    # 1. Find max for each head (stays on GPU)
+    mx = mapreduce(v -> Float32(v) * Float32(scale), max, sc_view, dims=1)
 
- # Copy back to GPU
- copyto!(probs, Float16.(probs_cpu))
- return nothing
+    # 2. Compute exp(x - mx)
+    @. pr_view = Float16(exp(Float32(sc_view) * Float32(scale) - mx))
+
+    # 3. Sum for each head
+    s = mapreduce(v -> Float32(v), +, pr_view, dims=1)
+
+    # 4. Normalize
+    @. pr_view /= Float16(s)
+
+    return nothing
 end
 
 # Numerically stable sigmoid using Float32 intermediate computation
