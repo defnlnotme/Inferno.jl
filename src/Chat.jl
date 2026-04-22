@@ -93,7 +93,18 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
     is_thinking = false
     token_buffer = ""
     
-    for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids); max_tokens=max_tokens, stop_tokens=stop_tokens, kwargs...)
+    # Extract and convert Float32 parameters
+    temperature = haskey(kwargs, :temperature) ? Float32(kwargs[:temperature]) : 0.7f0
+    top_p = haskey(kwargs, :top_p) ? Float32(kwargs[:top_p]) : 0.95f0
+    top_k = haskey(kwargs, :top_k) ? kwargs[:top_k] : 20
+    repetition_penalty = haskey(kwargs, :repetition_penalty) ? Float32(kwargs[:repetition_penalty]) : 1.0f0
+    presence_penalty = haskey(kwargs, :presence_penalty) ? Float32(kwargs[:presence_penalty]) : 0.0f0
+    min_p = haskey(kwargs, :min_p) ? Float32(kwargs[:min_p]) : 0.0f0
+    
+    for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids); 
+        max_tokens=max_tokens, stop_tokens=stop_tokens,
+        temperature=temperature, top_p=top_p, top_k=top_k,
+        repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p)
         token_buffer *= token
         
         # Track thinking state
@@ -116,8 +127,7 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
         end
     end
     
-    return String(take!(IOBuffer()))
-    return response
+    return token_buffer
 end
 
 function chat(model, tok, messages::Vector{Message}; enable_thinking::Bool=false, kwargs...)
