@@ -87,10 +87,10 @@ function render_with_thinking_color(response::String, term)
     return response
 end
 
-function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{Int}=Set{Int}(), max_tokens::Int=512, kwargs...)
+function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{Int}=Set{Int}(), max_tokens::Int=512, thinking_enabled::Bool=false, kwargs...)
     # Stream generation with thinking block color tracking
     prompt_tokens = encode(tok, prompt)
-    is_thinking = false
+    is_thinking = thinking_enabled
     token_buffer = ""
     
     # Extract and convert Float32 parameters
@@ -107,27 +107,9 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
         repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p)
         token_buffer *= token
         
-        # Track thinking state - detect both opening and closing markers
-        if occursin("<think>", token)
-            is_thinking = true
-        elseif occursin("</think>", token)
-            is_thinking = false
-        end
-        
-        # Debug: print any think-related tokens
-        if occursin("<think>", token) || occursin("</think>", token)
-            printstyled(io, " [$(token)]", color=:yellow)
-        end
-        
-        # Print with appropriate color - color the marker tokens AND content in thinking blocks
+        # Print with appropriate color - color content in thinking blocks
         if is_thinking
             printstyled(io, token, color=:red)
-        elseif occursin("<think>", token)
-            printstyled(io, token, color=:red)
-            is_thinking = true
-        elseif occursin("</think>", token)
-            printstyled(io, token, color=:red)
-            is_thinking = false
         else
             print(io, token)
         end
@@ -509,7 +491,7 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
   # Generate and stream with thinking colors
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
   stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
-response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, kwargs...)
+response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, thinking_enabled=thinking_mode, kwargs...)
    
    # Print newline after response
    println(term)
