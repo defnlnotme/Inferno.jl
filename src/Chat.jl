@@ -114,7 +114,7 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
         
         # Print with appropriate color
         if is_thinking
-            printstyled(io, token, color=:light_black)
+            printstyled(io, token, color=:cyan)
         else
             print(io, token)
         end
