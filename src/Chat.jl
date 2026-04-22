@@ -55,27 +55,29 @@ function render_with_thinking_color(response::String, term)
         return response
     end
     
-    # Split by thinking markers and print with colors
-    parts = split(response, thinking_start)
-    for (i, part) in enumerate(parts)
-        if i == 1
-            # First part - normal text before any thinking
-            print(term, part)
-        else
-            # This is a thinking block - find where it ends
-            if occursin(thinking_end, part)
-                thinking_content = split(part, thinking_end)[1]
-                remaining = join(split(part, thinking_end)[2:end], thinking_end)
-                # Print thinking in gray
-                printstyled(term, thinking_content, color=:light_black)
-                printstyled(term, thinking_end, color=:light_black)
-                print(term, remaining)
-            else
-                # Thinking block without end - shouldn't happen but print anyway
-                printstyled(term, part, color=:light_black)
-            end
-        end
+    # Use regex to find and replace thinking blocks with colored versions
+    # Pattern matches <think> followed by anything up to </think>
+    pattern = Regex("<think>(.*?)</think>", "s")
+    
+    # Find all matches and their positions
+    result = IOBuffer()
+    last_end = 1
+    
+    for m in eachmatch(pattern, response)
+        # Print text before this think block
+        print(result, response[last_end:prevind(response, m.offset)])
+        # Print think block in gray
+        printstyled(result, "<think>", color=:light_black)
+        printstyled(result, m[1], color=:light_black)
+        printstyled(result, "</think>", color=:light_black)
+        last_end = nextind(response, m.offset + length(m.match) - 1)
     end
+    
+    # Print remaining text after last think block
+    print(result, response[last_end:end])
+    
+    # Now print the whole colored result
+    print(term, String(take!(result)))
     flush(term)
     return response
 end
