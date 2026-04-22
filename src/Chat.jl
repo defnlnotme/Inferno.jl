@@ -7,7 +7,7 @@ module Chat
 
 using Base.Terminals
 using Base: join
-using ..Inferno: stream_to_stdout
+using ..Inferno: stream_to_stdout, generate_cpu
 
 export chat!, start_chat, Message, build_prompt
 
@@ -40,6 +40,44 @@ function build_prompt(messages::Vector{Message}; enable_thinking::Bool=false)
  push!(parts, "<|im_start|>assistant\n<think>\n\n</think>\n\n")
  end
  return join(parts, "\n")
+end
+
+function render_with_thinking_color(response::String, term)
+    # Find thinking blocks and render them in gray
+    # The model outputs: <think> ... thinking content ... </think>
+    thinking_start = "<think>"
+    thinking_end = "</think>"
+    
+    # Check if response contains thinking blocks
+    if !occursin(thinking_start, response)
+        # No thinking blocks, just print normally
+        print(term, response)
+        return response
+    end
+    
+    # Split by thinking markers and print with colors
+    parts = split(response, thinking_start)
+    for (i, part) in enumerate(parts)
+        if i == 1
+            # First part - normal text before any thinking
+            print(term, part)
+        else
+            # This is a thinking block - find where it ends
+            if occursin(thinking_end, part)
+                thinking_content = split(part, thinking_end)[1]
+                remaining = join(split(part, thinking_end)[2:end], thinking_end)
+                # Print thinking in gray
+                printstyled(term, thinking_content, color=:light_black)
+                printstyled(term, thinking_end, color=:light_black)
+                print(term, remaining)
+            else
+                # Thinking block without end - shouldn't happen but print anyway
+                printstyled(term, part, color=:light_black)
+            end
+        end
+    end
+    flush(term)
+    return response
 end
 
 function chat(model, tok, messages::Vector{Message}; enable_thinking::Bool=false, kwargs...)
@@ -406,7 +444,9 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
 # Exit raw mode during generation - makes stdin line-buffered
   raw!(term, false)
   
-  response = stream_to_stdout(model, tok, prompt; stop_token=tok.eos_id, max_tokens=div(model.config.max_position_embeddings, 2), kwargs...)
+  # Generate response and render with thinking colors
+  response = generate_cpu(model, tok, prompt; stop_token=tok.eos_id, max_tokens=div(model.config.max_position_embeddings, 2), kwargs...)
+  render_with_thinking_color(response, term)
   
   # Re-enter raw mode for input
   raw!(term, true)
