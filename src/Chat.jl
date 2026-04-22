@@ -78,6 +78,7 @@ function render_with_thinking_color(response::String, term)
     
     # Now print the whole colored result
     print(term, String(take!(result)))
+    println(term)
     flush(term)
     return response
 end
