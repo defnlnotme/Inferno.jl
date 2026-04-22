@@ -444,8 +444,9 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
 # Exit raw mode during generation - makes stdin line-buffered
   raw!(term, false)
   
-  # Generate response and render with thinking colors
-  response = generate_cpu(model, tok, prompt; stop_token=tok.eos_id, max_tokens=div(model.config.max_position_embeddings, 2), kwargs...)
+  # Generate to IOBuffer (captures output), then render with thinking colors
+  io_buf = IOBuffer()
+  response = stream_to_stdout(model, tok, prompt; io=io_buf, stop_token=stop_token, max_tokens=div(model.config.max_position_embeddings, 2), kwargs...)
   render_with_thinking_color(response, term)
   
   # Re-enter raw mode for input
