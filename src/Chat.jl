@@ -110,11 +110,14 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
         # Track thinking state
         if occursin("<think>", token_buffer)
             is_thinking = true
+            printstyled(io, " <THINK_START>", color=:green)
+        elseif occursin("<think>", token)
+            printstyled(io, " [TOKEN_HAS_THINK]", color=:cyan)
         end
         
-        # Debug: print token info
+        # Debug: print any think-related tokens
         if occursin("<think>", token) || occursin("</think>", token)
-            printstyled(io, " [DEBUG:$(token)]", color=:green)
+            printstyled(io, " [DEBUG:$(token)]", color=:yellow)
         end
         
         # Print with appropriate color
