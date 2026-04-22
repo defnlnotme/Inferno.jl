@@ -107,31 +107,35 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
         repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p)
         token_buffer *= token
         
-        # Track thinking state
-        if occursin("<think>", token_buffer)
+        # Track thinking state - detect both opening and closing markers
+        if occursin("<think>", token)
             is_thinking = true
-            printstyled(io, " <THINK_START>", color=:green)
-        elseif occursin("<think>", token)
-            printstyled(io, " [TOKEN_HAS_THINK]", color=:cyan)
+        elseif occursin("</think>", token)
+            is_thinking = false
         end
         
         # Debug: print any think-related tokens
         if occursin("<think>", token) || occursin("</think>", token)
-            printstyled(io, " [DEBUG:$(token)]", color=:yellow)
+            printstyled(io, " [$(token)]", color=:yellow)
         end
         
-        # Print with appropriate color
+        # Print with appropriate color - color the marker tokens AND content in thinking blocks
         if is_thinking
             printstyled(io, token, color=:red)
+        elseif occursin("<think>", token)
+            printstyled(io, token, color=:red)
+            is_thinking = true
+        elseif occursin("</think>", token)
+            printstyled(io, token, color=:red)
+            is_thinking = false
         else
             print(io, token)
         end
         flush(io)
         
         # Check if think block closed
-        if occursin("</think>", token_buffer)
+        if occursin("</think>", token)
             is_thinking = false
-            token_buffer = ""
         end
     end
     
