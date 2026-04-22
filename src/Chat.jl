@@ -109,7 +109,7 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
         
         # Print with appropriate color - color content in thinking blocks
         if is_thinking
-            printstyled(io, token, color=:red)
+            printstyled(io, token, color=:light_black, italic=true)
         else
             print(io, token)
         end
