@@ -497,10 +497,13 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
   # Generate and stream with thinking colors
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
   stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
-  response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, kwargs...)
-  
-  # Re-enter raw mode for input
-  raw!(term, true)
+response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, kwargs...)
+   
+   # Print newline after response
+   println(term)
+   
+   # Re-enter raw mode for input
+   raw!(term, true)
  
  push!(messages, Message(:assistant, response))
  end
