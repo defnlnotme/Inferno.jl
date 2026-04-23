@@ -92,7 +92,11 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
     prompt_tokens = encode(tok, prompt)
     is_thinking = thinking_enabled
     token_buffer = ""
+    is_stdout_tty = isa(io, Base.TTY)
+    first_token = true
     
+    is_stdout_tty && (printstyled(io, "...", color=:light_black); flush(io))
+
     # Extract and convert Float32 parameters
     temperature = haskey(kwargs, :temperature) ? Float32(kwargs[:temperature]) : 0.7f0
     top_p = haskey(kwargs, :top_p) ? Float32(kwargs[:top_p]) : 0.95f0
@@ -101,23 +105,38 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
     presence_penalty = haskey(kwargs, :presence_penalty) ? Float32(kwargs[:presence_penalty]) : 0.0f0
     min_p = haskey(kwargs, :min_p) ? Float32(kwargs[:min_p]) : 0.0f0
     
-    for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids); 
-        max_tokens=max_tokens, stop_tokens=stop_tokens,
-        temperature=temperature, top_p=top_p, top_k=top_k,
-        repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p)
-        token_buffer *= token
-        
-        # Print with appropriate color - color content in thinking blocks
-        if is_thinking
-            printstyled(io, token, color=:light_black, italic=true)
-        else
-            print(io, token)
+    try
+        for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids);
+            max_tokens=max_tokens, stop_tokens=stop_tokens,
+            temperature=temperature, top_p=top_p, top_k=top_k,
+            repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p)
+
+            if first_token
+                is_stdout_tty && (print(io, "\b\b\b\e[K"); flush(io))
+                first_token = false
+            end
+
+            token_buffer *= token
+
+            # Print with appropriate color - color content in thinking blocks
+            if is_thinking
+                printstyled(io, token, color=:light_black, italic=true)
+            else
+                print(io, token)
+            end
+            flush(io)
+
+            # Check if think block closed
+            if occursin("</think>", token)
+                is_thinking = false
+            end
         end
-        flush(io)
-        
-        # Check if think block closed
-        if occursin("</think>", token)
-            is_thinking = false
+    catch e
+        if e isa InterruptException
+            first_token && is_stdout_tty && (print(io, "\b\b\b\e[K"); flush(io))
+            rethrow(e)
+        else
+            rethrow(e)
         end
     end
     
@@ -241,12 +260,6 @@ function read_line_chat(term, state)
             else
                 rethrow(e)
             end
-        end
-        
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
-            continue
         end
         
         if c == '\x04'
