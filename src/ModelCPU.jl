@@ -1275,21 +1275,23 @@ stream = generate_stream_cpu(model, prompt_tokens; use_mtp=true, k_toks=4)
 ```
 """
 function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, decode_fn::Function;
- max_tokens::Int=512,
- temperature::Float32=1.0f0,
- top_p::Float32=0.95f0,
- top_k::Int=0,
- repetition_penalty::Float32=1.0f0,
- presence_penalty::Float32=0.0f0,
- min_p::Float32=0.0f0,
- stop_tokens::Set{Int}=Set{Int}(),
- max_context::Int=8192,
- # MTP options
- use_mtp::Bool=false,
- k_toks::Int=4,
- mask_id::Int=151643,
- # Interrupt support
- interrupt_check::Function=() -> false)
+  max_tokens::Int=512,
+  temperature::Float32=1.0f0,
+  top_p::Float32=0.95f0,
+  top_k::Int=0,
+  repetition_penalty::Float32=1.0f0,
+  presence_penalty::Float32=0.0f0,
+  min_p::Float32=0.0f0,
+  stop_tokens::Set{Int}=Set{Int}(),
+  max_context::Int=8192,
+  show_tps::Bool=false,
+  io::IO=stdout,
+  # MTP options
+  use_mtp::Bool=false,
+  k_toks::Int=4,
+  mask_id::Int=151643,
+  # Interrupt support
+  interrupt_check::Function=() -> false)
  
  return Channel{String}(32) do chan
  try

@@ -87,11 +87,15 @@ function render_with_thinking_color(response::String, term)
     return response
 end
 
-function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{Int}=Set{Int}(), max_tokens::Int=512, thinking_enabled::Bool=false, kwargs...)
+function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{Int}=Set{Int}(), max_tokens::Int=512, thinking_enabled::Bool=false, show_tps::Bool=false, kwargs...)
     # Stream generation with thinking block color tracking
     prompt_tokens = encode(tok, prompt)
     is_thinking = thinking_enabled
     token_buffer = ""
+    
+    # Track tokens and time for TPS
+    t0 = time()
+    token_count = 0
     
     # Extract and convert Float32 parameters
     temperature = haskey(kwargs, :temperature) ? Float32(kwargs[:temperature]) : 0.7f0
@@ -104,8 +108,10 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
     for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids); 
         max_tokens=max_tokens, stop_tokens=stop_tokens,
         temperature=temperature, top_p=top_p, top_k=top_k,
-        repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p)
+        repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p,
+        show_tps=false, io=stdout)
         token_buffer *= token
+        token_count += 1
         
         # Print with appropriate color - color content in thinking blocks
         if is_thinking
@@ -113,12 +119,14 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
         else
             print(io, token)
         end
-        flush(io)
-        
-        # Check if think block closed
-        if occursin("</think>", token)
-            is_thinking = false
-        end
+flush(io)
+    end
+    
+    # Print TPS if enabled
+    if show_tps && token_count > 0
+        elapsed = time() - t0
+        tps = elapsed > 0 ? token_count / elapsed : 0.0
+        printstyled(io, "\n[t/s] $(round(tps, digits=2)) tokens/s — $(token_count) tokens in $(round(elapsed, digits=3))s\n", color=:cyan)
     end
     
     return token_buffer
@@ -491,7 +499,7 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
   # Generate and stream with thinking colors
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
   stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
-response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, thinking_enabled=thinking_mode, kwargs...)
+response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, thinking_enabled=thinking_mode, show_tps=true, kwargs...)
    
    # Print newline after response
    println(term)
