@@ -101,23 +101,47 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
     presence_penalty = haskey(kwargs, :presence_penalty) ? Float32(kwargs[:presence_penalty]) : 0.0f0
     min_p = haskey(kwargs, :min_p) ? Float32(kwargs[:min_p]) : 0.0f0
     
-    for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids); 
-        max_tokens=max_tokens, stop_tokens=stop_tokens,
-        temperature=temperature, top_p=top_p, top_k=top_k,
-        repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p)
-        token_buffer *= token
-        
-        # Print with appropriate color - color content in thinking blocks
-        if is_thinking
-            printstyled(io, token, color=:light_black, italic=true)
-        else
-            print(io, token)
+    first_token = true
+    is_stdout_tty = isa(io, Base.TTY)
+
+    try
+        for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids);
+            max_tokens=max_tokens, stop_tokens=stop_tokens,
+            temperature=temperature, top_p=top_p, top_k=top_k,
+            repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p)
+
+            if first_token
+                if is_stdout_tty
+                    # Clear "thinking" indicator
+                    print(io, "\b\b\b\e[K")
+                end
+                first_token = false
+            end
+
+            token_buffer *= token
+
+            # Print with appropriate color - color content in thinking blocks
+            if is_thinking
+                printstyled(io, token, color=:light_black, italic=true)
+            else
+                print(io, token)
+            end
+            flush(io)
+
+            # Check if think block closed
+            if occursin("</think>", token)
+                is_thinking = false
+            end
         end
-        flush(io)
-        
-        # Check if think block closed
-        if occursin("</think>", token)
-            is_thinking = false
+    catch e
+        if first_token && is_stdout_tty
+            print(io, "\b\b\b\e[K")
+        end
+        if e isa InterruptException
+            printstyled(io, " [Interrupted]", color=:red)
+            token_buffer *= " [Interrupted]"
+        else
+            rethrow(e)
         end
     end
     
@@ -241,12 +265,6 @@ function read_line_chat(term, state)
             else
                 rethrow(e)
             end
-        end
-        
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
-            continue
         end
         
         if c == '\x04'
@@ -436,14 +454,15 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  
  banner = """
  ╔═══════════════════════════════════════════════════╗
- ║ Welcome to Inferno Chat! ║
+ ║             Welcome to Inferno Chat!              ║
  ╠═══════════════════════════════════════════════════╣
- ║ Type your message and press Enter to chat. ║
- ║ Commands: ║
- ║ /clear - Clear conversation history ║
- ║ /system - Change system prompt ║
- ║ /think - Toggle thinking mode ║
- ║ /quit - Exit chat ║
+ ║    Type your message and press Enter to chat.     ║
+ ║                                                   ║
+ ║  Commands:                                        ║
+ ║  /clear  - Clear conversation history             ║
+ ║  /system - Change system prompt                   ║
+ ║  /think  - Toggle thinking mode                   ║
+ ║  /quit   - Exit chat                              ║
  ╚═══════════════════════════════════════════════════╝
  """
  
@@ -491,6 +510,10 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
   # Generate and stream with thinking colors
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
   stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
+  if isa(term, Base.TTY)
+      printstyled(term, "...", color=:light_black)
+      flush(term)
+  end
 response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, thinking_enabled=thinking_mode, kwargs...)
    
    # Print newline after response

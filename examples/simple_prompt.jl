@@ -52,8 +52,17 @@ function main()
 
     # 2. Define your prompt
     println("-"^40)
-    print("Enter prompt: ")
-    prompt = read(stdin, String)
+    print("Enter prompt (Ctrl+D to submit): ")
+    prompt = try
+        read(stdin, String)
+    catch e
+        if e isa InterruptException
+            println("\nAborted.")
+            exit(0)
+        else
+            rethrow(e)
+        end
+    end
 
     if isempty(prompt)
         if eof(stdin)
@@ -67,17 +76,31 @@ function main()
     println("\nGenerating response...")
     println("-"^40)
     print("Response: ")
+    if isa(stdout, Base.TTY)
+        printstyled("...", color=:light_black)
+    end
+    flush(stdout)
 
     # generate_stream yields one string token (decoded) at a time
     stream = Inferno.generate_stream(model, tok, prompt; max_tokens=256, temperature=0.0f0, top_p=1.0f0, top_k=1)
+    first_token = true
     try
         for token in stream
+            if first_token
+                if isa(stdout, Base.TTY)
+                    print("\b\b\b\e[K")
+                end
+                first_token = false
+            end
             print(token)
             flush(stdout)
         end
     catch e
+        if first_token && isa(stdout, Base.TTY)
+            print("\b\b\b\e[K")
+        end
         if e isa InterruptException
-            println("\n\nInterrupted!")
+            printstyled("\n\nInterrupted!", color=:red)
             close(stream)
         else
             rethrow(e)
