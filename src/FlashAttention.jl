@@ -31,27 +31,35 @@ function flash_attention_cpu!(
     m = -Inf32
     l = 0.0f0
     
+    # Use undef to avoid zeroing and pre-allocate outside block loop
+    scores_buf = Vector{Float32}(undef, BLOCK_N)
+
     # Process KV cache in blocks
     for j in 1:BLOCK_N:seq_len
         j_end = min(j + BLOCK_N - 1, seq_len)
         block_len = j_end - j + 1
+        scores = view(scores_buf, 1:block_len)
         
-        scores = zeros(Float32, block_len)
-        
+        # Fuse block maximum calculation into dot product loop
+        m_block = -Inf32
         for n in 1:block_len
             k_j = j + n - 1
             s = 0.0f0
-            @simd for d in 1:head_dim
+            # Use @turbo for faster dot product
+            @turbo for d in 1:head_dim
                 s += Q[d] * cache_k[d, kv_h, k_j]
             end
-            scores[n] = s * scale
+            s *= scale
+            scores[n] = s
+            m_block = max(m_block, s)
         end
         
-        m_new = max(m, maximum(scores))
+        m_new = max(m, m_block)
         scale_factor = exp(m - m_new)
         
         if m_new > m
-            output .*= scale_factor
+            # Re-scale previous accumulation
+            @turbo output .*= scale_factor
             l *= scale_factor
         end
         
@@ -59,7 +67,7 @@ function flash_attention_cpu!(
             k_j = j + n - 1
             p = exp(scores[n] - m_new)
             l += p
-            @simd for d in 1:head_dim
+            @turbo for d in 1:head_dim
                 output[d] += p * cache_v[d, kv_h, k_j]
             end
         end
@@ -68,7 +76,7 @@ function flash_attention_cpu!(
     end
     
     inv_l = 1.0f0 / l
-    @simd for d in 1:head_dim
+    @turbo for d in 1:head_dim
         output[d] *= inv_l
     end
 end
