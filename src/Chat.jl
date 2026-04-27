@@ -105,21 +105,44 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
     presence_penalty = haskey(kwargs, :presence_penalty) ? Float32(kwargs[:presence_penalty]) : 0.0f0
     min_p = haskey(kwargs, :min_p) ? Float32(kwargs[:min_p]) : 0.0f0
     
-    for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids); 
-        max_tokens=max_tokens, stop_tokens=stop_tokens,
-        temperature=temperature, top_p=top_p, top_k=top_k,
-        repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p,
-        show_tps=false, io=stdout)
-        token_buffer *= token
-        token_count += 1
-        
-        # Print with appropriate color - color content in thinking blocks
-        if is_thinking
-            printstyled(io, token, color=:light_black, italic=true)
-        else
-            print(io, token)
+    # Thinking indicator
+    is_stdout_tty = isa(io, Base.TTY)
+    first_token = true
+    if is_stdout_tty
+        printstyled(io, "...", color=:light_black)
+        flush(io)
+    end
+
+    try
+        for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids);
+            max_tokens=max_tokens, stop_tokens=stop_tokens,
+            temperature=temperature, top_p=top_p, top_k=top_k,
+            repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p,
+            show_tps=false, io=io)
+
+            if first_token
+                if is_stdout_tty
+                    print(io, "\b\b\b\e[K") # Clear the "..."
+                end
+                first_token = false
+            end
+
+            token_buffer *= token
+            token_count += 1
+
+            # Print with appropriate color - color content in thinking blocks
+            if is_thinking
+                printstyled(io, token, color=:light_black, italic=true)
+            else
+                print(io, token)
+            end
+            flush(io)
         end
-flush(io)
+    catch e
+        if first_token && is_stdout_tty
+            print(io, "\b\b\b\e[K")
+        end
+        rethrow(e)
     end
     
     # Print TPS if enabled
@@ -444,14 +467,15 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  
  banner = """
  ╔═══════════════════════════════════════════════════╗
- ║ Welcome to Inferno Chat! ║
+ ║             Welcome to Inferno Chat!              ║
  ╠═══════════════════════════════════════════════════╣
- ║ Type your message and press Enter to chat. ║
- ║ Commands: ║
- ║ /clear - Clear conversation history ║
- ║ /system - Change system prompt ║
- ║ /think - Toggle thinking mode ║
- ║ /quit - Exit chat ║
+ ║    Type your message and press Enter to chat.     ║
+ ║                                                   ║
+ ║  Commands:                                        ║
+ ║    /clear  - Clear conversation history           ║
+ ║    /system - Change system prompt                 ║
+ ║    /think  - Toggle thinking mode                  ║
+ ║    /quit   - Exit chat                            ║
  ╚═══════════════════════════════════════════════════╝
  """
  

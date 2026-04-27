@@ -100,6 +100,7 @@ function main()
     end
     
     messages = Pair{String, String}[]
+    is_stdout_tty = isa(stdout, Base.TTY)
     
     # If initial prompt is given, process it first
     if args["prompt"] !== nothing
@@ -108,6 +109,13 @@ function main()
         
         print("\n\e[1;32mAssistant:\e[0m ")
         flush(stdout)
+
+        first_token = true
+        if is_stdout_tty
+            printstyled("...", color=:light_black)
+            flush(stdout)
+        end
+
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
                                               max_tokens=args["max-tokens"], 
                                               temperature=Float32(args["temperature"]), 
@@ -116,6 +124,12 @@ function main()
         full_response = ""
         try
             for token_text in stream
+                if first_token
+                    if is_stdout_tty
+                        print("\b\b\b\e[K")
+                    end
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
@@ -123,6 +137,9 @@ function main()
             println()
         catch e
             if e isa InterruptException
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                end
                 close(stream)
                 println("\n\e[31m[Interrupted]\e[0m")
                 full_response *= " [Interrupted]"
@@ -191,6 +208,12 @@ function main()
         print("\e[1;32mAssistant:\e[0m ")
         flush(stdout)
         
+        first_token = true
+        if is_stdout_tty
+            printstyled("...", color=:light_black)
+            flush(stdout)
+        end
+
         stream = Inferno.Engine.generate_stream(model, tok, prompt_text; 
                                               max_tokens=args["max-tokens"], 
                                               temperature=Float32(args["temperature"]), 
@@ -199,6 +222,12 @@ function main()
         full_response = ""
         try
             for token_text in stream
+                if first_token
+                    if is_stdout_tty
+                        print("\b\b\b\e[K")
+                    end
+                    first_token = false
+                end
                 print(token_text)
                 full_response *= token_text
                 flush(stdout)
@@ -206,6 +235,9 @@ function main()
             println()
         catch e
             if e isa InterruptException
+                if first_token && is_stdout_tty
+                    print("\b\b\b\e[K")
+                end
                 close(stream)
                 println("\n\e[31m[Interrupted]\e[0m")
                 full_response *= " [Interrupted]"
