@@ -1011,38 +1011,30 @@ on a cache-friendly subset of rows.
 Benchmark: 13ms vs 27ms for direct BLAS (2.1x speedup with 4 threads)
 Allocations: 1872 bytes vs 8128 bytes for Threads.@threads
 """
-function lm_head_project!(output::Vector{Float32}, weight::Matrix{Float32}, hidden::Vector{Float32}; nchunks::Int=4)
- vocab_size = size(weight, 1)
- chunk_size = cld(vocab_size, nchunks)
- 
- # Pre-allocate temporary buffers for each chunk
- chunk_outputs = [Vector{Float32}(undef, chunk_size) for _ in 1:nchunks]
- 
- # Use spawn+wait instead of @threads to reduce allocations
- tasks = Vector{Task}(undef, nchunks)
- for chunk in 1:nchunks
- i_start = (chunk - 1) * chunk_size + 1
- i_end = min(chunk * chunk_size, vocab_size)
- actual_size = i_end - i_start + 1
- 
- tasks[chunk] = Threads.@spawn begin
- buf = view(chunk_outputs[chunk], 1:actual_size)
- BLAS.gemv!('N', 1.0f0, view(weight, i_start:i_end, :), hidden, 0.0f0, buf)
- end
- end
- 
- # Wait for all tasks to complete and copy results
- for task in tasks
- wait(task)
- end
- 
- # Copy results back to output
- for chunk in 1:nchunks
- i_start = (chunk - 1) * chunk_size + 1
- i_end = min(chunk * chunk_size, vocab_size)
- actual_size = i_end - i_start + 1
- output[i_start:i_end] .= chunk_outputs[chunk][1:actual_size]
- end
+function lm_head_project!(output::Vector{Float32}, weight::Matrix{Float32}, hidden::Vector{Float32}; nchunks::Int=8)
+    vocab_size = size(weight, 1)
+    chunk_size = cld(vocab_size, nchunks)
+
+    # Use spawn+wait to parallelize without intermediate allocations
+    tasks = Vector{Task}(undef, nchunks)
+    for chunk in 1:nchunks
+        i_start = (chunk - 1) * chunk_size + 1
+        if i_start > vocab_size
+            tasks[chunk] = Threads.@spawn nothing
+            continue
+        end
+        i_end = min(chunk * chunk_size, vocab_size)
+
+        tasks[chunk] = Threads.@spawn begin
+            # Write directly to output slice to avoid copies/allocations
+            buf = view(output, i_start:i_end)
+            BLAS.gemv!('N', 1.0f0, view(weight, i_start:i_end, :), hidden, 0.0f0, buf)
+        end
+    end
+
+    for task in tasks
+        wait(task)
+    end
 end
 
 """
@@ -1051,73 +1043,37 @@ end
  (vocab entry) maps to a Julia column, which IS contiguous in memory.
  Uses C AVX2 BF16 kernel for each contiguous column dot product.
 """
-function lm_head_project!(output::Vector{Float32}, weight::Matrix{BFloat16}, hidden::Vector{Float32}; nchunks::Int=4)
- # weight is (hidden_size, vocab_size), stored transposed
- # output[j] = dot(weight[:,j], hidden) = sum_i weight[i,j] * hidden[i]
- vocab_size = size(weight, 2)
- 
- W_u16 = reinterpret(UInt16, weight)
- 
- # Convert F32 activations to BF16 once
- x_bf16 = Vector{UInt16}(undef, length(hidden))
- ArrowLake.fp32_to_bf16_c!(x_bf16, hidden)
- 
- # Each column weight[:,j] is contiguous (stride 1) in column-major
- # Use bf16_gemv_c! with the transposed view:
- # Call with W_u16' conceptually, but physically we just pass the whole matrix
- # and let the C kernel iterate over columns.
- # Actually simpler: call bf16_gemv_c! on the full weight
- # bf16_gemv_c! computes out[i] = dot(W_u16[i,:], x_bf16) for row i
- # But we want out[j] = dot(W_u16[:,j], x_bf16) for column j
- # So we use the GEMV kernel on the transposed layout.
- # 
- # The simplest correct approach: use the C kernel's bf16_dot_avx2 directly
- # for each column. But we need a Julia wrapper.
- # 
- # Alternative: just use the already-working bf16_gemv_c! on contiguous rows
- # by reinterpreting the weight matrix layout.
- # 
- # Simplest: use bf16_gemv_c! with (vocab_size, hidden_size) row-major view
- # Since weight is (hidden_size, vocab_size) in Julia column-major,
- # reinterpreting as (vocab_size, hidden_size) row-major would require
- # transposing the data.
- #
- # ACTUALLY: the transposed weight already makes columns contiguous.
- # A column view(W_u16, :, j) IS contiguous and IS what we need for dot product.
- # We just need a Julia-callable bf16_dot_avx2 wrapper.
- 
- chunk_size = cld(vocab_size, nchunks)
- chunk_outputs = [Vector{Float32}(undef, chunk_size) for _ in 1:nchunks]
- tasks = Vector{Task}(undef, nchunks)
- for chunk in 1:nchunks
- j_start = (chunk - 1) * chunk_size + 1
- j_end = min(chunk * chunk_size, vocab_size)
- actual_size = j_end - j_start + 1
- 
- tasks[chunk] = Threads.@spawn begin
- # Use the GEMV kernel: treat each column as a "row" for the dot product
- # Pass a view of contiguous columns to the C kernel
- # The C kernel bf16_gemv_avx2(out, A, x, m, n, stride) computes:
- # out[i] = dot(A[i*stride .. i*stride+n-1], x)
- # We want: out[k] = dot(W_u16[:, j_start+k-1], x_bf16)
- # Column j of W_u16 starts at W_u16[1,j] = parent[offset + (j-1)*hidden_size]
- # So we can pass columns as if they were rows with stride=hidden_size
- ArrowLake.bf16_gemv_c_cols!(
- view(chunk_outputs[chunk], 1:actual_size),
- W_u16, x_bf16, j_start, j_end, size(weight, 1))
- end
- end
- 
- for task in tasks
- wait(task)
- end
- 
- for chunk in 1:nchunks
- j_start = (chunk - 1) * chunk_size + 1
- j_end = min(chunk * chunk_size, vocab_size)
- actual_size = j_end - j_start + 1
- output[j_start:j_end] .= chunk_outputs[chunk][1:actual_size]
- end
+function lm_head_project!(output::Vector{Float32}, weight::Matrix{BFloat16}, hidden::Vector{Float32}; nchunks::Int=8)
+    # weight is (hidden_size, vocab_size), stored transposed
+    # output[j] = dot(weight[:,j], hidden) = sum_i weight[i,j] * hidden[i]
+    vocab_size = size(weight, 2)
+
+    W_u16 = reinterpret(UInt16, weight)
+
+    # Convert F32 activations to BF16 once
+    x_bf16 = Vector{UInt16}(undef, length(hidden))
+    ArrowLake.fp32_to_bf16_c!(x_bf16, hidden)
+
+    chunk_size = cld(vocab_size, nchunks)
+    tasks = Vector{Task}(undef, nchunks)
+    for chunk in 1:nchunks
+        j_start = (chunk - 1) * chunk_size + 1
+        if j_start > vocab_size
+            tasks[chunk] = Threads.@spawn nothing
+            continue
+        end
+        j_end = min(chunk * chunk_size, vocab_size)
+
+        tasks[chunk] = Threads.@spawn begin
+            # Write directly to output slice using C batch kernel
+            buf = view(output, j_start:j_end)
+            ArrowLake.bf16_gemv_c_cols!(buf, W_u16, x_bf16, j_start, j_end, size(weight, 1))
+        end
+    end
+
+    for task in tasks
+        wait(task)
+    end
 end
 
 function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top_p::Float32=1.0f0, top_k::Int=0, min_p::Float32=0.0f0)
