@@ -96,6 +96,13 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
     # Track tokens and time for TPS
     t0 = time()
     token_count = 0
+    first_token = true
+    is_stdout_tty = (io === stdout && isa(stdout, Base.TTY))
+
+    if is_stdout_tty
+        printstyled(io, "...", color=:light_black)
+        flush(io)
+    end
     
     # Extract and convert Float32 parameters
     temperature = haskey(kwargs, :temperature) ? Float32(kwargs[:temperature]) : 0.7f0
@@ -105,21 +112,39 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
     presence_penalty = haskey(kwargs, :presence_penalty) ? Float32(kwargs[:presence_penalty]) : 0.0f0
     min_p = haskey(kwargs, :min_p) ? Float32(kwargs[:min_p]) : 0.0f0
     
-    for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids); 
-        max_tokens=max_tokens, stop_tokens=stop_tokens,
-        temperature=temperature, top_p=top_p, top_k=top_k,
-        repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p,
-        show_tps=false, io=stdout)
-        token_buffer *= token
-        token_count += 1
-        
-        # Print with appropriate color - color content in thinking blocks
-        if is_thinking
-            printstyled(io, token, color=:light_black, italic=true)
-        else
-            print(io, token)
+    try
+        for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids);
+            max_tokens=max_tokens, stop_tokens=stop_tokens,
+            temperature=temperature, top_p=top_p, top_k=top_k,
+            repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p,
+            show_tps=false, io=io)
+
+            if first_token
+                if is_stdout_tty
+                    print(io, "\b\b\b\e[K") # Backspace 3 times and clear to end of line
+                end
+                first_token = false
+            end
+
+            token_buffer *= token
+            token_count += 1
+
+            # Print with appropriate color - color content in thinking blocks
+            if is_thinking
+                printstyled(io, token, color=:light_black, italic=true)
+            else
+                print(io, token)
+            end
+            flush(io)
         end
-flush(io)
+    catch e
+        if e isa InterruptException
+            if first_token && is_stdout_tty
+                print(io, "\b\b\b\e[K")
+                first_token = false
+            end
+        end
+        rethrow(e)
     end
     
     # Print TPS if enabled
@@ -249,12 +274,6 @@ function read_line_chat(term, state)
             else
                 rethrow(e)
             end
-        end
-        
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
-            continue
         end
         
         if c == '\x04'
@@ -444,14 +463,14 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  
  banner = """
  ╔═══════════════════════════════════════════════════╗
- ║ Welcome to Inferno Chat! ║
+ ║             Welcome to Inferno Chat!              ║
  ╠═══════════════════════════════════════════════════╣
- ║ Type your message and press Enter to chat. ║
- ║ Commands: ║
- ║ /clear - Clear conversation history ║
- ║ /system - Change system prompt ║
- ║ /think - Toggle thinking mode ║
- ║ /quit - Exit chat ║
+ ║    Type your message and press Enter to chat.     ║
+ ║                     Commands:                     ║
+ ║      /clear  - Clear conversation history         ║
+ ║      /system - Change system prompt               ║
+ ║      /think  - Toggle thinking mode               ║
+ ║      /quit   - Exit chat                          ║
  ╚═══════════════════════════════════════════════════╝
  """
  
