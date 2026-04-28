@@ -1132,11 +1132,16 @@ function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top
  end
     
     # Apply top-k filtering
-    if top_k > 0
-        sorted_indices = sortperm(logits, rev=true)
-        keep_indices = Set(sorted_indices[1:min(top_k, length(logits))])
-        for i in 1:length(logits)
-            if i ∉ keep_indices
+    if top_k > 0 && top_k < length(logits)
+        # Use partialsortperm to reduce complexity from O(N log N) to O(N log k)
+        top_k_indices = partialsortperm(logits, 1:top_k, rev=true)
+        # Create a boolean mask to avoid Set allocations and O(k) membership checks
+        mask = fill(false, length(logits))
+        for idx in top_k_indices
+            mask[idx] = true
+        end
+        for i in eachindex(logits)
+            if !mask[i]
                 logits[i] = -Inf32
             end
         end
@@ -1149,22 +1154,35 @@ function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top
     
     # Apply top-p (nucleus) filtering
     if top_p < 1.0f0
-        sorted_indices = sortperm(probs, rev=true)
+        # Use partialsortperm with a reasonable cutoff (e.g., 1024) to avoid full sort
+        # Most of the mass in LLM output is concentrated in a few tokens.
+        k_max = min(length(probs), 1024)
+        sorted_indices = partialsortperm(probs, 1:k_max, rev=true)
+
         cumsum = 0.0f0
-        keep_indices = Set{Int}()
-        for idx in sorted_indices
-            push!(keep_indices, idx)
+        cutoff = k_max
+        for i in 1:k_max
+            idx = sorted_indices[i]
             cumsum += probs[idx]
             if cumsum >= top_p
+                cutoff = i
                 break
             end
         end
-        # Zero out probabilities for tokens not in top-p
-        for i in 1:length(probs)
-            if i ∉ keep_indices
+
+        # Keep only tokens in top-p, zero out everything else
+        # Use a temporary mask to avoid another sort or Set
+        mask = fill(false, length(probs))
+        for i in 1:cutoff
+            mask[sorted_indices[i]] = true
+        end
+
+        for i in eachindex(probs)
+            if !mask[i]
                 probs[i] = 0.0f0
             end
         end
+
         # Renormalize
         total = sum(probs)
         if total > 0.0f0
