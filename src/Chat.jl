@@ -444,14 +444,15 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  
  banner = """
  ╔═══════════════════════════════════════════════════╗
- ║ Welcome to Inferno Chat! ║
+ ║             Welcome to Inferno Chat!              ║
  ╠═══════════════════════════════════════════════════╣
- ║ Type your message and press Enter to chat. ║
- ║ Commands: ║
- ║ /clear - Clear conversation history ║
- ║ /system - Change system prompt ║
- ║ /think - Toggle thinking mode ║
- ║ /quit - Exit chat ║
+ ║    Type your message and press Enter to chat.     ║
+ ║                                                   ║
+ ║  Commands:                                        ║
+ ║   /clear  - Clear conversation history            ║
+ ║   /system - Change system prompt                  ║
+ ║   /think  - Toggle thinking mode                  ║
+ ║   /quit   - Exit chat                             ║
  ╚═══════════════════════════════════════════════════╝
  """
  
@@ -497,6 +498,7 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
   raw!(term, false)
   
   # Generate and stream with thinking colors
+  printstyled(term, "Assistant> ", color=:green, bold=true)
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
   stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
 response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, thinking_enabled=thinking_mode, show_tps=true, kwargs...)
