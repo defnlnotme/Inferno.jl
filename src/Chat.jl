@@ -97,6 +97,13 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
     t0 = time()
     token_count = 0
     
+    # Print thinking indicator
+    first_token = true
+    if isa(io, Base.TTY) || (hasfield(typeof(io), :io) && isa(io.io, Base.TTY))
+        printstyled(io, "...", color=:light_black)
+        flush(io)
+    end
+
     # Extract and convert Float32 parameters
     temperature = haskey(kwargs, :temperature) ? Float32(kwargs[:temperature]) : 0.7f0
     top_p = haskey(kwargs, :top_p) ? Float32(kwargs[:top_p]) : 0.95f0
@@ -105,21 +112,37 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
     presence_penalty = haskey(kwargs, :presence_penalty) ? Float32(kwargs[:presence_penalty]) : 0.0f0
     min_p = haskey(kwargs, :min_p) ? Float32(kwargs[:min_p]) : 0.0f0
     
-    for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids); 
-        max_tokens=max_tokens, stop_tokens=stop_tokens,
-        temperature=temperature, top_p=top_p, top_k=top_k,
-        repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p,
-        show_tps=false, io=stdout)
-        token_buffer *= token
-        token_count += 1
-        
-        # Print with appropriate color - color content in thinking blocks
-        if is_thinking
-            printstyled(io, token, color=:light_black, italic=true)
-        else
-            print(io, token)
+    try
+        for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids);
+            max_tokens=max_tokens, stop_tokens=stop_tokens,
+            temperature=temperature, top_p=top_p, top_k=top_k,
+            repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p,
+            show_tps=false, io=stdout)
+
+            # Clear thinking indicator on first token
+            if first_token
+                if isa(io, Base.TTY) || (hasfield(typeof(io), :io) && isa(io.io, Base.TTY))
+                    print(io, "\b\b\b\e[K")
+                end
+                first_token = false
+            end
+
+            token_buffer *= token
+            token_count += 1
+
+            # Print with appropriate color - color content in thinking blocks
+            if is_thinking
+                printstyled(io, token, color=:light_black, italic=true)
+            else
+                print(io, token)
+            end
+            flush(io)
         end
-flush(io)
+    catch e
+        if first_token && (isa(io, Base.TTY) || (hasfield(typeof(io), :io) && isa(io.io, Base.TTY)))
+            print(io, "\b\b\b\e[K")
+        end
+        rethrow(e)
     end
     
     # Print TPS if enabled
@@ -225,8 +248,11 @@ function clear_line(term, prompt)
 end
 
 function refresh_line(term, prompt, buffer, cursor)
-    print(term, "\r" * " "^80 * "\r" * prompt * String(buffer) * "\r")
-    print(term, "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term, prompt, color=:cyan, bold=true)
+    print(term, String(buffer))
+    print(term, "\r")
+    printstyled(term, prompt, color=:cyan, bold=true)
     for i in 1:cursor-1
         print(term, buffer[i])
     end
@@ -251,11 +277,6 @@ function read_line_chat(term, state)
             end
         end
         
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
-            continue
-        end
         
         if c == '\x04'
             isempty(buffer) && return "EXIT_CHAT"
@@ -266,6 +287,9 @@ function read_line_chat(term, state)
         elseif c == '\x03'
             println(term)
             return ""
+        elseif c == '\x0c'  # Ctrl+L = clear screen
+            print(term, "\e[H\e[2J")
+            refresh_line(term, "You> ", buffer, cursor)
         elseif c == '\x10'  # Ctrl+P = previous history
             if !isempty(state.history)
                 if state.hist_pos < length(state.history) - 1
@@ -365,6 +389,22 @@ function read_line_chat(term, state)
                         cursor -= 1
                         print(term, "\b")
                     end
+                elseif seq == 'H' # Home
+                    cursor = 1
+                    refresh_line(term, "You> ", buffer, cursor)
+                elseif seq == 'F' # End
+                    cursor = length(buffer) + 1
+                    refresh_line(term, "You> ", buffer, cursor)
+                elseif seq == '1' # Possible Home (\e[1~)
+                    if read(term, Char) == '~'
+                        cursor = 1
+                        refresh_line(term, "You> ", buffer, cursor)
+                    end
+                elseif seq == '4' # Possible End (\e[4~)
+                    if read(term, Char) == '~'
+                        cursor = length(buffer) + 1
+                        refresh_line(term, "You> ", buffer, cursor)
+                    end
                 end
             elseif next == '\x7f'
                 new_cursor = backward_word(cursor, buffer)
@@ -392,10 +432,8 @@ function read_line_chat(term, state)
             refresh_line(term, "You> ", buffer, cursor)
             continue
         elseif c == '\x05'
-            for i in cursor:length(buffer)
-                print(term, buffer[i])
-            end
-            cursor = min(length(buffer) + 1, cursor)
+            cursor = length(buffer) + 1
+            refresh_line(term, "You> ", buffer, cursor)
             continue
         elseif c == '\x02'
             if cursor > 1
@@ -443,17 +481,18 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  thinking_mode = enable_thinking
  
  banner = """
- ╔═══════════════════════════════════════════════════╗
- ║ Welcome to Inferno Chat! ║
- ╠═══════════════════════════════════════════════════╣
- ║ Type your message and press Enter to chat. ║
- ║ Commands: ║
- ║ /clear - Clear conversation history ║
- ║ /system - Change system prompt ║
- ║ /think - Toggle thinking mode ║
- ║ /quit - Exit chat ║
- ╚═══════════════════════════════════════════════════╝
- """
+╔═══════════════════════════════════════════════════╗
+║             Welcome to Inferno Chat!              ║
+╠═══════════════════════════════════════════════════╣
+║    Type your message and press Enter to chat.     ║
+║                                                   ║
+║  Commands:                                        ║
+║    /clear  - Clear conversation history           ║
+║    /system - Change system prompt                 ║
+║    /think  - Toggle thinking mode                 ║
+║    /quit   - Exit chat                            ║
+╚═══════════════════════════════════════════════════╝
+"""
  
  printstyled(banner, color=:cyan, bold=true)
  printstyled("Thinking: $(thinking_mode ? "ON" : "OFF")\n", color=:yellow)
@@ -499,6 +538,7 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
   # Generate and stream with thinking colors
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
   stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
+  printstyled(term, "Assistant> ", color=:green, bold=true)
 response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, thinking_enabled=thinking_mode, show_tps=true, kwargs...)
    
    # Print newline after response
