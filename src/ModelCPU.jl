@@ -1011,37 +1011,20 @@ on a cache-friendly subset of rows.
 Benchmark: 13ms vs 27ms for direct BLAS (2.1x speedup with 4 threads)
 Allocations: 1872 bytes vs 8128 bytes for Threads.@threads
 """
-function lm_head_project!(output::Vector{Float32}, weight::Matrix{Float32}, hidden::Vector{Float32}; nchunks::Int=4)
+function lm_head_project!(output::Vector{Float32}, weight::Matrix{Float32}, hidden::Vector{Float32}; nchunks::Int=8)
  vocab_size = size(weight, 1)
  chunk_size = cld(vocab_size, nchunks)
  
- # Pre-allocate temporary buffers for each chunk
- chunk_outputs = [Vector{Float32}(undef, chunk_size) for _ in 1:nchunks]
- 
- # Use spawn+wait instead of @threads to reduce allocations
- tasks = Vector{Task}(undef, nchunks)
- for chunk in 1:nchunks
+ # Use @sync and @spawn to write directly to output views, eliminating intermediate allocations (~2.4MB)
+ @sync for chunk in 1:nchunks
  i_start = (chunk - 1) * chunk_size + 1
+ if i_start > vocab_size break end
  i_end = min(chunk * chunk_size, vocab_size)
- actual_size = i_end - i_start + 1
  
- tasks[chunk] = Threads.@spawn begin
- buf = view(chunk_outputs[chunk], 1:actual_size)
- BLAS.gemv!('N', 1.0f0, view(weight, i_start:i_end, :), hidden, 0.0f0, buf)
+ Threads.@spawn begin
+ out_view = view(output, i_start:i_end)
+ BLAS.gemv!('N', 1.0f0, view(weight, i_start:i_end, :), hidden, 0.0f0, out_view)
  end
- end
- 
- # Wait for all tasks to complete and copy results
- for task in tasks
- wait(task)
- end
- 
- # Copy results back to output
- for chunk in 1:nchunks
- i_start = (chunk - 1) * chunk_size + 1
- i_end = min(chunk * chunk_size, vocab_size)
- actual_size = i_end - i_start + 1
- output[i_start:i_end] .= chunk_outputs[chunk][1:actual_size]
  end
 end
 
@@ -1051,7 +1034,7 @@ end
  (vocab entry) maps to a Julia column, which IS contiguous in memory.
  Uses C AVX2 BF16 kernel for each contiguous column dot product.
 """
-function lm_head_project!(output::Vector{Float32}, weight::Matrix{BFloat16}, hidden::Vector{Float32}; nchunks::Int=4)
+function lm_head_project!(output::Vector{Float32}, weight::Matrix{BFloat16}, hidden::Vector{Float32}; nchunks::Int=8)
  # weight is (hidden_size, vocab_size), stored transposed
  # output[j] = dot(weight[:,j], hidden) = sum_i weight[i,j] * hidden[i]
  vocab_size = size(weight, 2)
@@ -1062,141 +1045,119 @@ function lm_head_project!(output::Vector{Float32}, weight::Matrix{BFloat16}, hid
  x_bf16 = Vector{UInt16}(undef, length(hidden))
  ArrowLake.fp32_to_bf16_c!(x_bf16, hidden)
  
- # Each column weight[:,j] is contiguous (stride 1) in column-major
- # Use bf16_gemv_c! with the transposed view:
- # Call with W_u16' conceptually, but physically we just pass the whole matrix
- # and let the C kernel iterate over columns.
- # Actually simpler: call bf16_gemv_c! on the full weight
- # bf16_gemv_c! computes out[i] = dot(W_u16[i,:], x_bf16) for row i
- # But we want out[j] = dot(W_u16[:,j], x_bf16) for column j
- # So we use the GEMV kernel on the transposed layout.
- # 
- # The simplest correct approach: use the C kernel's bf16_dot_avx2 directly
- # for each column. But we need a Julia wrapper.
- # 
- # Alternative: just use the already-working bf16_gemv_c! on contiguous rows
- # by reinterpreting the weight matrix layout.
- # 
- # Simplest: use bf16_gemv_c! with (vocab_size, hidden_size) row-major view
- # Since weight is (hidden_size, vocab_size) in Julia column-major,
- # reinterpreting as (vocab_size, hidden_size) row-major would require
- # transposing the data.
- #
- # ACTUALLY: the transposed weight already makes columns contiguous.
- # A column view(W_u16, :, j) IS contiguous and IS what we need for dot product.
- # We just need a Julia-callable bf16_dot_avx2 wrapper.
- 
  chunk_size = cld(vocab_size, nchunks)
- chunk_outputs = [Vector{Float32}(undef, chunk_size) for _ in 1:nchunks]
- tasks = Vector{Task}(undef, nchunks)
- for chunk in 1:nchunks
+
+ # Use @sync and @spawn to write directly to output views, eliminating intermediate allocations (~2.4MB)
+ @sync for chunk in 1:nchunks
  j_start = (chunk - 1) * chunk_size + 1
+ if j_start > vocab_size break end
  j_end = min(chunk * chunk_size, vocab_size)
- actual_size = j_end - j_start + 1
  
- tasks[chunk] = Threads.@spawn begin
- # Use the GEMV kernel: treat each column as a "row" for the dot product
- # Pass a view of contiguous columns to the C kernel
- # The C kernel bf16_gemv_avx2(out, A, x, m, n, stride) computes:
- # out[i] = dot(A[i*stride .. i*stride+n-1], x)
- # We want: out[k] = dot(W_u16[:, j_start+k-1], x_bf16)
- # Column j of W_u16 starts at W_u16[1,j] = parent[offset + (j-1)*hidden_size]
- # So we can pass columns as if they were rows with stride=hidden_size
- ArrowLake.bf16_gemv_c_cols!(
- view(chunk_outputs[chunk], 1:actual_size),
- W_u16, x_bf16, j_start, j_end, size(weight, 1))
+ Threads.@spawn begin
+ out_view = view(output, j_start:j_end)
+ # The C kernel bf16_gemv_cols_avx2 supports writing directly to views
+ ArrowLake.bf16_gemv_c_cols!(out_view, W_u16, x_bf16, j_start, j_end, size(weight, 1))
  end
- end
- 
- for task in tasks
- wait(task)
- end
- 
- for chunk in 1:nchunks
- j_start = (chunk - 1) * chunk_size + 1
- j_end = min(chunk * chunk_size, vocab_size)
- actual_size = j_end - j_start + 1
- output[j_start:j_end] .= chunk_outputs[chunk][1:actual_size]
  end
 end
 
 function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top_p::Float32=1.0f0, top_k::Int=0, min_p::Float32=0.0f0)
- # Handle temperature=0 (greedy/argmax sampling)
- if temperature == 0.0f0
- return argmax(logits)
- end
- 
- # Apply temperature
- if temperature != 1.0f0
- logits = logits ./ temperature
- end
+    # Handle temperature=0 (greedy/argmax sampling)
+    if temperature == 0.0f0
+        return argmax(logits)
+    end
+
+    # Apply temperature
+    # Work on a copy to avoid mutating input logits
+    p = copy(logits)
+    if temperature != 1.0f0
+        @. p /= temperature
+    end
     
     # Apply top-k filtering
-    if top_k > 0
-        sorted_indices = sortperm(logits, rev=true)
-        keep_indices = Set(sorted_indices[1:min(top_k, length(logits))])
-        for i in 1:length(logits)
-            if i ∉ keep_indices
-                logits[i] = -Inf32
+    if top_k > 0 && top_k < length(p)
+        k = min(top_k, length(p))
+        # O(N log k) instead of O(N log N)
+        top_indices = partialsortperm(p, 1:k, rev=true)
+        # Use boolean mask to avoid Set allocations/hashing
+        mask = fill(false, length(p))
+        @inbounds for idx in top_indices
+            mask[idx] = true
+        end
+        @inbounds for i in eachindex(p)
+            if !mask[i]
+                p[i] = -Inf32
             end
         end
     end
     
-    # Apply softmax
-    max_logit = maximum(logits)
-    exp_logits = exp.(logits .- max_logit)
-    probs = exp_logits ./ sum(exp_logits)
+    # Apply softmax (in-place)
+    max_logit = maximum(p)
+    @. p = exp(p - max_logit)
+    sum_p = sum(p)
+    @. p /= sum_p
     
     # Apply top-p (nucleus) filtering
     if top_p < 1.0f0
-        sorted_indices = sortperm(probs, rev=true)
+        # Cap Top-P sorting at 1024 for performance (nucleus is usually in top 1000)
+        p_k = min(1024, length(p))
+        sorted_indices = partialsortperm(p, 1:p_k, rev=true)
+
         cumsum = 0.0f0
-        keep_indices = Set{Int}()
-        for idx in sorted_indices
-            push!(keep_indices, idx)
-            cumsum += probs[idx]
+        last_idx = p_k
+        @inbounds for i in 1:p_k
+            idx = sorted_indices[i]
+            cumsum += p[idx]
             if cumsum >= top_p
+                last_idx = i
                 break
             end
         end
+
         # Zero out probabilities for tokens not in top-p
-        for i in 1:length(probs)
-            if i ∉ keep_indices
-                probs[i] = 0.0f0
+        mask = fill(false, length(p))
+        @inbounds for i in 1:last_idx
+            mask[sorted_indices[i]] = true
+        end
+
+        @inbounds for i in eachindex(p)
+            if !mask[i]
+                p[i] = 0.0f0
             end
         end
+
         # Renormalize
-        total = sum(probs)
+        total = sum(p)
         if total > 0.0f0
-            probs ./= total
+            @. p /= total
         end
     end
     
     # Apply minimum probability threshold (relative to max probability)
     if min_p > 0.0f0
-        max_prob = maximum(probs)
+        max_prob = maximum(p)
         threshold = max_prob * min_p
-        for i in 1:length(probs)
-            if probs[i] < threshold
-                probs[i] = 0.0f0
+        @inbounds for i in eachindex(p)
+            if p[i] < threshold
+                p[i] = 0.0f0
             end
         end
-        total = sum(probs)
+        total = sum(p)
         if total > 0.0f0
-            probs ./= total
+            @. p /= total
         end
     end
     
     # Sample from distribution
     r = rand(Float32)
     cumsum = 0.0f0
-    for i in 1:length(probs)
-        cumsum += probs[i]
+    @inbounds for i in eachindex(p)
+        cumsum += p[i]
         if r <= cumsum
             return i
         end
     end
-    return length(probs)
+    return length(p)
 end
 
 function apply_presence_penalty!(logits::Vector{Float32}, token_counts::Dict{Int,Int}, penalty::Float32)
