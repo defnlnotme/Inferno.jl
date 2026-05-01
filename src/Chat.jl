@@ -251,12 +251,6 @@ function read_line_chat(term, state)
             end
         end
         
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
-            continue
-        end
-        
         if c == '\x04'
             isempty(buffer) && return "EXIT_CHAT"
             println(term)
@@ -266,6 +260,10 @@ function read_line_chat(term, state)
         elseif c == '\x03'
             println(term)
             return ""
+        elseif c == '\x0c' # Ctrl+L
+            print(term, "\e[H\e[2J")
+            refresh_line(term, "You> ", buffer, cursor)
+            continue
         elseif c == '\x10'  # Ctrl+P = previous history
             if !isempty(state.history)
                 if state.hist_pos < length(state.history) - 1
@@ -364,6 +362,27 @@ function read_line_chat(term, state)
                     if cursor > 1
                         cursor -= 1
                         print(term, "\b")
+                    end
+                elseif seq == 'H' # Home
+                    cursor = 1
+                    refresh_line(term, "You> ", buffer, cursor)
+                elseif seq == 'F' # End
+                    cursor = length(buffer) + 1
+                    refresh_line(term, "You> ", buffer, cursor)
+                elseif seq == '1' || seq == '4' || seq == '3'
+                    # Handle \e[1~ (Home), \e[4~ (End), \e[3~ (Delete)
+                    trailer = read(term, Char)
+                    if trailer == '~'
+                        if seq == '1' # Home
+                            cursor = 1
+                        elseif seq == '4' # End
+                            cursor = length(buffer) + 1
+                        elseif seq == '3' # Delete
+                            if cursor <= length(buffer)
+                                deleteat!(buffer, cursor)
+                            end
+                        end
+                        refresh_line(term, "You> ", buffer, cursor)
                     end
                 end
             elseif next == '\x7f'
