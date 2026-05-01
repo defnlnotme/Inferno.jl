@@ -137,54 +137,51 @@ end
 
 
 # --- GPU Softmax Kernel ---
-# Stable softmax on a 1D slice of length `len` stored in `scores[1:len, 1]`
-# Writes probabilities back into `probs[1:len, 1]`
-# Uses Float32 for exp() to prevent overflow
+# Stable softmax on GPU using reductions to avoid CPU round-trips.
+# Uses Float32 for accumulation and exp() for numerical stability.
 function softmax_kernel!(probs, scores, len, scale)
- # Copy to CPU for computation (avoids scalar indexing on GPU)
- probs_cpu = Array(probs)
- scores_cpu = Array(scores)
+    T = eltype(probs)
+    # Ensure scores and probs are treated as 2D for broadcasting with reduced mx/s
+    sc_view = view(reshape(scores, :, size(scores, 2)), 1:len, 1)
+    pr_view = view(reshape(probs, :, size(probs, 2)), 1:len, 1)
 
- # Compute max in Float32 for stability
- mx = Float32(maximum(scores_cpu[1:len, 1]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:len
- v = exp(Float32(scores_cpu[i, 1] * scale) - mx)
- probs_cpu[i, 1] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:len
- probs_cpu[i, 1] *= inv_s
- end
+    # 1. Compute max for numerical stability.
+    # Use Float32 for the comparison to match precision of exp().
+    # mx is a (1, 1) array on device.
+    mx = maximum(v -> Float32(v) * Float32(scale), sc_view, dims=1)
 
- # Copy back to GPU
- copyto!(probs, Float16.(probs_cpu))
- return nothing
+    # 2. Compute exp(x - mx)
+    @. pr_view = T(exp(Float32(sc_view) * Float32(scale) - mx))
+
+    # 3. Sum of exponents for normalization
+    # s is a (1, 1) array on device.
+    s = mapreduce(v -> Float32(v), +, pr_view, dims=1)
+
+    # 4. Normalize
+    @. pr_view /= T(s)
+
+    return nothing
 end
 
 function batched_softmax_kernel!(probs, scores, total_len, n_heads, scale)
- # Copy to CPU for computation (avoids scalar indexing on GPU)
- probs_cpu = Array(probs)
- scores_cpu = Array(scores)
+    T = eltype(probs)
+    sc_view = view(scores, 1:total_len, 1:n_heads)
+    pr_view = view(probs, 1:total_len, 1:n_heads)
 
- for h in 1:n_heads
- mx = Float32(maximum(scores_cpu[1:total_len, h]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:total_len
- v = exp(Float32(scores_cpu[i, h] * scale) - mx)
- probs_cpu[i, h] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:total_len
- probs_cpu[i, h] *= inv_s
- end
- end
+    # 1. Compute max per head (dims=1 means reduction over first dimension)
+    # Result mx is (1, n_heads) on device.
+    mx = maximum(v -> Float32(v) * Float32(scale), sc_view, dims=1)
 
- # Copy back to GPU
- copyto!(probs, Float16.(probs_cpu))
- return nothing
+    # 2. Compute exp(x - mx)
+    @. pr_view = T(exp(Float32(sc_view) * Float32(scale) - mx))
+
+    # 3. Sum per head (1, n_heads)
+    s = mapreduce(v -> Float32(v), +, pr_view, dims=1)
+
+    # 4. Normalize
+    @. pr_view /= T(s)
+
+    return nothing
 end
 
 # Numerically stable sigmoid using Float32 intermediate computation
@@ -255,13 +252,14 @@ end
 struct RotaryEmbedding
  dim::Int
  base::Float32  # Use Float32 for base to prevent precision loss
- inv_freq::Vector{Float32}  # Use Float32 for more precision
+ inv_freq::oneVector{Float32}  # Use Float32 for more precision, stored on GPU
  rotary_dim::Int  # Number of dimensions that get rotary (partial rotary support)
 end
 
 function RotaryEmbedding(dim::Int; base=Float32(10000000.0), rotary_dim::Int=dim)
  # Only compute inv_freq for the rotary dimensions
- inv_freq = Float32(1.0) ./ (Float32(base) .^ (Float32.(range(0, stop=rotary_dim - 1, step=2)) ./ Float32(rotary_dim)))
+ inv_freq_cpu = Float32(1.0) ./ (Float32(base) .^ (Float32.(range(0, stop=rotary_dim - 1, step=2)) ./ Float32(rotary_dim)))
+ inv_freq = oneArray(inv_freq_cpu)
  return RotaryEmbedding(dim, Float32(base), inv_freq, rotary_dim)
 end
 
@@ -269,32 +267,29 @@ function rope_kernel!(x, inv_freq, pos, d, h, seq, d_rope)
  T = eltype(x)
  half_d = d_rope ÷ 2
 
- # Copy to CPU, compute, copy back (avoids scalar indexing on GPU)
- x_cpu = Array(x)
- inv_freq_cpu = Array(inv_freq)
-
  for t in 1:seq
- for head in 1:h
- for i in 1:half_d
- # Half-split pairing: first half paired with second half
- idx1 = i
- idx2 = i + half_d
-
  # Use Float32 for position computation to prevent precision loss
  p = Float32(pos + t - 1)
- freq = inv_freq_cpu[i] * p  # inv_freq is Float32
- sin_val, cos_val = sincos(freq)
+ # Compute freqs for this position (GPU vector)
+ # inv_freq is (half_d,), freqs becomes (half_d, 1) to broadcast over heads
+ freqs = reshape(inv_freq .* p, :, 1)
 
- x1 = x_cpu[idx1, head, t]
- x2 = x_cpu[idx2, head, t]
+ cos_vals = cos.(freqs)
+ sin_vals = sin.(freqs)
 
- x_cpu[idx1, head, t] = x1 * cos_val - x2 * sin_val
- x_cpu[idx2, head, t] = x1 * sin_val + x2 * cos_val
- end
- end
+ # Views into x for this t
+ x1 = view(x, 1:half_d, :, t)
+ x2 = view(x, half_d+1:d_rope, :, t)
+
+ # Update x1 and x2 using fused broadcasting.
+ # RHS expressions are evaluated into temporary arrays to ensure correctness.
+ v1 = @. T(Float32(x1) * cos_vals - Float32(x2) * sin_vals)
+ v2 = @. T(Float32(x1) * sin_vals + Float32(x2) * cos_vals)
+
+ x1 .= v1
+ x2 .= v2
  end
 
- copyto!(x, x_cpu)
  return x
 end
 
@@ -438,34 +433,29 @@ function MLP(index::Int, gate_weight, up_weight, down_weight)
 end
 
 function (m::MLP)(x::oneMatrix{Float16}, cache::KVCache)
- # GPU path - use numerically stable SiLU with Float32 intermediate
- mul!(cache.mlp_gate, m.gate_weight, x)
- mul!(cache.mlp_up, m.up_weight, x)
- 
- # Numerically stable SiLU: gate * sigmoid(gate)
- # Use Float32 for exp() to avoid overflow/underflow
- gate_cpu = Array(cache.mlp_gate)
- up_cpu = Array(cache.mlp_up)
- 
- # Apply SiLU in Float32 for numerical stability
- @. gate_cpu = gate_cpu * (Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_cpu))))
- gate_cpu .*= up_cpu
- 
- # Copy back to GPU
- copyto!(cache.mlp_gate, Float16.(gate_cpu))
- mul!(cache.branch_out, m.down_weight, cache.mlp_gate)
+    # GPU path - use numerically stable SiLU with Float32 intermediate
+    mul!(cache.mlp_gate, m.gate_weight, x)
+    mul!(cache.mlp_up, m.up_weight, x)
 
- return cache.branch_out
+    # Numerically stable SiLU on GPU: gate * sigmoid(gate) * up
+    # Use Float32 for exp() to avoid overflow/underflow in Float16.
+    # Result is written back to mlp_gate buffer before down-projection.
+    @. cache.mlp_gate = Float16(Float32(cache.mlp_gate) * (1.0f0 / (1.0f0 + exp(-Float32(cache.mlp_gate)))) * Float32(cache.mlp_up))
+
+    mul!(cache.branch_out, m.down_weight, cache.mlp_gate)
+
+    return cache.branch_out
 end
 
 function (m::MLP)(x::oneMatrix{Float16})
- # Numerically stable SiLU using Float32 intermediate
- g = Array(mat_mul(m.gate_weight, x))
- u = Array(mat_mul(m.up_weight, x))
- # SiLU: g * sigmoid(g) in Float32
- @. g = g * (Float32(1.0) / (Float32(1.0) + exp(-Float32(g))))
- g .*= u
- return mat_mul(m.down_weight, oneArray(Float16.(g)))
+    # Numerically stable SiLU using Float32 intermediate on GPU
+    g = mat_mul(m.gate_weight, x)
+    u = mat_mul(m.up_weight, x)
+
+    # SiLU: g * sigmoid(g) * u in Float32
+    @. g = Float16(Float32(g) * (1.0f0 / (1.0f0 + exp(-Float32(g)))) * Float32(u))
+
+    return mat_mul(m.down_weight, g)
 end
 
 function reset_states!(m::MLP)
@@ -490,74 +480,77 @@ function MoE(index::Int, gate, experts_gate, experts_up, experts_down, num_exper
 end
 
 function (m::MoE)(x::oneMatrix{Float16}, cache::KVCache)
- # x: (hidden_size, seq_len)
- hidden_size, seq_len = size(x)
+    # x: (hidden_size, seq_len)
+    hidden_size, seq_len = size(x)
 
- # GPU path
- gate_logits = mat_mul(m.gate, x)
- gate_logits_cpu = collect(gate_logits)
+    # GPU path - gating still requires some host logic for top-k
+    gate_logits = mat_mul(m.gate, x)
+    gate_logits_cpu = collect(gate_logits)
 
- output = cache.branch_out
- fill!(output, Float16(0.0))
+    output = cache.branch_out
+    fill!(output, Float16(0.0))
 
- for t in 1:seq_len
- logits = gate_logits_cpu[:, t]
- exp_logits = exp.(logits .- maximum(logits))
- probs = exp_logits ./ sum(exp_logits)
+    for t in 1:seq_len
+        logits = gate_logits_cpu[:, t]
+        exp_logits = exp.(logits .- maximum(logits))
+        probs = exp_logits ./ sum(exp_logits)
 
- top_k_indices = sortperm(probs, rev=true)[1:m.num_experts_per_tok]
- top_k_probs = probs[top_k_indices]
- top_k_probs ./= sum(top_k_probs)
+        top_k_indices = sortperm(probs, rev=true)[1:m.num_experts_per_tok]
+        top_k_probs = probs[top_k_indices]
+        top_k_probs ./= sum(top_k_probs)
 
- xt = @view x[:, t:t]
+        xt = @view x[:, t:t]
 
- for (i, expert_idx) in enumerate(top_k_indices)
- g = Array(mat_mul(m.experts_gate[expert_idx], xt))
- u = Array(mat_mul(m.experts_up[expert_idx], xt))
- # Numerically stable SiLU in Float32
- @. g = g * (Float32(1.0) / (Float32(1.0) + exp(-Float32(g))))
- g .*= u
- res = mat_mul(m.experts_down[expert_idx], oneArray(Float16.(g)))
+        for (i, expert_idx) in enumerate(top_k_indices)
+            g = mat_mul(m.experts_gate[expert_idx], xt)
+            u = mat_mul(m.experts_up[expert_idx], xt)
 
- prob = top_k_probs[i]
- out_view = @view output[:, t:t]
- @. out_view += prob * res
- end
- end
+            # Numerically stable SiLU on GPU
+            @. g = Float16(Float32(g) * (1.0f0 / (1.0f0 + exp(-Float32(g)))) * Float32(u))
 
- return output
+            res = mat_mul(m.experts_down[expert_idx], g)
+
+            prob = Float16(top_k_probs[i])
+            out_view = @view output[:, t:t]
+            @. out_view += prob * res
+        end
+    end
+
+    return output
 end
 
 function (m::MoE)(x::oneMatrix{Float16})
- # Numerically stable MoE using Float32 intermediate for SiLU
- hidden_size, seq_len = size(x)
- gate_logits = mat_mul(m.gate, x)
- gate_logits_cpu = collect(gate_logits)
- output = oneArray(zeros(Float16, hidden_size, seq_len))
+    # Numerically stable MoE using Float32 intermediate for SiLU on GPU
+    hidden_size, seq_len = size(x)
+    gate_logits = mat_mul(m.gate, x)
+    gate_logits_cpu = collect(gate_logits)
+    output = oneArray(zeros(Float16, hidden_size, seq_len))
 
- for t in 1:seq_len
- logits = gate_logits_cpu[:, t]
- exp_logits = exp.(logits .- maximum(logits))
- probs = exp_logits ./ sum(exp_logits)
- top_k_indices = sortperm(probs, rev=true)[1:m.num_experts_per_tok]
- top_k_probs = probs[top_k_indices]
- top_k_probs ./= sum(top_k_probs)
+    for t in 1:seq_len
+        logits = gate_logits_cpu[:, t]
+        exp_logits = exp.(logits .- maximum(logits))
+        probs = exp_logits ./ sum(exp_logits)
+        top_k_indices = sortperm(probs, rev=true)[1:m.num_experts_per_tok]
+        top_k_probs = probs[top_k_indices]
+        top_k_probs ./= sum(top_k_probs)
 
- xt = @view x[:, t:t]
- for (i, expert_idx) in enumerate(top_k_indices)
- g = Array(mat_mul(m.experts_gate[expert_idx], xt))
- u = Array(mat_mul(m.experts_up[expert_idx], xt))
- # Numerically stable SiLU in Float32
- @. g = g * (Float32(1.0) / (Float32(1.0) + exp(-Float32(g))))
- g .*= u
- res = mat_mul(m.experts_down[expert_idx], oneArray(Float16.(g)))
- prob = top_k_probs[i]
- out_view = @view output[:, t:t]
- @. out_view += prob * res
- end
- end
+        xt = @view x[:, t:t]
+        for (i, expert_idx) in enumerate(top_k_indices)
+            g = mat_mul(m.experts_gate[expert_idx], xt)
+            u = mat_mul(m.experts_up[expert_idx], xt)
 
- return output
+            # Numerically stable SiLU on GPU
+            @. g = Float16(Float32(g) * (1.0f0 / (1.0f0 + exp(-Float32(g)))) * Float32(u))
+
+            res = mat_mul(m.experts_down[expert_idx], g)
+
+            prob = Float16(top_k_probs[i])
+            out_view = @view output[:, t:t]
+            @. out_view += prob * res
+        end
+    end
+
+    return output
 end
 
 function reset_states!(m::MoE)
@@ -661,11 +654,10 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
         q_rope = rope(q_2d, pos)
         k_rope = rope(k_2d, pos)
 
- # 4. Gate (applied AFTER attention, not to Q)
- gate_raw_cpu = Array(gate_raw)
- @. gate_raw_cpu = Float32(1.0) / (Float32(1.0) + exp(-Float32(gate_raw_cpu))) # sigmoid
- gate_sigmoid = oneArray(Float16.(gate_raw_cpu))
- q_gated = q_rope
+        # 4. Gate (applied AFTER attention, not to Q)
+        # Numerically stable sigmoid on GPU
+        gate_sigmoid = @. T(1.0f0 / (1.0f0 + exp(-Float32(gate_raw))))
+        q_gated = q_rope
 
     elseif m.architecture == :phi3
         # Packed QKV
@@ -733,53 +725,54 @@ function (m::FullAttention)(x::oneArray{Float16,2}, pos::Int, rope::RotaryEmbedd
         end
 
         combined = m.decode_combined
-        combined .*= gate_sigmoid
+        combined .*= reshape(gate_sigmoid, :, 1)
         result = mat_mul!(m.decode_wo_buf, m.wo, combined)
 
- else
- # Prefill path
- q_final = reshape(q_gated, hd, m.n_heads, seq)
- combined_all = zeros(T, hd * m.n_heads, seq)
+    else
+        # Prefill path - optimized for GPU using batched operations
+        q_final = reshape(q_gated, hd, m.n_heads, seq)
+        combined = oneArray(zeros(T, hd * m.n_heads, seq))
 
- for h in 1:m.n_heads
- kh = div(h - 1, gqa_ratio) + 1
- for s in 1:seq
- q_v = @view q_final[:, h, s]
- K_v = @view K_cache[:, kh, 1:(pos+s)]
- V_v = @view V_cache[:, kh, 1:(pos+s)]
+        for h in 1:m.n_heads
+            kh = div(h - 1, gqa_ratio) + 1
 
- # Use Float32 for attention scores to prevent overflow
- scores = zeros(Float32, pos + s)
- for i in 1:(pos+s)
- dot = Float32(0.0)
- for d in 1:hd
- dot += Float32(K_v[d, i]) * Float32(q_v[d])
- end
- scores[i] = dot * scale
- end
+            # 1. Batch dot products: (total_len, seq) = (head_dim, total_len)' * (head_dim, seq)
+            # This covers all queries in the sequence against the full cache
+            # Use dynamically sized prefill_scores view
+            sc_view = view(m.prefill_scores, 1:cache.pos, 1:seq)
+            K_view = view(K_cache, :, kh, 1:cache.pos)
+            q_view = view(q_final, :, h, :)
 
- # Stable softmax in Float32
- mx = maximum(scores)
- sum_exp = Float32(0.0)
- for i in 1:(pos+s)
- scores[i] = exp(scores[i] - mx)
- sum_exp += scores[i]
- end
- scores ./= sum_exp
+            mat_mul_AT_B!(sc_view, K_view, q_view)
+            @. sc_view *= scale
 
- for d in 1:hd
- val = T(0.0)
- for i in 1:(pos+s)
- val += V_v[d, i] * T(scores[i])
- end
- combined_all[(h-1)*hd+d, s] = val
- end
- end
- end
- combined = oneArray(combined_all)
- combined .*= gate_sigmoid
- result = mat_mul(m.wo, combined)
- end
+            # 2. Causal Masking (only need to mask if seq > 1)
+            # Currently we process the entire sequence as one batch
+            # Note: pos is the offset into the cache
+            for s in 1:seq
+                # Mask out positions > pos + s
+                mask_limit = pos + s
+                if mask_limit < cache.pos
+                    m_view = view(sc_view, mask_limit+1:cache.pos, s)
+                    fill!(m_view, T(-Inf32))
+                end
+
+                # 3. Softmax on each query's scores
+                # softmax_kernel! handles the 1D slice for one query
+                p_view = view(m.prefill_pb, 1:cache.pos, s)
+                s_view = view(sc_view, 1:cache.pos, s)
+                softmax_kernel!(p_view, s_view, cache.pos, T(1.0))
+
+                # 4. Weighted sum: (head_dim, 1) = (head_dim, total_len) * (total_len, 1)
+                out_view = view(combined, (h-1)*hd+1:h*hd, s:s)
+                V_view = view(V_cache, :, kh, 1:cache.pos)
+                mul!(out_view, V_view, p_view)
+            end
+        end
+
+        combined .*= reshape(gate_sigmoid, :, seq)
+        result = mat_mul(m.wo, combined)
+    end
 
  return result
 end
@@ -816,11 +809,9 @@ struct MLAttention
     decode_out::oneMatrix{Float16}           # (n_heads * v_head_dim, 1)
     decode_wo_buf::oneMatrix{Float16}        # (hidden_size, 1)
 
-    # CPU scratchpads for numerical stability
-    q_pe_cpu::Vector{Float32}
-    k_pe_cpu::Vector{Float32}
-    scores_cpu::Vector{Float32}
-    pb_cpu::Vector{Float32}
+    # Scratchpads for avoiding vcat/reshape allocations
+    q_h_combined_buf::oneMatrix{Float16}     # (qk_nope + qk_rope, 1)
+    k_h_combined_buf::oneMatrix{Float16}     # (qk_nope + qk_rope, 1)
 end
 
 function MLAttention(q_a_proj, q_a_norm, q_b_proj, kv_a_proj_with_mqa, kv_a_norm, kv_b_proj, wo,
@@ -844,17 +835,16 @@ function MLAttention(q_a_proj, q_a_norm, q_b_proj, kv_a_proj_with_mqa, kv_a_norm
     wo_out_size = size(wo, 1)
     decode_wo_buf = oneArray(zeros(Float16, wo_out_size, 1))
 
-    # CPU scratchpads
-    q_pe_cpu = zeros(Float32, n_heads * qk_rope_head_dim)
-    k_pe_cpu = zeros(Float32, n_heads * qk_rope_head_dim)
-    scores_cpu = zeros(Float32, max_seq)
-    pb_cpu = zeros(Float32, max_seq)
+    # Scratchpads
+    k_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    q_h_combined_buf = oneArray(zeros(Float16, k_head_dim, 1))
+    k_h_combined_buf = oneArray(zeros(Float16, k_head_dim, 1))
 
     return MLAttention(q_a_proj, q_a_norm, q_b_proj, kv_a_proj_with_mqa, kv_a_norm, kv_b_proj, wo,
         n_heads, head_dim, q_lora_rank, kv_lora_rank, qk_rope_head_dim, v_head_dim, qk_nope_head_dim,
         softmax_scale, decode_q_latent, decode_q_latent_norm, decode_q_all, decode_kv_a,
         decode_kv_latent, decode_kv_latent_norm, decode_kv_b, decode_scores, decode_pb,
-        decode_out, decode_wo_buf, q_pe_cpu, k_pe_cpu, scores_cpu, pb_cpu)
+        decode_out, decode_wo_buf, q_h_combined_buf, k_h_combined_buf)
 end
 
 function (m::MLAttention)(x::oneMatrix{Float16}, pos::Int, rope::RotaryEmbedding, cache::KVCache)
@@ -901,83 +891,64 @@ function (m::MLAttention)(x::oneMatrix{Float16}, pos::Int, rope::RotaryEmbedding
         rope(k_pe_3d, pos)
 
         # 4. Update KV cache
-        # For MLA, we store full K (k_nope + k_pe) and V in the cache
-        # K cache shape: (qk_nope_head_dim + qk_rope_head_dim, n_heads, max_seq)
-        # But standard cache has: (head_dim, n_kv, max_seq)
-        # We'll use a simplified approach: store k_nope and k_pe separately
-        
-        # Store k_nope in cache.k (reshaped to fit)
-        # Store k_pe in cache.v's extra space (we'll use a workaround)
-        # For now, store combined K in cache.k and V in cache.v
-        k_combined = vcat(reshape(k_nope, :, 1), reshape(k_pe_3d, :, 1))
-        v_combined = reshape(v, :, 1)
-        
-        # Update cache - note: this assumes cache can hold n_heads channels
-        @views cache.k[:, 1, pos + 1] .= k_combined
-        @views cache.v[:, 1, pos + 1] .= v_combined
+        # Use views and multiple assignments to avoid vcat allocations
+        k_head_dim = m.qk_nope_head_dim + m.qk_rope_head_dim
+        for h in 1:m.n_heads
+            # Copy k_nope
+            src_k_nope = view(k_nope, (h-1)*m.qk_nope_head_dim+1:h*m.qk_nope_head_dim, :)
+            dst_k_nope = view(cache.k, (h-1)*k_head_dim+1:(h-1)*k_head_dim+m.qk_nope_head_dim, 1, pos + 1)
+            dst_k_nope .= src_k_nope
+
+            # Copy k_pe
+            src_k_pe = view(k_pe_3d, :, h, :)
+            dst_k_pe = view(cache.k, (h-1)*k_head_dim+m.qk_nope_head_dim+1:h*k_head_dim, 1, pos + 1)
+            dst_k_pe .= src_k_pe
+
+            # Copy v
+            src_v = view(v, (h-1)*m.v_head_dim+1:h*m.v_head_dim, :)
+            dst_v = view(cache.v, (h-1)*m.v_head_dim+1:h*m.v_head_dim, 1, pos + 1)
+            dst_v .= src_v
+        end
         cache.pos = pos + 1
 
         # 5. Compute attention scores
         total_len = cache.pos
-        k_head_dim = m.qk_nope_head_dim + m.qk_rope_head_dim
         
-        # Compute attention for each head
-        fill!(m.decode_scores, T(0.0))
-        fill!(m.decode_pb, T(0.0))
-
+        # GPU-native attention per head
         for h in 1:m.n_heads
-            # Get cached K and V for this head
-            # K is stored as (k_nope + k_pe) for all positions
+            sc_h = view(m.decode_scores, 1:total_len, h)
+            pb_h = view(m.decode_pb, 1:total_len, h)
+
             k_cached = view(cache.k, (h-1)*k_head_dim+1:h*k_head_dim, 1, 1:total_len)
             v_cached = view(cache.v, (h-1)*m.v_head_dim+1:h*m.v_head_dim, 1, 1:total_len)
             
-            # Current Q for this head
+            # Reconstruct query for this head: nope + pe into scratchpad
             q_h_nope = view(q_nope, (h-1)*m.qk_nope_head_dim+1:h*m.qk_nope_head_dim, :)
             q_h_pe = view(q_pe_3d, :, h, :)
-            q_h_combined = vcat(vec(q_h_nope), vec(q_h_pe))
 
-            # Score computation with numerical stability in Float32
-            for p in 1:total_len
-                k_p = view(k_cached, :, p)
-                score = Float32(0.0)
-                for d in 1:k_head_dim
-                    score += Float32(q_h_combined[d]) * Float32(k_p[d])
-                end
-                m.scores_cpu[p] = score * Float32(m.softmax_scale)
-            end
+            view(m.q_h_combined_buf, 1:m.qk_nope_head_dim, 1) .= q_h_nope
+            view(m.q_h_combined_buf, m.qk_nope_head_dim+1:k_head_dim, 1) .= q_h_pe
 
-            # Stable softmax in Float32
-            mx = maximum(m.scores_cpu[1:total_len])
-            s = Float32(0.0)
-            for p in 1:total_len
-                m.pb_cpu[p] = exp(m.scores_cpu[p] - mx)
-                s += m.pb_cpu[p]
-            end
-            inv_s = Float32(1.0) / s
-            for p in 1:total_len
-                m.pb_cpu[p] *= inv_s
-            end
-            copyto!(view(m.decode_pb, 1:total_len, h), m.pb_cpu[1:total_len])
+            mat_mul_AT_B!(reshape(sc_h, :, 1), k_cached, m.q_h_combined_buf)
 
-            # Weighted sum of V
+            softmax_kernel!(pb_h, sc_h, total_len, m.softmax_scale)
+
             out_h = view(m.decode_out, (h-1)*m.v_head_dim+1:h*m.v_head_dim, :)
-            mul!(out_h, v_cached, view(m.decode_pb, 1:total_len, h:h))
+            mul!(out_h, v_cached, pb_h)
         end
 
-        # 6. Output projection
         result = mat_mul(m.wo, m.decode_out)
         return result
 
     else
         # === Prefill path (multiple tokens) ===
-        # Similar to decode but processes all tokens in parallel
+        # Optimized for GPU broadcasting
 
         # 1. Q projection
         q_latent = mat_mul(m.q_a_proj, x)
         q_latent_norm_2d = m.q_a_norm(q_latent)
         q_all = mat_mul(m.q_b_proj, q_latent_norm_2d)
 
-        # Split q_all into q_nope and q_pe
         q_pe = view(q_all, 1:qk_pe_size, :)
         q_nope = view(q_all, qk_pe_size+1:qk_pe_size+qk_nope_size, :)
 
@@ -986,82 +957,69 @@ function (m::MLAttention)(x::oneMatrix{Float16}, pos::Int, rope::RotaryEmbedding
         kv_latent = view(kv_a, 1:m.kv_lora_rank, :)
         k_pe = view(kv_a, m.kv_lora_rank+1:m.kv_lora_rank+m.qk_rope_head_dim, :)
 
-        # Normalize kv_latent and project to k_nope and v
         kv_latent_norm_2d = m.kv_a_norm(kv_latent)
         kv_b = mat_mul(m.kv_b_proj, kv_latent_norm_2d)
 
-        # Split kv_b into k_nope and v
         k_nope = view(kv_b, 1:qk_nope_size, :)
         v = view(kv_b, qk_nope_size+1:qk_nope_size+v_size, :)
 
-        # 3. Apply RoPE to q_pe and k_pe
+        # 3. Apply RoPE
         q_pe_3d = reshape(q_pe, m.qk_rope_head_dim, m.n_heads, seq)
         k_pe_3d = reshape(k_pe, m.qk_rope_head_dim, m.n_heads, seq)
-        rope(q_pe_3d, pos + 1)  # pos is 0-indexed, RoPE expects 1-indexed start
+        rope(q_pe_3d, pos + 1)
         rope(k_pe_3d, pos + 1)
 
         # 4. Update KV cache
         k_head_dim = m.qk_nope_head_dim + m.qk_rope_head_dim
         for s in 1:seq
+            cache_pos = pos + s
             for h in 1:m.n_heads
-                k_nope_h = view(k_nope, (h-1)*m.qk_nope_head_dim+1:h*m.qk_nope_head_dim, s)
-                k_pe_h = view(k_pe_3d, :, h, s)
-                k_combined = vcat(vec(k_nope_h), vec(k_pe_h))
-                v_h = view(v, (h-1)*m.v_head_dim+1:h*m.v_head_dim, s)
+                # Copy k_nope
+                src_k_nope = view(k_nope, (h-1)*m.qk_nope_head_dim+1:h*m.qk_nope_head_dim, s)
+                dst_k_nope = view(cache.k, (h-1)*k_head_dim+1:(h-1)*k_head_dim+m.qk_nope_head_dim, 1, cache_pos)
+                dst_k_nope .= src_k_nope
                 
-                cache_pos = pos + s
-                @views cache.k[:, 1, cache_pos] .= k_combined
-                @views cache.v[:, 1, cache_pos] .= v_h
+                # Copy k_pe
+                src_k_pe = view(k_pe_3d, :, h, s)
+                dst_k_pe = view(cache.k, (h-1)*k_head_dim+m.qk_nope_head_dim+1:h*k_head_dim, 1, cache_pos)
+                dst_k_pe .= src_k_pe
+
+                # Copy v
+                src_v = view(v, (h-1)*m.v_head_dim+1:h*m.v_head_dim, s)
+                dst_v = view(cache.v, (h-1)*m.v_head_dim+1:h*m.v_head_dim, 1, cache_pos)
+                dst_v .= src_v
             end
         end
         cache.pos = pos + seq
 
-        # 5. Compute attention scores
+        # 5. Compute attention scores (Batched GPU)
         q_nope_3d = reshape(q_nope, m.qk_nope_head_dim, m.n_heads, seq)
-
-        # Allocate output buffer
-        out_all = zeros(Float32, m.v_head_dim, m.n_heads, seq)
+        out_all = oneArray(zeros(T, m.v_head_dim * m.n_heads, seq))
 
         for h in 1:m.n_heads
             for s in 1:seq
                 q_h_nope = view(q_nope_3d, :, h, s)
                 q_h_pe = view(q_pe_3d, :, h, s)
-                q_h_combined = vcat(vec(q_h_nope), vec(q_h_pe))
 
-                scores = zeros(Float32, pos + s)
-                for p in 1:(pos + s)
-                    k_p = view(cache.k, (h-1)*k_head_dim+1:h*k_head_dim, 1, p)
-                    score = Float32(0.0)
-                    for d in 1:k_head_dim
-                        score += Float32(q_h_combined[d]) * Float32(k_p[d])
-                    end
-                    scores[p] = score * Float32(m.softmax_scale)
-                end
+                view(m.q_h_combined_buf, 1:m.qk_nope_head_dim, 1) .= q_h_nope
+                view(m.q_h_combined_buf, m.qk_nope_head_dim+1:k_head_dim, 1) .= q_h_pe
 
-                # Stable softmax
-                mx = maximum(scores)
-                sum_exp = Float32(0.0)
-                for p in 1:(pos + s)
-                    scores[p] = exp(scores[p] - mx)
-                    sum_exp += scores[p]
-                end
-                scores ./= sum_exp
+                # Use the head-specific column in decode_scores/pb to avoid collisions
+                sc_h = view(m.decode_scores, 1:pos+s, h)
+                pb_h = view(m.decode_pb, 1:pos+s, h)
 
-                # Weighted sum of V
-                for d in 1:m.v_head_dim
-                    val = Float32(0.0)
-                    for p in 1:(pos + s)
-                        v_p = cache.v[(h-1)*m.v_head_dim+d, 1, p]
-                        val += Float32(v_p) * scores[p]
-                    end
-                    out_all[d, h, s] = val
-                end
+                k_cached = view(cache.k, (h-1)*k_head_dim+1:h*k_head_dim, 1, 1:pos+s)
+                v_cached = view(cache.v, (h-1)*m.v_head_dim+1:h*m.v_head_dim, 1, 1:pos+s)
+
+                mat_mul_AT_B!(reshape(sc_h, :, 1), k_cached, m.q_h_combined_buf)
+                softmax_kernel!(pb_h, sc_h, pos+s, m.softmax_scale)
+
+                out_h_s = view(out_all, (h-1)*m.v_head_dim+1:h*m.v_head_dim, s:s)
+                mul!(out_h_s, v_cached, pb_h)
             end
         end
 
-        # 6. Output projection
-        out_tensor = oneArray(Float16.(reshape(out_all, m.v_head_dim * m.n_heads, seq)))
-        result = mat_mul(m.wo, out_tensor)
+        result = mat_mul(m.wo, out_all)
         return result
     end
 end
