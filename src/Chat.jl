@@ -221,11 +221,11 @@ function forward_word(cursor::Int, buffer::Vector{Char})
 end
 
 function clear_line(term, prompt)
-    print(term, "\r" * " "^80 * "\r" * prompt)
+    print(term, "\r\e[2K" * prompt)
 end
 
 function refresh_line(term, prompt, buffer, cursor)
-    print(term, "\r" * " "^80 * "\r" * prompt * String(buffer) * "\r")
+    print(term, "\r\e[2K" * prompt * String(buffer) * "\r")
     print(term, "\r" * prompt)
     for i in 1:cursor-1
         print(term, buffer[i])
@@ -251,12 +251,6 @@ function read_line_chat(term, state)
             end
         end
         
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
-            continue
-        end
-        
         if c == '\x04'
             isempty(buffer) && return "EXIT_CHAT"
             println(term)
@@ -266,6 +260,9 @@ function read_line_chat(term, state)
         elseif c == '\x03'
             println(term)
             return ""
+        elseif c == '\x0c'  # Ctrl+L = clear screen
+            print(term, "\e[H\e[2J")
+            refresh_line(term, "You> ", buffer, cursor)
         elseif c == '\x10'  # Ctrl+P = previous history
             if !isempty(state.history)
                 if state.hist_pos < length(state.history) - 1
@@ -364,6 +361,29 @@ function read_line_chat(term, state)
                     if cursor > 1
                         cursor -= 1
                         print(term, "\b")
+                    end
+                elseif seq == 'H' # Home
+                    cursor = 1
+                    refresh_line(term, "You> ", buffer, cursor)
+                elseif seq == 'F' # End
+                    cursor = length(buffer) + 1
+                    refresh_line(term, "You> ", buffer, cursor)
+                elseif seq == '3' # Delete
+                    if read(term, Char) == '~'
+                        if cursor <= length(buffer)
+                            deleteat!(buffer, cursor)
+                            refresh_line(term, "You> ", buffer, cursor)
+                        end
+                    end
+                elseif seq == '1' # Home (some terminals)
+                    if read(term, Char) == '~'
+                        cursor = 1
+                        refresh_line(term, "You> ", buffer, cursor)
+                    end
+                elseif seq == '4' # End (some terminals)
+                    if read(term, Char) == '~'
+                        cursor = length(buffer) + 1
+                        refresh_line(term, "You> ", buffer, cursor)
                     end
                 end
             elseif next == '\x7f'
