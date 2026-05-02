@@ -1121,82 +1121,117 @@ function lm_head_project!(output::Vector{Float32}, weight::Matrix{BFloat16}, hid
 end
 
 function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top_p::Float32=1.0f0, top_k::Int=0, min_p::Float32=0.0f0)
- # Handle temperature=0 (greedy/argmax sampling)
- if temperature == 0.0f0
- return argmax(logits)
- end
- 
- # Apply temperature
- if temperature != 1.0f0
- logits = logits ./ temperature
- end
+    # Handle temperature=0 (greedy/argmax sampling)
+    if temperature == 0.0f0
+        return argmax(logits)
+    end
+
+    vocab_size = length(logits)
+    inv_temp = 1.0f0 / temperature
     
-    # Apply top-k filtering
-    if top_k > 0
-        sorted_indices = sortperm(logits, rev=true)
-        keep_indices = Set(sorted_indices[1:min(top_k, length(logits))])
-        for i in 1:length(logits)
-            if i ∉ keep_indices
-                logits[i] = -Inf32
-            end
+    # Path A: No filtering - O(N) time, O(N) space, 1 allocation
+    # Optimized for the most common case during generation
+    if top_k <= 0 && top_p >= 1.0f0 && min_p <= 0.0f0
+        max_logit = maximum(logits) * inv_temp
+        probs = Vector{Float32}(undef, vocab_size)
+        sum_p = 0.0f0
+        @inbounds for i in 1:vocab_size
+            p = exp(logits[i] * inv_temp - max_logit)
+            probs[i] = p
+            sum_p += p
         end
+
+        r = rand(Float32) * sum_p
+        cumsum = 0.0f0
+        @inbounds for i in 1:vocab_size
+            cumsum += probs[i]
+            if r <= cumsum; return i; end
+        end
+        return vocab_size
+    end
+
+    # Path B: top-k only - O(N + k log k) time, O(k) space, 2 allocations
+    if top_k > 0 && top_p >= 1.0f0 && min_p <= 0.0f0
+        k = min(vocab_size, top_k)
+        indices = partialsortperm(logits, 1:k, rev=true)
+        max_logit = logits[indices[1]] * inv_temp
+        probs_k = Vector{Float32}(undef, k)
+        sum_k = 0.0f0
+        @inbounds for i in 1:k
+            p = exp(logits[indices[i]] * inv_temp - max_logit)
+            probs_k[i] = p
+            sum_k += p
+        end
+        r = rand(Float32) * sum_k
+        cumsum = 0.0f0
+        @inbounds for i in 1:k
+            cumsum += probs_k[i]
+            if r <= cumsum; return indices[i]; end
+        end
+        return indices[k]
+    end
+
+    # Path C: Advanced filtering (top_p, min_p) - O(N log N) time, O(N) space
+    # Correctness: Handles full vocabulary for nucleus sampling if top_k is not set.
+    max_logit = maximum(logits) * inv_temp
+    full_probs = Vector{Float32}(undef, vocab_size)
+    full_sum = 0.0f0
+    @inbounds for i in 1:vocab_size
+        p = exp(logits[i] * inv_temp - max_logit)
+        full_probs[i] = p
+        full_sum += p
+    end
+
+    # Sort to apply top_p/min_p
+    if top_k > 0
+        k_range = 1:min(vocab_size, top_k)
+        indices = partialsortperm(logits, k_range, rev=true)
+    else
+        indices = sortperm(logits, rev=true)
     end
     
-    # Apply softmax
-    max_logit = maximum(logits)
-    exp_logits = exp.(logits .- max_logit)
-    probs = exp_logits ./ sum(exp_logits)
+    k = length(indices)
     
-    # Apply top-p (nucleus) filtering
+    # Nucleus sampling
     if top_p < 1.0f0
-        sorted_indices = sortperm(probs, rev=true)
+        target = top_p * full_sum
         cumsum = 0.0f0
-        keep_indices = Set{Int}()
-        for idx in sorted_indices
-            push!(keep_indices, idx)
-            cumsum += probs[idx]
-            if cumsum >= top_p
+        for i in 1:k
+            cumsum += full_probs[indices[i]]
+            if cumsum >= target
+                k = i
                 break
             end
         end
-        # Zero out probabilities for tokens not in top-p
-        for i in 1:length(probs)
-            if i ∉ keep_indices
-                probs[i] = 0.0f0
+    end
+    
+    # Min-p sampling
+    if min_p > 0.0f0 && k > 0
+        # full_probs[indices[1]] is always 1.0 because it's the argmax
+        threshold = full_probs[indices[1]] * min_p
+        for i in 1:k
+            if full_probs[indices[i]] < threshold
+                k = i - 1
+                break
             end
-        end
-        # Renormalize
-        total = sum(probs)
-        if total > 0.0f0
-            probs ./= total
         end
     end
     
-    # Apply minimum probability threshold (relative to max probability)
-    if min_p > 0.0f0
-        max_prob = maximum(probs)
-        threshold = max_prob * min_p
-        for i in 1:length(probs)
-            if probs[i] < threshold
-                probs[i] = 0.0f0
-            end
-        end
-        total = sum(probs)
-        if total > 0.0f0
-            probs ./= total
-        end
+    if k <= 0; return indices[1]; end
+
+    # Sample from the filtered distribution
+    sum_filtered = 0.0f0
+    @inbounds for i in 1:k
+        sum_filtered += full_probs[indices[i]]
     end
-    
-    # Sample from distribution
-    r = rand(Float32)
+
+    r = rand(Float32) * sum_filtered
     cumsum = 0.0f0
-    for i in 1:length(probs)
-        cumsum += probs[i]
-        if r <= cumsum
-            return i
-        end
+    @inbounds for i in 1:k
+        cumsum += full_probs[indices[i]]
+        if r <= cumsum; return indices[i]; end
     end
-    return length(probs)
+    return indices[k]
 end
 
 function apply_presence_penalty!(logits::Vector{Float32}, token_counts::Dict{Int,Int}, penalty::Float32)
