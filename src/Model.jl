@@ -139,109 +139,83 @@ end
 # --- GPU Softmax Kernel ---
 # Stable softmax on a 1D slice of length `len` stored in `scores[1:len, 1]`
 # Writes probabilities back into `probs[1:len, 1]`
-# Uses Float32 for exp() to prevent overflow
+# Uses Float32 for exp() to prevent overflow. Optimized for GPU-native execution.
 function softmax_kernel!(probs, scores, len, scale)
- # Copy to CPU for computation (avoids scalar indexing on GPU)
- probs_cpu = Array(probs)
- scores_cpu = Array(scores)
+    # Perform computation entirely on GPU using views and reductions
+    sc_view = view(scores, 1:len, 1)
+    pr_view = view(probs, 1:len, 1)
 
- # Compute max in Float32 for stability
- mx = Float32(maximum(scores_cpu[1:len, 1]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:len
- v = exp(Float32(scores_cpu[i, 1] * scale) - mx)
- probs_cpu[i, 1] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:len
- probs_cpu[i, 1] *= inv_s
- end
+    # Compute max in Float32 for numerical stability on scaled scores
+    # softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))
+    mx = maximum(v -> Float32(v) * Float32(scale), sc_view, dims=1)
 
- # Copy back to GPU
- copyto!(probs, Float16.(probs_cpu))
- return nothing
+    # Compute exponentials into probs buffer (Float16)
+    @. pr_view = Float16(exp(Float32(sc_view) * Float32(scale) - mx))
+
+    # Compute sum in Float32 for precision
+    s = mapreduce(v -> Float32(v), +, pr_view, dims=1)
+
+    # Normalize in-place
+    @. pr_view /= Float16(s)
+    return nothing
 end
 
 function batched_softmax_kernel!(probs, scores, total_len, n_heads, scale)
- # Copy to CPU for computation (avoids scalar indexing on GPU)
- probs_cpu = Array(probs)
- scores_cpu = Array(scores)
+    # Perform computation entirely on GPU using views and reductions
+    sc_view = view(scores, 1:total_len, 1:n_heads)
+    pr_view = view(probs, 1:total_len, 1:n_heads)
 
- for h in 1:n_heads
- mx = Float32(maximum(scores_cpu[1:total_len, h]) * scale)
- s = Float32(0.0)
- @inbounds for i in 1:total_len
- v = exp(Float32(scores_cpu[i, h] * scale) - mx)
- probs_cpu[i, h] = v
- s += v
- end
- inv_s = Float32(1.0) / s
- @inbounds for i in 1:total_len
- probs_cpu[i, h] *= inv_s
- end
- end
+    # Compute max across columns (each head) in Float32
+    mx = maximum(v -> Float32(v) * Float32(scale), sc_view, dims=1)
 
- # Copy back to GPU
- copyto!(probs, Float16.(probs_cpu))
- return nothing
+    # Compute exponentials
+    @. pr_view = Float16(exp(Float32(sc_view) * Float32(scale) - mx))
+
+    # Compute sum per head
+    s = mapreduce(v -> Float32(v), +, pr_view, dims=1)
+
+    # Normalize
+    @. pr_view /= Float16(s)
+    return nothing
 end
 
-# Numerically stable sigmoid using Float32 intermediate computation
+# Numerically stable sigmoid using Float32 intermediate computation. Optimized for GPU.
 # Float16 exp() overflows/underflows for |x| > 6.5
 function sigmoid_kernel!(out, x, N)
- for i in 1:N
- # Use Float32 for exp() to avoid overflow/underflow
- x_f32 = Float32(x[i])
- sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-x_f32))
- out[i] = Float16(sigmoid_f32)
- end
- return nothing
+    out_v = view(out, 1:N)
+    x_v = view(x, 1:N)
+    @. out_v = Float16(1.0f0 / (1.0f0 + exp(-Float32(x_v))))
+    return nothing
 end
 
-# Numerically stable softplus using Float32 intermediate computation
+# Numerically stable softplus using Float32 intermediate computation. Optimized for GPU.
 function softplus_kernel!(out, x, bias, N)
- for i in 1:N
- # Use Float32 for exp() to avoid overflow/underflow
- x_f32 = Float32(x[i] + bias[i])
- # Use softplus identity: log(1 + exp(x)) ≈ max(x, 0) + log(1 + exp(-|x|))
- # This is numerically stable for all x
- if x_f32 > 20.0f0
- # For large x, log(1 + exp(x)) ≈ x
- softplus_f32 = x_f32
- elseif x_f32 < -20.0f0
- # For large negative x, log(1 + exp(x)) ≈ 0
- softplus_f32 = 0.0f0
- else
- softplus_f32 = log(1.0f0 + exp(x_f32))
- end
- out[i] = Float16(softplus_f32)
- end
- return nothing
+    out_v = view(out, 1:N)
+    x_v = view(x, 1:N)
+    b_v = view(bias, 1:N)
+    # Use softplus identity: log(1 + exp(x)) = max(x, 0) + log(1 + exp(-|x|))
+    # This is numerically stable for both large positive and negative values.
+    @. out_v = Float16(max(Float32(x_v + b_v), 0.0f0) + log(1.0f0 + exp(-abs(Float32(x_v + b_v)))))
+    return nothing
 end
 
-# Numerically stable SiLU (Swish) using Float32 intermediate computation
+# Numerically stable SiLU (Swish) using Float32 intermediate computation. Optimized for GPU.
 # SiLU(x) = x * sigmoid(x)
 function silu_kernel!(out, x, N)
- for i in 1:N
- x_f32 = Float32(x[i])
- sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-x_f32))
- silu_f32 = x_f32 * sigmoid_f32
- out[i] = Float16(silu_f32)
- end
- return nothing
+    out_v = view(out, 1:N)
+    x_v = view(x, 1:N)
+    @. out_v = Float16(Float32(x_v) / (1.0f0 + exp(-Float32(x_v))))
+    return nothing
 end
 
-# Numerically stable SiLU gating with Float32 intermediate computation
+# Numerically stable SiLU gating with Float32 intermediate computation. Optimized for GPU.
 # SiLU_gating(z, normed) = z * sigmoid(z) * normed
 function silu_gating_kernel!(out, z, normed, N)
- for i in 1:N
- z_f32 = Float32(z[i])
- sigmoid_f32 = 1.0f0 / (1.0f0 + exp(-z_f32))
- silu_f32 = z_f32 * sigmoid_f32 * Float32(normed[i])
- out[i] = Float16(silu_f32)
- end
- return nothing
+    out_v = view(out, 1:N)
+    z_v = view(z, 1:N)
+    n_v = view(normed, 1:N)
+    @. out_v = Float16(Float32(z_v) / (1.0f0 + exp(-Float32(z_v))) * Float32(n_v))
+    return nothing
 end
 
 # --- SiLU ---
@@ -255,47 +229,47 @@ end
 struct RotaryEmbedding
  dim::Int
  base::Float32  # Use Float32 for base to prevent precision loss
- inv_freq::Vector{Float32}  # Use Float32 for more precision
+ inv_freq::oneVector{Float32}  # Store on GPU to eliminate host-device transfers
  rotary_dim::Int  # Number of dimensions that get rotary (partial rotary support)
 end
 
 function RotaryEmbedding(dim::Int; base=Float32(10000000.0), rotary_dim::Int=dim)
  # Only compute inv_freq for the rotary dimensions
- inv_freq = Float32(1.0) ./ (Float32(base) .^ (Float32.(range(0, stop=rotary_dim - 1, step=2)) ./ Float32(rotary_dim)))
- return RotaryEmbedding(dim, Float32(base), inv_freq, rotary_dim)
+ inv_freq_cpu = Float32(1.0) ./ (Float32(base) .^ (Float32.(range(0, stop=rotary_dim - 1, step=2)) ./ Float32(rotary_dim)))
+ return RotaryEmbedding(dim, Float32(base), oneArray(inv_freq_cpu), rotary_dim)
 end
 
+# Optimized GPU-native RoPE kernel.
+# Applies rotary embeddings using broadcasting over GPU views,
+# completely eliminating host-device synchronization and memory copies.
 function rope_kernel!(x, inv_freq, pos, d, h, seq, d_rope)
- T = eltype(x)
- half_d = d_rope ÷ 2
+    T = eltype(x)
+    half_d = d_rope ÷ 2
+    ivf_v = view(inv_freq, 1:half_d)
 
- # Copy to CPU, compute, copy back (avoids scalar indexing on GPU)
- x_cpu = Array(x)
- inv_freq_cpu = Array(inv_freq)
+    # Broadcast over time (t) using fused kernels
+    for t in 1:seq
+        p = Float32(pos + t - 1)
 
- for t in 1:seq
- for head in 1:h
- for i in 1:half_d
- # Half-split pairing: first half paired with second half
- idx1 = i
- idx2 = i + half_d
+        # Select views for current time step
+        # x is (head_dim, num_heads, seq_len)
+        x1 = view(x, 1:half_d, :, t)
+        x2 = view(x, half_d+1:d_rope, :, t)
 
- # Use Float32 for position computation to prevent precision loss
- p = Float32(pos + t - 1)
- freq = inv_freq_cpu[i] * p  # inv_freq is Float32
- sin_val, cos_val = sincos(freq)
+        # Precompute frequencies and trig functions once per step
+        f = @. ivf_v * p
+        c = @. T(cos(f))
+        s = @. T(sin(f))
 
- x1 = x_cpu[idx1, head, t]
- x2 = x_cpu[idx2, head, t]
+        # Capture original x1 values to avoid using mutated values in x2 calculation
+        # Small allocation on GPU is much faster than host-device round-trips
+        x1_orig = copy(x1)
 
- x_cpu[idx1, head, t] = x1 * cos_val - x2 * sin_val
- x_cpu[idx2, head, t] = x1 * sin_val + x2 * cos_val
- end
- end
- end
-
- copyto!(x, x_cpu)
- return x
+        # Apply rotation: [x1; x2] * [c -s; s c]
+        @. x1 = x1_orig * c - x2 * s
+        @. x2 = x1_orig * s + x2 * c
+    end
+    return x
 end
 
 function (rope::RotaryEmbedding)(x::AbstractArray{T,3}, pos::Int) where T
