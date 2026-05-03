@@ -93,6 +93,14 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
     is_thinking = thinking_enabled
     token_buffer = ""
     
+    # Show thinking indicator
+    is_stdout_tty = isa(io, Base.TTY) || (hasfield(typeof(io), :io) && isa(io.io, Base.TTY))
+    if is_stdout_tty
+        printstyled(io, "...", color=:light_black)
+        flush(io)
+    end
+    first_token = true
+
     # Track tokens and time for TPS
     t0 = time()
     token_count = 0
@@ -110,6 +118,14 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
         temperature=temperature, top_p=top_p, top_k=top_k,
         repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p,
         show_tps=false, io=stdout)
+
+        if first_token
+            if is_stdout_tty
+                print(io, "\b\b\b\e[K") # Remove thinking indicator
+            end
+            first_token = false
+        end
+
         token_buffer *= token
         token_count += 1
         
@@ -221,19 +237,22 @@ function forward_word(cursor::Int, buffer::Vector{Char})
 end
 
 function clear_line(term, prompt)
-    print(term, "\r" * " "^80 * "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term, prompt, color=:cyan, bold=true)
 end
 
 function refresh_line(term, prompt, buffer, cursor)
-    print(term, "\r" * " "^80 * "\r" * prompt * String(buffer) * "\r")
-    print(term, "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term, prompt, color=:cyan, bold=true)
+    print(term, String(buffer) * "\r")
+    printstyled(term, prompt, color=:cyan, bold=true)
     for i in 1:cursor-1
         print(term, buffer[i])
     end
 end
 
 function read_line_chat(term, state)
-    print(term, "You> ")
+    printstyled(term, "You> ", color=:cyan, bold=true)
     flush(term)
     
     buffer = Char[]
@@ -251,13 +270,11 @@ function read_line_chat(term, state)
             end
         end
         
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
+        if c == '\x0c' # Ctrl+L = clear screen
+            print(term, "\e[H\e[2J")
+            refresh_line(term, "You> ", buffer, cursor)
             continue
-        end
-        
-        if c == '\x04'
+        elseif c == '\x04'
             isempty(buffer) && return "EXIT_CHAT"
             println(term)
             result = String(buffer)
@@ -443,17 +460,17 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  thinking_mode = enable_thinking
  
  banner = """
- ╔═══════════════════════════════════════════════════╗
- ║ Welcome to Inferno Chat! ║
- ╠═══════════════════════════════════════════════════╣
- ║ Type your message and press Enter to chat. ║
- ║ Commands: ║
- ║ /clear - Clear conversation history ║
- ║ /system - Change system prompt ║
- ║ /think - Toggle thinking mode ║
- ║ /quit - Exit chat ║
- ╚═══════════════════════════════════════════════════╝
- """
+╔═══════════════════════════════════════════════════╗
+║             Welcome to Inferno Chat!              ║
+╠═══════════════════════════════════════════════════╣
+║    Type your message and press Enter to chat.     ║
+║                     Commands:                     ║
+║       /clear  - Clear conversation history        ║
+║       /system - Change system prompt              ║
+║       /think  - Toggle thinking mode              ║
+║       /quit   - Exit chat                         ║
+╚═══════════════════════════════════════════════════╝
+"""
  
  printstyled(banner, color=:cyan, bold=true)
  printstyled("Thinking: $(thinking_mode ? "ON" : "OFF")\n", color=:yellow)
@@ -497,6 +514,7 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
   raw!(term, false)
   
   # Generate and stream with thinking colors
+  printstyled(term, "Assistant> ", color=:green, bold=true)
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
   stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
 response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, thinking_enabled=thinking_mode, show_tps=true, kwargs...)
