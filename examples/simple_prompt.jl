@@ -52,7 +52,7 @@ function main()
 
     # 2. Define your prompt
     println("-"^40)
-    print("Enter prompt: ")
+    print("Enter prompt (Ctrl+D to submit): ")
     prompt = read(stdin, String)
 
     if isempty(prompt)
