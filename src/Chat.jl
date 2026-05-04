@@ -92,7 +92,15 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
     prompt_tokens = encode(tok, prompt)
     is_thinking = thinking_enabled
     token_buffer = ""
+    first_token = true
     
+    # Show thinking indicator if it's a TTY
+    is_tty = isa(io, Base.TTY) || (hasfield(typeof(io), :io) && isa(io.io, Base.TTY))
+    if is_tty
+        printstyled(io, "...", color=:light_black)
+        flush(io)
+    end
+
     # Track tokens and time for TPS
     t0 = time()
     token_count = 0
@@ -110,6 +118,14 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
         temperature=temperature, top_p=top_p, top_k=top_k,
         repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p,
         show_tps=false, io=stdout)
+
+        if first_token
+            if is_tty
+                print(io, "\b\b\b\e[K") # Clear thinking dots
+            end
+            first_token = false
+        end
+
         token_buffer *= token
         token_count += 1
         
@@ -221,19 +237,23 @@ function forward_word(cursor::Int, buffer::Vector{Char})
 end
 
 function clear_line(term, prompt)
-    print(term, "\r" * " "^80 * "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term, prompt, color=:cyan, bold=true)
 end
 
 function refresh_line(term, prompt, buffer, cursor)
-    print(term, "\r" * " "^80 * "\r" * prompt * String(buffer) * "\r")
-    print(term, "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term, prompt, color=:cyan, bold=true)
+    print(term, String(buffer) * "\r")
+    print(term, "\r")
+    printstyled(term, prompt, color=:cyan, bold=true)
     for i in 1:cursor-1
         print(term, buffer[i])
     end
 end
 
 function read_line_chat(term, state)
-    print(term, "You> ")
+    printstyled(term, "You> ", color=:cyan, bold=true)
     flush(term)
     
     buffer = Char[]
@@ -249,12 +269,6 @@ function read_line_chat(term, state)
             else
                 rethrow(e)
             end
-        end
-        
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
-            continue
         end
         
         if c == '\x04'
@@ -392,10 +406,8 @@ function read_line_chat(term, state)
             refresh_line(term, "You> ", buffer, cursor)
             continue
         elseif c == '\x05'
-            for i in cursor:length(buffer)
-                print(term, buffer[i])
-            end
-            cursor = min(length(buffer) + 1, cursor)
+            cursor = length(buffer) + 1
+            refresh_line(term, "You> ", buffer, cursor)
             continue
         elseif c == '\x02'
             if cursor > 1
@@ -499,6 +511,10 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
   # Generate and stream with thinking colors
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
   stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
+
+  printstyled(term, "Assistant> ", color=:green, bold=true)
+  flush(term)
+
 response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, thinking_enabled=thinking_mode, show_tps=true, kwargs...)
    
    # Print newline after response
