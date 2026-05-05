@@ -185,49 +185,49 @@ end
 
 # Fused RMSNorm + RoPE for attention (reduces memory passes)
 function rmsnorm_rotary!(x::Matrix{Float32}, pos::Int, rope::RotaryEmbeddingCPU, norm::RMSNormCPU)
- head_dim, num_heads = size(x, 1), size(x, 2)
- half = div(rope.rotary_dim, 2)
- weight = norm.weight
- 
- # Use precomputed cos/sin (1-indexed position)
- pos_idx = pos + 1  # Convert 0-indexed to 1-indexed
- @inbounds begin
- cos_vals = view(rope.cos_cache, :, pos_idx)
- sin_vals = view(rope.sin_cache, :, pos_idx)
- end
- 
- for h in 1:num_heads
- # First: RMSNorm on this head
- sum_sq = 0.0f0
- for i in 1:head_dim
- @inbounds sum_sq += x[i, h] * x[i, h]
- end
- rms = sqrt(sum_sq / head_dim + norm.eps)
- inv_rms = 1.0f0 / rms
- 
- # Apply RMSNorm and RoPE in one pass
- for i in 1:head_dim
- @inbounds x[i, h] = x[i, h] * inv_rms * weight[i]
- end
- 
- # Now apply RoPE to the first rotary_dim dimensions
- for i in 1:half
- @inbounds begin
- idx1 = i
- idx2 = i + half
- 
- x1 = x[idx1, h]
- x2 = x[idx2, h]
- 
- c = cos_vals[i]
- s = sin_vals[i]
- 
- x[idx1, h] = x1 * c - x2 * s
- x[idx2, h] = x1 * s + x2 * c
- end
- end
- end
- return x
+    head_dim, num_heads = size(x, 1), size(x, 2)
+    half = div(rope.rotary_dim, 2)
+    weight = norm.weight
+    eps = norm.eps
+
+    # Use precomputed cos/sin (1-indexed position)
+    pos_idx = pos + 1  # Convert 0-indexed to 1-indexed
+    @inbounds begin
+        cos_vals = view(rope.cos_cache, :, pos_idx)
+        sin_vals = view(rope.sin_cache, :, pos_idx)
+    end
+
+    for h in 1:num_heads
+        # First: RMSNorm on this head
+        sum_sq = 0.0f0
+        @turbo for i in 1:head_dim
+            sum_sq += x[i, h] * x[i, h]
+        end
+        inv_rms = 1.0f0 / sqrt(sum_sq / head_dim + eps)
+
+        # Fused RMSNorm and RoPE for the rotary dimensions (reduces memory passes)
+        @turbo for i in 1:half
+            idx1 = i
+            idx2 = i + half
+
+            # Apply RMSNorm scaling to the elements before RoPE
+            x1 = x[idx1, h] * inv_rms * weight[idx1]
+            x2 = x[idx2, h] * inv_rms * weight[idx2]
+
+            c = cos_vals[i]
+            s = sin_vals[i]
+
+            # Apply rotary embedding
+            x[idx1, h] = x1 * c - x2 * s
+            x[idx2, h] = x1 * s + x2 * c
+        end
+
+        # Apply RMSNorm scaling to remaining non-rotary dimensions
+        @turbo for i in (rope.rotary_dim + 1):head_dim
+            x[i, h] = x[i, h] * inv_rms * weight[i]
+        end
+    end
+    return x
 end
 
 # --- KV Cache ---
@@ -763,12 +763,14 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
  query_states = attn.query_states_buf
  gate = attn.gate_buf
  
- for h in 1:attn.n_heads
- base = (h - 1) * (2 * attn.head_dim)
- for i in 1:attn.head_dim
- query_states[(h-1)*attn.head_dim+i] = attn.qkv_buf[base+i]
- gate[(h-1)*attn.head_dim+i] = attn.qkv_buf[base+attn.head_dim+i]
- end
+ # @turbo handles the nested loop and enables SIMD vectorization for splitting qkv_buf
+ @turbo for h in 1:attn.n_heads
+     for i in 1:attn.head_dim
+         base = (h - 1) * (2 * attn.head_dim)
+         out_idx = (h - 1) * attn.head_dim + i
+         query_states[out_idx] = attn.qkv_buf[base + i]
+         gate[out_idx] = attn.qkv_buf[base + attn.head_dim + i]
+     end
  end
 
  # Reshape to (head_dim, num_heads)
