@@ -221,19 +221,23 @@ function forward_word(cursor::Int, buffer::Vector{Char})
 end
 
 function clear_line(term, prompt)
-    print(term, "\r" * " "^80 * "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term, prompt, color=:cyan, bold=true)
 end
 
 function refresh_line(term, prompt, buffer, cursor)
-    print(term, "\r" * " "^80 * "\r" * prompt * String(buffer) * "\r")
-    print(term, "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term, prompt, color=:cyan, bold=true)
+    print(term, String(buffer) * "\r")
+    printstyled(term, prompt, color=:cyan, bold=true)
     for i in 1:cursor-1
         print(term, buffer[i])
     end
 end
 
 function read_line_chat(term, state)
-    print(term, "You> ")
+    prompt = "You> "
+    printstyled(term, prompt, color=:cyan, bold=true)
     flush(term)
     
     buffer = Char[]
@@ -249,12 +253,6 @@ function read_line_chat(term, state)
             else
                 rethrow(e)
             end
-        end
-        
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
-            continue
         end
         
         if c == '\x04'
@@ -275,7 +273,7 @@ function read_line_chat(term, state)
                 end
                 buffer = collect(state.history[end - state.hist_pos])
                 cursor = length(buffer) + 1
-                refresh_line(term, "You> ", buffer, cursor)
+                refresh_line(term, prompt, buffer, cursor)
             end
         elseif c == '\x0e'  # Ctrl+N = next history
             if state.hist_pos > 0
@@ -289,7 +287,7 @@ function read_line_chat(term, state)
                 buffer = Char[]
             end
             cursor = length(buffer) + 1
-            refresh_line(term, "You> ", buffer, cursor)
+            refresh_line(term, prompt, buffer, cursor)
         elseif c == '\r' || c == '\n'
             # Check if this might be part of a paste operation
             # Try to read more characters - if we get multiple quickly, it's paste
@@ -313,7 +311,8 @@ function read_line_chat(term, state)
                 truncate_msg = paste_len > 100 ? "[$paste_len chars truncated]" : "[$paste_len chars pasted]"
                 println(term)
                 printstyled(truncate_msg, color=:cyan)
-                print(term, "\r\nYou> ")
+                print(term, "\r\n")
+                printstyled(term, prompt, color=:cyan, bold=true)
                 flush(term)
                 # Add to buffer but don't print each char
                 for pc in potential_paste
@@ -321,7 +320,7 @@ function read_line_chat(term, state)
                 end
                 # Continue editing - reset state and continue the input loop
                 cursor = length(buffer) + 1
-                refresh_line(term, "You> ", buffer, cursor)
+                refresh_line(term, prompt, buffer, cursor)
             else
                 # Normal enter - submit
                 println(term)
@@ -341,7 +340,7 @@ function read_line_chat(term, state)
                     end
                     buffer = collect(state.history[end - state.hist_pos])
                     cursor = length(buffer) + 1
-                    refresh_line(term, "You> ", buffer, cursor)
+                    refresh_line(term, prompt, buffer, cursor)
                 elseif seq == 'B'
                     if state.hist_pos > 0
                         state.hist_pos -= 1
@@ -354,7 +353,7 @@ function read_line_chat(term, state)
                         buffer = Char[]
                     end
                     cursor = length(buffer) + 1
-                    refresh_line(term, "You> ", buffer, cursor)
+                    refresh_line(term, prompt, buffer, cursor)
                 elseif seq == 'C'
                     if cursor <= length(buffer)
                         print(term, buffer[cursor])
@@ -371,25 +370,25 @@ function read_line_chat(term, state)
                 if new_cursor < cursor
                     deleteat!(buffer, new_cursor:cursor-1)
                     cursor = new_cursor
-                    refresh_line(term, "You> ", buffer, cursor)
+                    refresh_line(term, prompt, buffer, cursor)
                 end
             elseif next == 'b'
                 cursor = backward_word(cursor, buffer)
-                refresh_line(term, "You> ", buffer, cursor)
+                refresh_line(term, prompt, buffer, cursor)
             elseif next == 'f'
                 cursor = forward_word(cursor, buffer)
-                refresh_line(term, "You> ", buffer, cursor)
+                refresh_line(term, prompt, buffer, cursor)
             elseif next == 'd'
                 word_end = forward_word(cursor, buffer)
                 if word_end > cursor
                     deleteat!(buffer, cursor:word_end-1)
-                    refresh_line(term, "You> ", buffer, cursor)
+                    refresh_line(term, prompt, buffer, cursor)
                 end
             end
             continue
         elseif c == '\x01'
             cursor = 1
-            refresh_line(term, "You> ", buffer, cursor)
+            refresh_line(term, prompt, buffer, cursor)
             continue
         elseif c == '\x05'
             for i in cursor:length(buffer)
@@ -411,24 +410,24 @@ function read_line_chat(term, state)
             continue
         elseif c == '\x0b'
             buffer = buffer[1:cursor-1]
-            refresh_line(term, "You> ", buffer, cursor)
+            refresh_line(term, prompt, buffer, cursor)
             continue
         elseif c == '\x15'
             buffer = buffer[cursor:end]
             cursor = 1
-            refresh_line(term, "You> ", buffer, cursor)
+            refresh_line(term, prompt, buffer, cursor)
             continue
         elseif c == '\x7f'
             if cursor > 1
                 deleteat!(buffer, cursor - 1)
                 cursor -= 1
-                refresh_line(term, "You> ", buffer, cursor)
+                refresh_line(term, prompt, buffer, cursor)
             end
             continue
         else
             if cursor <= length(buffer)
                 insert!(buffer, cursor, c)
-                refresh_line(term, "You> ", buffer, cursor)
+                refresh_line(term, prompt, buffer, cursor)
             else
                 push!(buffer, c)
                 print(term, c)
@@ -451,6 +450,7 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  ║ /clear - Clear conversation history ║
  ║ /system - Change system prompt ║
  ║ /think - Toggle thinking mode ║
+ ║ /help - Show this help message ║
  ║ /quit - Exit chat ║
  ╚═══════════════════════════════════════════════════╝
  """
@@ -479,6 +479,15 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  line == "/quit" || line == "/exit" && (printstyled("Goodbye!\n", color=:cyan); break)
  line == "/clear" && (messages = [Message(:system, system_prompt)]; printstyled("Conversation cleared.\n", color=:yellow); continue)
  line == "/think" && (thinking_mode = !thinking_mode; printstyled("Thinking: $(thinking_mode ? "ON" : "OFF")\n", color=:yellow); continue)
+ line == "/help" && begin
+     printstyled("Available commands:\n", color=:cyan, bold=true)
+     println("  /clear  - Clear conversation history")
+     println("  /system - Change system prompt")
+     println("  /think  - Toggle thinking mode")
+     println("  /help   - Show this help message")
+     println("  /quit   - Exit chat")
+     continue
+ end
  line == "/system" && begin
  printstyled("New system prompt: ", color=:magenta)
  raw!(term, false)
@@ -495,6 +504,8 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  
 # Exit raw mode during generation - makes stdin line-buffered
   raw!(term, false)
+
+  printstyled(term, "Assistant> ", color=:green, bold=true)
   
   # Generate and stream with thinking colors
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
