@@ -1,3 +1,3 @@
-## 2025-05-15 - [Graceful CLI Interrupts & Feedback]
-**Learning:** For interactive Julia CLI tools, specifically LLM engines where operations like model loading or prompt input can be interrupted, wrapping `readline()` and `load_model()` in `try-catch` for `EOFError` and `InterruptException` is essential for a polished UX that avoids raw stack traces. Providing immediate visual feedback (e.g., dots) during long-running weight loading makes the app feel responsive even before inference starts.
-**Action:** Use standard `try-catch` blocks for `EOFError` and `InterruptException` in all CLI entry points and add incremental progress printing in `Loader.jl`.
+## 2025-05-15 - [Interactive CLI Polish and Logic Fixes]
+**Learning:** In custom Julia REPL implementations, a redundant `if c == '\e' continue end` block during char reading will shadow all escape sequences (like arrow keys, Home/End). Removing it and correctly handling `CSI` sequences enables full keyboard navigation. Additionally, centralizing terminal feedback (like thinking indicators) within streaming functions and using `\e[2K` for line clearing provides a much more responsive and cleaner UX than manual space padding.
+**Action:** Always verify keyboard sequence handling in `read(term, Char)` loops and use ANSI escape sequences for robust terminal manipulation.
