@@ -1121,82 +1121,112 @@ function lm_head_project!(output::Vector{Float32}, weight::Matrix{BFloat16}, hid
 end
 
 function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top_p::Float32=1.0f0, top_k::Int=0, min_p::Float32=0.0f0)
- # Handle temperature=0 (greedy/argmax sampling)
- if temperature == 0.0f0
- return argmax(logits)
- end
- 
- # Apply temperature
- if temperature != 1.0f0
- logits = logits ./ temperature
- end
-    
-    # Apply top-k filtering
-    if top_k > 0
-        sorted_indices = sortperm(logits, rev=true)
-        keep_indices = Set(sorted_indices[1:min(top_k, length(logits))])
-        for i in 1:length(logits)
-            if i ∉ keep_indices
-                logits[i] = -Inf32
-            end
-        end
+    # Handle temperature=0 (greedy/argmax sampling)
+    if temperature == 0.0f0
+        return argmax(logits)
     end
     
-    # Apply softmax
-    max_logit = maximum(logits)
-    exp_logits = exp.(logits .- max_logit)
-    probs = exp_logits ./ sum(exp_logits)
+    n = length(logits)
+
+    # 1. Determine which tokens to consider and sort them
+    # If top_k is small, partialsortperm is much faster than sortperm.
+    # We always need sorted indices for top_k, top_p, and min_p.
+    if top_k > 0 && top_k < n
+        indices = partialsortperm(1:n, 1:top_k, by=i->logits[i], rev=true)
+    else
+        indices = sortperm(logits, rev=true)
+    end
+
+    # 2. Compute probabilities for the considered tokens
+    # Using the max logit for numerical stability
+    max_logit = logits[indices[1]]
+    k = length(indices)
+
+    # Use a smaller buffer for probabilities
+    # If top_k is used, this is much smaller than the vocabulary (e.g. 50 vs 248k)
+    # This significantly reduces memory allocations per token.
+    probs = Vector{Float32}(undef, k)
+
+    sum_exp = 0.0f0
+    inv_temp = 1.0f0 / temperature
+    for i in 1:k
+        # Apply temperature during exp to avoid an extra vector allocation
+        @inbounds p = exp((logits[indices[i]] - max_logit) * inv_temp)
+        probs[i] = p
+        sum_exp += p
+    end
     
-    # Apply top-p (nucleus) filtering
+    # Normalize
+    if sum_exp > 0.0f0
+        inv_sum_exp = 1.0f0 / sum_exp
+        for i in 1:k
+            @inbounds probs[i] *= inv_sum_exp
+        end
+    else
+        # Fallback for extreme cases (all logits -Inf)
+        @inbounds probs[1] = 1.0f0
+        for i in 2:k; @inbounds probs[i] = 0.0f0; end
+    end
+    
+    # 3. Apply top-p (nucleus) filtering
+    # Since 'probs' is already sorted by construction (from 'indices'),
+    # we just need to find the truncation point.
     if top_p < 1.0f0
-        sorted_indices = sortperm(probs, rev=true)
         cumsum = 0.0f0
-        keep_indices = Set{Int}()
-        for idx in sorted_indices
-            push!(keep_indices, idx)
-            cumsum += probs[idx]
+        cutoff = k
+        for i in 1:k
+            @inbounds cumsum += probs[i]
             if cumsum >= top_p
+                cutoff = i
                 break
             end
         end
-        # Zero out probabilities for tokens not in top-p
-        for i in 1:length(probs)
-            if i ∉ keep_indices
-                probs[i] = 0.0f0
-            end
-        end
-        # Renormalize
-        total = sum(probs)
-        if total > 0.0f0
-            probs ./= total
-        end
+        k = cutoff
     end
     
-    # Apply minimum probability threshold (relative to max probability)
+    # 4. Apply min_p filtering
     if min_p > 0.0f0
-        max_prob = maximum(probs)
-        threshold = max_prob * min_p
-        for i in 1:length(probs)
-            if probs[i] < threshold
-                probs[i] = 0.0f0
+        # probs[1] is the max probability
+        @inbounds threshold = probs[1] * min_p
+        cutoff = 0
+        for i in 1:k
+            @inbounds if probs[i] >= threshold
+                cutoff = i
+            else
+                break
             end
         end
-        total = sum(probs)
+
+        if cutoff > 0
+            k = cutoff
+        else
+            k = 1 # Keep at least one
+        end
+    end
+
+    # 5. Final renormalization (if we truncated) and sampling
+    if k < length(probs)
+        total = 0.0f0
+        for i in 1:k; @inbounds total += probs[i]; end
         if total > 0.0f0
-            probs ./= total
+            inv_total = 1.0f0 / total
+            for i in 1:k; @inbounds probs[i] *= inv_total; end
+        else
+            @inbounds probs[1] = 1.0f0
+            k = 1
         end
     end
     
-    # Sample from distribution
+    # Sample from the truncated distribution
     r = rand(Float32)
     cumsum = 0.0f0
-    for i in 1:length(probs)
-        cumsum += probs[i]
+    for i in 1:k
+        @inbounds cumsum += probs[i]
         if r <= cumsum
-            return i
+            return indices[i]
         end
     end
-    return length(probs)
+    return indices[k]
 end
 
 function apply_presence_penalty!(logits::Vector{Float32}, token_counts::Dict{Int,Int}, penalty::Float32)
