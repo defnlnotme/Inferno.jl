@@ -55,7 +55,7 @@ function speculate_and_verify(
         logits = forward_cpu!(decoder.draft_model, input_tokens, curr_pos, draft_caches)
         logits_vec = vec(logits[:, end])
         
-        next_token = softmax_sample(logits_vec; temperature=temperature, top_p=top_p, top_k=top_k)
+        next_token = softmax_sample!(logits_vec; temperature=temperature, top_p=top_p, top_k=top_k)
         
         push!(draft_tokens, next_token)
         logprobs = logits_vec .- maximum(logits_vec)
@@ -99,7 +99,7 @@ function speculate_and_verify(
     # If all gamma accepted, need one more token
     if length(accepted) == decoder.gamma
         target_logits_final = vec(target_logits[:, end])
-        final_token = softmax_sample(target_logits_final; temperature=temperature, top_p=top_p, top_k=top_k)
+        final_token = softmax_sample!(target_logits_final; temperature=temperature, top_p=top_p, top_k=top_k)
         push!(accepted, final_token)
     end
     

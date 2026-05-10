@@ -26,7 +26,7 @@ Supports both GGUF and Safetensors formats with optional quantization support.
 - `forward_cpu!`: Forward pass
 - `generate_cpu`: Generate tokens
 - `stream_to_stdout_cpu`: Stream to stdout with token stats
-- `softmax_sample`: Sample from logits
+- `softmax_sample!`: Sample from logits (modifies input vector)
 
 ## State Management
 - `init_kv_cache_cpu`: Initialize KV cache
@@ -50,7 +50,7 @@ using BFloat16s
 using Printf
 
 export QwenConfigCPU, QwenModelCPU, KVCacheCPU, forward_cpu!, RMSNormCPU, MLPCPU, GatedDeltaNetCPU, FullAttentionCPU, DecoderLayerCPU, RotaryEmbeddingCPU
-export init_kv_cache_cpu, reset_states_cpu!, softmax_sample, generate_cpu, generate_stream_cpu, stream_to_stdout_cpu
+export init_kv_cache_cpu, reset_states_cpu!, softmax_sample!, generate_cpu, generate_stream_cpu, stream_to_stdout_cpu
 
 # --- Configuration ---
 Base.@kwdef struct QwenConfigCPU
@@ -760,15 +760,18 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
  mul!(attn.v_buf, attn.wv, x)
 
  # Split qkv into query and gate - manual loop to avoid allocation
+ # Hoist fields to local variables for @turbo compatibility
+ n_heads = attn.n_heads
+ head_dim = attn.head_dim
+ qkv_buf = attn.qkv_buf
  query_states = attn.query_states_buf
  gate = attn.gate_buf
- 
- for h in 1:attn.n_heads
- base = (h - 1) * (2 * attn.head_dim)
- for i in 1:attn.head_dim
- query_states[(h-1)*attn.head_dim+i] = attn.qkv_buf[base+i]
- gate[(h-1)*attn.head_dim+i] = attn.qkv_buf[base+attn.head_dim+i]
- end
+
+ @turbo for h in 1:n_heads
+     for i in 1:head_dim
+         query_states[(h-1)*head_dim+i] = qkv_buf[(h-1)*2*head_dim+i]
+         gate[(h-1)*head_dim+i] = qkv_buf[(h-1)*2*head_dim+head_dim+i]
+     end
  end
 
  # Reshape to (head_dim, num_heads)
@@ -1011,38 +1014,21 @@ on a cache-friendly subset of rows.
 Benchmark: 13ms vs 27ms for direct BLAS (2.1x speedup with 4 threads)
 Allocations: 1872 bytes vs 8128 bytes for Threads.@threads
 """
-function lm_head_project!(output::Vector{Float32}, weight::Matrix{Float32}, hidden::Vector{Float32}; nchunks::Int=4)
- vocab_size = size(weight, 1)
- chunk_size = cld(vocab_size, nchunks)
- 
- # Pre-allocate temporary buffers for each chunk
- chunk_outputs = [Vector{Float32}(undef, chunk_size) for _ in 1:nchunks]
- 
- # Use spawn+wait instead of @threads to reduce allocations
- tasks = Vector{Task}(undef, nchunks)
- for chunk in 1:nchunks
- i_start = (chunk - 1) * chunk_size + 1
- i_end = min(chunk * chunk_size, vocab_size)
- actual_size = i_end - i_start + 1
- 
- tasks[chunk] = Threads.@spawn begin
- buf = view(chunk_outputs[chunk], 1:actual_size)
- BLAS.gemv!('N', 1.0f0, view(weight, i_start:i_end, :), hidden, 0.0f0, buf)
- end
- end
- 
- # Wait for all tasks to complete and copy results
- for task in tasks
- wait(task)
- end
- 
- # Copy results back to output
- for chunk in 1:nchunks
- i_start = (chunk - 1) * chunk_size + 1
- i_end = min(chunk * chunk_size, vocab_size)
- actual_size = i_end - i_start + 1
- output[i_start:i_end] .= chunk_outputs[chunk][1:actual_size]
- end
+function lm_head_project!(output::Vector{Float32}, weight::Matrix{Float32}, hidden::Vector{Float32}; nchunks::Int=8)
+    vocab_size = size(weight, 1)
+    chunk_size = cld(vocab_size, nchunks)
+
+    @sync for chunk in 1:nchunks
+        i_start = (chunk - 1) * chunk_size + 1
+        i_end = min(chunk * chunk_size, vocab_size)
+        i_start > vocab_size && break
+
+        Threads.@spawn begin
+            @views out_buf = output[i_start:i_end]
+            @views weight_view = weight[i_start:i_end, :]
+            BLAS.gemv!('N', 1.0f0, weight_view, hidden, 0.0f0, out_buf)
+        end
+    end
 end
 
 """
@@ -1051,152 +1037,110 @@ end
  (vocab entry) maps to a Julia column, which IS contiguous in memory.
  Uses C AVX2 BF16 kernel for each contiguous column dot product.
 """
-function lm_head_project!(output::Vector{Float32}, weight::Matrix{BFloat16}, hidden::Vector{Float32}; nchunks::Int=4)
- # weight is (hidden_size, vocab_size), stored transposed
- # output[j] = dot(weight[:,j], hidden) = sum_i weight[i,j] * hidden[i]
- vocab_size = size(weight, 2)
- 
- W_u16 = reinterpret(UInt16, weight)
- 
- # Convert F32 activations to BF16 once
- x_bf16 = Vector{UInt16}(undef, length(hidden))
- ArrowLake.fp32_to_bf16_c!(x_bf16, hidden)
- 
- # Each column weight[:,j] is contiguous (stride 1) in column-major
- # Use bf16_gemv_c! with the transposed view:
- # Call with W_u16' conceptually, but physically we just pass the whole matrix
- # and let the C kernel iterate over columns.
- # Actually simpler: call bf16_gemv_c! on the full weight
- # bf16_gemv_c! computes out[i] = dot(W_u16[i,:], x_bf16) for row i
- # But we want out[j] = dot(W_u16[:,j], x_bf16) for column j
- # So we use the GEMV kernel on the transposed layout.
- # 
- # The simplest correct approach: use the C kernel's bf16_dot_avx2 directly
- # for each column. But we need a Julia wrapper.
- # 
- # Alternative: just use the already-working bf16_gemv_c! on contiguous rows
- # by reinterpreting the weight matrix layout.
- # 
- # Simplest: use bf16_gemv_c! with (vocab_size, hidden_size) row-major view
- # Since weight is (hidden_size, vocab_size) in Julia column-major,
- # reinterpreting as (vocab_size, hidden_size) row-major would require
- # transposing the data.
- #
- # ACTUALLY: the transposed weight already makes columns contiguous.
- # A column view(W_u16, :, j) IS contiguous and IS what we need for dot product.
- # We just need a Julia-callable bf16_dot_avx2 wrapper.
- 
- chunk_size = cld(vocab_size, nchunks)
- chunk_outputs = [Vector{Float32}(undef, chunk_size) for _ in 1:nchunks]
- tasks = Vector{Task}(undef, nchunks)
- for chunk in 1:nchunks
- j_start = (chunk - 1) * chunk_size + 1
- j_end = min(chunk * chunk_size, vocab_size)
- actual_size = j_end - j_start + 1
- 
- tasks[chunk] = Threads.@spawn begin
- # Use the GEMV kernel: treat each column as a "row" for the dot product
- # Pass a view of contiguous columns to the C kernel
- # The C kernel bf16_gemv_avx2(out, A, x, m, n, stride) computes:
- # out[i] = dot(A[i*stride .. i*stride+n-1], x)
- # We want: out[k] = dot(W_u16[:, j_start+k-1], x_bf16)
- # Column j of W_u16 starts at W_u16[1,j] = parent[offset + (j-1)*hidden_size]
- # So we can pass columns as if they were rows with stride=hidden_size
- ArrowLake.bf16_gemv_c_cols!(
- view(chunk_outputs[chunk], 1:actual_size),
- W_u16, x_bf16, j_start, j_end, size(weight, 1))
- end
- end
- 
- for task in tasks
- wait(task)
- end
- 
- for chunk in 1:nchunks
- j_start = (chunk - 1) * chunk_size + 1
- j_end = min(chunk * chunk_size, vocab_size)
- actual_size = j_end - j_start + 1
- output[j_start:j_end] .= chunk_outputs[chunk][1:actual_size]
- end
+function lm_head_project!(output::Vector{Float32}, weight::Matrix{BFloat16}, hidden::Vector{Float32}; nchunks::Int=8)
+    # weight is (hidden_size, vocab_size), stored transposed
+    # output[j] = dot(weight[:,j], hidden) = sum_i weight[i,j] * hidden[i]
+    vocab_size = size(weight, 2)
+    chunk_size = cld(vocab_size, nchunks)
+    
+    W_u16 = reinterpret(UInt16, weight)
+
+    # Convert F32 activations to BF16 once
+    x_bf16 = Vector{UInt16}(undef, length(hidden))
+    ArrowLake.fp32_to_bf16_c!(x_bf16, hidden)
+
+    hidden_dim = size(weight, 1)
+
+    @sync for chunk in 1:nchunks
+        j_start = (chunk - 1) * chunk_size + 1
+        j_end = min(chunk * chunk_size, vocab_size)
+        j_start > vocab_size && break
+
+        Threads.@spawn begin
+            @views out_view = output[j_start:j_end]
+            ArrowLake.bf16_gemv_c_cols!(out_view, W_u16, x_bf16, j_start, j_end, hidden_dim)
+        end
+    end
 end
 
-function softmax_sample(logits::Vector{Float32}; temperature::Float32=1.0f0, top_p::Float32=1.0f0, top_k::Int=0, min_p::Float32=0.0f0)
- # Handle temperature=0 (greedy/argmax sampling)
- if temperature == 0.0f0
- return argmax(logits)
- end
- 
- # Apply temperature
- if temperature != 1.0f0
- logits = logits ./ temperature
- end
-    
-    # Apply top-k filtering
-    if top_k > 0
-        sorted_indices = sortperm(logits, rev=true)
-        keep_indices = Set(sorted_indices[1:min(top_k, length(logits))])
-        for i in 1:length(logits)
-            if i ∉ keep_indices
-                logits[i] = -Inf32
-            end
-        end
+function softmax_sample!(logits::Vector{Float32}; temperature::Float32=1.0f0, top_p::Float32=1.0f0, top_k::Int=0, min_p::Float32=0.0f0)
+    # Handle temperature=0 (greedy/argmax sampling)
+    if temperature == 0.0f0
+        return argmax(logits)
     end
     
-    # Apply softmax
-    max_logit = maximum(logits)
-    exp_logits = exp.(logits .- max_logit)
-    probs = exp_logits ./ sum(exp_logits)
+    # Apply temperature and find max logit in one pass to avoid multiple scans
+    inv_temp = 1.0f0 / temperature
+    mx = -Inf32
+    @inbounds for i in eachindex(logits)
+        v = logits[i] * inv_temp
+        logits[i] = v
+        if v > mx; mx = v; end
+    end
+
+    n = length(logits)
     
-    # Apply top-p (nucleus) filtering
-    if top_p < 1.0f0
-        sorted_indices = sortperm(probs, rev=true)
+    # Determine if we need to sort for Top-K, Top-P, or Min-P
+    if (top_k > 0 && top_k < n) || top_p < 1.0f0 || min_p > 0.0f0
+        # selection sort/partial sort is much faster than full sort for small K
+        if top_k > 0 && top_k < n
+            indices = partialsortperm(logits, 1:top_k, rev=true)
+        else
+            indices = sortperm(logits, rev=true)
+        end
+
+        n_active = length(indices)
+        # Allocate only for active tokens, significantly reducing memory churn for large vocabs
+        active_probs = Vector{Float32}(undef, n_active)
+        sum_exp = 0.0f0
+        for i in 1:n_active
+            p = exp(logits[indices[i]] - mx)
+            active_probs[i] = p
+            sum_exp += p
+        end
+
+        inv_sum = 1.0f0 / sum_exp
+        threshold = min_p > 0.0f0 ? (active_probs[1] * inv_sum) * min_p : -1.0f0
+
         cumsum = 0.0f0
-        keep_indices = Set{Int}()
-        for idx in sorted_indices
-            push!(keep_indices, idx)
-            cumsum += probs[idx]
-            if cumsum >= top_p
-                break
+        final_count = 0
+        for i in 1:n_active
+            p = active_probs[i] * inv_sum
+            if p < threshold; break; end
+            cumsum += p
+            final_count += 1
+            if cumsum >= top_p; break; end
+        end
+
+        # Sample from the filtered distribution
+        r = rand(Float32) * cumsum
+        acc = 0.0f0
+        for i in 1:final_count
+            p = active_probs[i] * inv_sum
+            acc += p
+            if r <= acc
+                return indices[i]
             end
         end
-        # Zero out probabilities for tokens not in top-p
-        for i in 1:length(probs)
-            if i ∉ keep_indices
-                probs[i] = 0.0f0
+        return indices[final_count]
+    else
+        # Standard softmax sampling without sorting (Fast path)
+        sum_exp = 0.0f0
+        @inbounds for i in 1:n
+            sum_exp += exp(logits[i] - mx)
+        end
+
+        r = rand(Float32) * sum_exp
+        acc = 0.0f0
+        @inbounds for i in 1:n
+            p = exp(logits[i] - mx)
+            acc += p
+            if r <= acc
+                return i
             end
         end
-        # Renormalize
-        total = sum(probs)
-        if total > 0.0f0
-            probs ./= total
-        end
+        return n
     end
-    
-    # Apply minimum probability threshold (relative to max probability)
-    if min_p > 0.0f0
-        max_prob = maximum(probs)
-        threshold = max_prob * min_p
-        for i in 1:length(probs)
-            if probs[i] < threshold
-                probs[i] = 0.0f0
-            end
-        end
-        total = sum(probs)
-        if total > 0.0f0
-            probs ./= total
-        end
-    end
-    
-    # Sample from distribution
-    r = rand(Float32)
-    cumsum = 0.0f0
-    for i in 1:length(probs)
-        cumsum += probs[i]
-        if r <= cumsum
-            return i
-        end
-    end
-    return length(probs)
 end
 
 function apply_presence_penalty!(logits::Vector{Float32}, token_counts::Dict{Int,Int}, penalty::Float32)
@@ -1248,7 +1192,7 @@ function generate_cpu(model::QwenModelCPU, tokens::Vector{Int}, pos::Int, caches
     apply_repetition_penalty!(logits_vec, token_counts, repetition_penalty)
     
     # Sample
-    next_token = softmax_sample(logits_vec; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
+    next_token = softmax_sample!(logits_vec; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
     
     return next_token, logits_vec
 end
@@ -1322,7 +1266,7 @@ function generate_stream_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int}, de
  apply_repetition_penalty!(first_logits_vec, token_counts, repetition_penalty)
 
  # Sample the first token
- next_token = softmax_sample(first_logits_vec; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
+ next_token = softmax_sample!(first_logits_vec; temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
 
  curr_pos += 1
  token_counts[next_token] = get(token_counts, next_token, 0) + 1
@@ -1667,7 +1611,7 @@ function generate_mtp_cpu(model::QwenModelCPU, prompt_tokens::Vector{Int};
  if temperature == 0.0f0
  next_token = argmax(first_logits)
  else
- next_token = softmax_sample(first_logits; temperature=temperature, top_p=top_p, top_k=top_k)
+ next_token = softmax_sample!(first_logits; temperature=temperature, top_p=top_p, top_k=top_k)
  end
  push!(generated_tokens, next_token)
  curr_pos += 1
@@ -1763,7 +1707,7 @@ function mtp_predict_step!(model::QwenModelCPU, input_tokens::Vector{Int}, pos::
  tok = argmax(probs)
  push!(predicted_tokens, tok)
  else
- tok = softmax_sample(logits_i; temperature=temperature, top_p=top_p, top_k=top_k)
+ tok = softmax_sample!(logits_i; temperature=temperature, top_p=top_p, top_k=top_k)
  push!(predicted_tokens, tok)
  end
  end
@@ -1822,7 +1766,7 @@ function mtp_predict_with_head!(model::QwenModelCPU, input_tokens::Vector{Int}, 
  end
  next_token = argmax(probs)
  else
- next_token = softmax_sample(mtp_logits; temperature=temperature, top_p=top_p, top_k=top_k)
+ next_token = softmax_sample!(mtp_logits; temperature=temperature, top_p=top_p, top_k=top_k)
  end
  
  push!(predicted_tokens, next_token)
