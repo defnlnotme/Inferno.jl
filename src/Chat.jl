@@ -97,6 +97,14 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
     t0 = time()
     token_count = 0
     
+    # Show thinking indicator if TTY
+    first_token = true
+    is_stdout_tty = isa(io, Base.TTY) || (hasfield(typeof(io), :io) && isa(io.io, Base.TTY))
+    if is_stdout_tty
+        printstyled(io, "...", color=:light_black)
+        flush(io)
+    end
+
     # Extract and convert Float32 parameters
     temperature = haskey(kwargs, :temperature) ? Float32(kwargs[:temperature]) : 0.7f0
     top_p = haskey(kwargs, :top_p) ? Float32(kwargs[:top_p]) : 0.95f0
@@ -110,6 +118,15 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
         temperature=temperature, top_p=top_p, top_k=top_k,
         repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p,
         show_tps=false, io=stdout)
+
+        if first_token
+            if is_stdout_tty
+                # Clear thinking indicator: move back 3 spaces and clear to end of line
+                print(io, "\b\b\b\e[K")
+            end
+            first_token = false
+        end
+
         token_buffer *= token
         token_count += 1
         
@@ -119,7 +136,7 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
         else
             print(io, token)
         end
-flush(io)
+        flush(io)
     end
     
     # Print TPS if enabled
@@ -138,6 +155,15 @@ function chat(model, tok, messages::Vector{Message}; enable_thinking::Bool=false
  im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
  stop_token = im_end_id != 0 ? im_end_id : tok.eos_id
  return stream_to_stdout(model, tok, prompt; stop_token=stop_token, kwargs...)
+end
+
+function display_help(term)
+    printstyled(term, "Available commands:\n", bold=true)
+    printstyled(term, "  /clear", color=:yellow); println(term, "  - Clear conversation history")
+    printstyled(term, "  /system", color=:yellow); println(term, " - Change system prompt")
+    printstyled(term, "  /think", color=:yellow); println(term, "  - Toggle thinking mode")
+    printstyled(term, "  /help", color=:yellow); println(term, "   - Show this help message")
+    printstyled(term, "  /quit", color=:yellow); print(term, ", "); printstyled(term, "/exit", color=:yellow); println(term, " - Exit chat")
 end
 
 const interrupt_flag = Threads.Atomic{Bool}(false)
@@ -221,19 +247,22 @@ function forward_word(cursor::Int, buffer::Vector{Char})
 end
 
 function clear_line(term, prompt)
-    print(term, "\r" * " "^80 * "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term, prompt, color=:cyan, bold=true)
 end
 
 function refresh_line(term, prompt, buffer, cursor)
-    print(term, "\r" * " "^80 * "\r" * prompt * String(buffer) * "\r")
-    print(term, "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term, prompt, color=:cyan, bold=true)
+    print(term, String(buffer) * "\r")
+    printstyled(term, prompt, color=:cyan, bold=true)
     for i in 1:cursor-1
         print(term, buffer[i])
     end
 end
 
 function read_line_chat(term, state)
-    print(term, "You> ")
+    printstyled(term, "You> ", color=:cyan, bold=true)
     flush(term)
     
     buffer = Char[]
@@ -451,6 +480,7 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  ║ /clear - Clear conversation history ║
  ║ /system - Change system prompt ║
  ║ /think - Toggle thinking mode ║
+ ║ /help - Show help message ║
  ║ /quit - Exit chat ║
  ╚═══════════════════════════════════════════════════╝
  """
@@ -476,7 +506,8 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  
  isempty(line) && continue
  line == "EXIT_CHAT" && (printstyled("Goodbye!\n", color=:cyan); break)
- line == "/quit" || line == "/exit" && (printstyled("Goodbye!\n", color=:cyan); break)
+ (line == "/quit" || line == "/exit") && (printstyled("Goodbye!\n", color=:cyan); break)
+ line == "/help" && (display_help(term); continue)
  line == "/clear" && (messages = [Message(:system, system_prompt)]; printstyled("Conversation cleared.\n", color=:yellow); continue)
  line == "/think" && (thinking_mode = !thinking_mode; printstyled("Thinking: $(thinking_mode ? "ON" : "OFF")\n", color=:yellow); continue)
  line == "/system" && begin
@@ -496,6 +527,8 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
 # Exit raw mode during generation - makes stdin line-buffered
   raw!(term, false)
   
+  printstyled(term, "Assistant> ", color=:green, bold=true)
+
   # Generate and stream with thinking colors
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
   stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
