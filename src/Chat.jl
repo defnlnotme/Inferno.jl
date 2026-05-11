@@ -251,12 +251,6 @@ function read_line_chat(term, state)
             end
         end
         
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
-            continue
-        end
-        
         if c == '\x04'
             isempty(buffer) && return "EXIT_CHAT"
             println(term)
@@ -476,7 +470,7 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  
  isempty(line) && continue
  line == "EXIT_CHAT" && (printstyled("Goodbye!\n", color=:cyan); break)
- line == "/quit" || line == "/exit" && (printstyled("Goodbye!\n", color=:cyan); break)
+ (line == "/quit" || line == "/exit") && (printstyled("Goodbye!\n", color=:cyan); break)
  line == "/clear" && (messages = [Message(:system, system_prompt)]; printstyled("Conversation cleared.\n", color=:yellow); continue)
  line == "/think" && (thinking_mode = !thinking_mode; printstyled("Thinking: $(thinking_mode ? "ON" : "OFF")\n", color=:yellow); continue)
  line == "/system" && begin
