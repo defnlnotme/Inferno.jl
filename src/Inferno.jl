@@ -50,7 +50,7 @@ using .Server
 using .Generate
 
 export load_model, load_model_cpu, start_server, non_nothing_fields, stream_to_stdout, stream_to_stdout_cpu
-export LoaderCPU, ModelCPU, generate_stream_cpu, generate_cpu, softmax_sample, BF16Support
+export LoaderCPU, ModelCPU, generate_stream_cpu, generate_cpu, softmax_sample, softmax_sample!, BF16Support
 export generate_text
 export chat!, start_chat, Message, build_prompt
 export load_safetensors_model, Safetensors, detect_model_format
