@@ -113,6 +113,11 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
         token_buffer *= token
         token_count += 1
         
+        # Detect end of thinking block
+        if is_thinking && occursin("</think>", token_buffer)
+            is_thinking = false
+        end
+
         # Print with appropriate color - color content in thinking blocks
         if is_thinking
             printstyled(io, token, color=:light_black, italic=true)
@@ -221,19 +226,23 @@ function forward_word(cursor::Int, buffer::Vector{Char})
 end
 
 function clear_line(term, prompt)
-    print(term, "\r" * " "^80 * "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term, prompt, color=:cyan, bold=true)
 end
 
 function refresh_line(term, prompt, buffer, cursor)
-    print(term, "\r" * " "^80 * "\r" * prompt * String(buffer) * "\r")
-    print(term, "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term, prompt, color=:cyan, bold=true)
+    print(term, String(buffer) * "\r")
+    print(term, "\r")
+    printstyled(term, prompt, color=:cyan, bold=true)
     for i in 1:cursor-1
         print(term, buffer[i])
     end
 end
 
 function read_line_chat(term, state)
-    print(term, "You> ")
+    printstyled(term, "You> ", color=:cyan, bold=true)
     flush(term)
     
     buffer = Char[]
@@ -249,12 +258,6 @@ function read_line_chat(term, state)
             else
                 rethrow(e)
             end
-        end
-        
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
-            continue
         end
         
         if c == '\x04'
@@ -313,7 +316,8 @@ function read_line_chat(term, state)
                 truncate_msg = paste_len > 100 ? "[$paste_len chars truncated]" : "[$paste_len chars pasted]"
                 println(term)
                 printstyled(truncate_msg, color=:cyan)
-                print(term, "\r\nYou> ")
+                print(term, "\r\n")
+                printstyled(term, "You> ", color=:cyan, bold=true)
                 flush(term)
                 # Add to buffer but don't print each char
                 for pc in potential_paste
@@ -438,6 +442,16 @@ function read_line_chat(term, state)
     end
 end
 
+function display_help(term)
+    println(term, "\nAvailable commands:")
+    printstyled(term, "  /clear", color=:yellow); println(term, "  - Clear conversation history")
+    printstyled(term, "  /system", color=:yellow); println(term, " - Change system prompt")
+    printstyled(term, "  /think", color=:yellow); println(term, "  - Toggle thinking mode")
+    printstyled(term, "  /help", color=:yellow); println(term, "   - Show this help message")
+    printstyled(term, "  /quit", color=:yellow); println(term, "   - Exit chat")
+    println(term)
+end
+
 function chat!(model, tok; system_prompt::String="You are a helpful assistant.", enable_thinking::Bool=false, kwargs...)
  messages = [Message(:system, system_prompt)]
  thinking_mode = enable_thinking
@@ -476,7 +490,8 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  
  isempty(line) && continue
  line == "EXIT_CHAT" && (printstyled("Goodbye!\n", color=:cyan); break)
- line == "/quit" || line == "/exit" && (printstyled("Goodbye!\n", color=:cyan); break)
+ (line == "/quit" || line == "/exit") && (printstyled("Goodbye!\n", color=:cyan); break)
+ line == "/help" && (display_help(term); continue)
  line == "/clear" && (messages = [Message(:system, system_prompt)]; printstyled("Conversation cleared.\n", color=:yellow); continue)
  line == "/think" && (thinking_mode = !thinking_mode; printstyled("Thinking: $(thinking_mode ? "ON" : "OFF")\n", color=:yellow); continue)
  line == "/system" && begin
@@ -496,6 +511,8 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
 # Exit raw mode during generation - makes stdin line-buffered
   raw!(term, false)
   
+  printstyled(term, "Assistant> ", color=:green, bold=true)
+
   # Generate and stream with thinking colors
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
   stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
