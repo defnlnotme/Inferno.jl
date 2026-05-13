@@ -116,6 +116,10 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
         # Print with appropriate color - color content in thinking blocks
         if is_thinking
             printstyled(io, token, color=:light_black, italic=true)
+            # Detect end of thinking block
+            if occursin("</think>", token)
+                is_thinking = false
+            end
         else
             print(io, token)
         end
@@ -145,7 +149,7 @@ const chat_terminal = Ref{Any}(nothing)
 
 function check_interrupt()
     if interrupt_flag[]
-        interrupt_flag[], false
+        interrupt_flag[] = false
         return true
     end
     # Try to check if there's input available on terminal
@@ -221,19 +225,22 @@ function forward_word(cursor::Int, buffer::Vector{Char})
 end
 
 function clear_line(term, prompt)
-    print(term, "\r" * " "^80 * "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term, prompt, color=:cyan, bold=true)
 end
 
 function refresh_line(term, prompt, buffer, cursor)
-    print(term, "\r" * " "^80 * "\r" * prompt * String(buffer) * "\r")
-    print(term, "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term, prompt, color=:cyan, bold=true)
+    print(term, String(buffer) * "\r")
+    printstyled(term, prompt, color=:cyan, bold=true)
     for i in 1:cursor-1
         print(term, buffer[i])
     end
 end
 
 function read_line_chat(term, state)
-    print(term, "You> ")
+    printstyled(term, "You> ", color=:cyan, bold=true)
     flush(term)
     
     buffer = Char[]
@@ -251,11 +258,6 @@ function read_line_chat(term, state)
             end
         end
         
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
-            continue
-        end
         
         if c == '\x04'
             isempty(buffer) && return "EXIT_CHAT"
@@ -313,7 +315,8 @@ function read_line_chat(term, state)
                 truncate_msg = paste_len > 100 ? "[$paste_len chars truncated]" : "[$paste_len chars pasted]"
                 println(term)
                 printstyled(truncate_msg, color=:cyan)
-                print(term, "\r\nYou> ")
+                print(term, "\r\n")
+                printstyled(term, "You> ", color=:cyan, bold=true)
                 flush(term)
                 # Add to buffer but don't print each char
                 for pc in potential_paste
@@ -461,8 +464,8 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  
  state = ChatState(String[], -1)
  term = TTYTerminal("/dev/tty", stdin, stdout, stderr)
- chat_terminal[], term
- interrupt_flag[], false
+ chat_terminal[] = term
+ interrupt_flag[] = false
  
 # Stop on EOS and <|im_end|>
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
@@ -499,6 +502,7 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
   # Generate and stream with thinking colors
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
   stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
+  printstyled(term, "Assistant> ", color=:green, bold=true)
 response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, thinking_enabled=thinking_mode, show_tps=true, kwargs...)
    
    # Print newline after response
@@ -512,7 +516,7 @@ response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_t
     catch e
         if e isa InterruptException
             println(term)
-            interrupt_flag[], false
+            interrupt_flag[] = false
         else
             rethrow(e)
         end
