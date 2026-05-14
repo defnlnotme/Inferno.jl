@@ -221,19 +221,22 @@ function forward_word(cursor::Int, buffer::Vector{Char})
 end
 
 function clear_line(term, prompt)
-    print(term, "\r" * " "^80 * "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term.out_stream, prompt, color=:cyan, bold=true)
 end
 
 function refresh_line(term, prompt, buffer, cursor)
-    print(term, "\r" * " "^80 * "\r" * prompt * String(buffer) * "\r")
-    print(term, "\r" * prompt)
+    print(term, "\r\e[2K")
+    printstyled(term.out_stream, prompt, color=:cyan, bold=true)
+    print(term, String(buffer), "\r")
+    printstyled(term.out_stream, prompt, color=:cyan, bold=true)
     for i in 1:cursor-1
         print(term, buffer[i])
     end
 end
 
 function read_line_chat(term, state)
-    print(term, "You> ")
+    printstyled(term.out_stream, "You> ", color=:cyan, bold=true)
     flush(term)
     
     buffer = Char[]
@@ -312,8 +315,9 @@ function read_line_chat(term, state)
                 paste_len = length(potential_paste)
                 truncate_msg = paste_len > 100 ? "[$paste_len chars truncated]" : "[$paste_len chars pasted]"
                 println(term)
-                printstyled(truncate_msg, color=:cyan)
-                print(term, "\r\nYou> ")
+                printstyled(term.out_stream, truncate_msg, color=:cyan)
+                print(term, "\r\n")
+                printstyled(term.out_stream, "You> ", color=:cyan, bold=true)
                 flush(term)
                 # Add to buffer but don't print each char
                 for pc in potential_paste
@@ -495,7 +499,9 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  
 # Exit raw mode during generation - makes stdin line-buffered
   raw!(term, false)
-  
+
+  printstyled(term.out_stream, "Assistant> ", color=:green, bold=true)
+
   # Generate and stream with thinking colors
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
   stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
