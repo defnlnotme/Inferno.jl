@@ -44,10 +44,13 @@ function build_prompt(messages::Vector{Message}; enable_thinking::Bool=false)
 end
 
 function render_with_thinking_color(response::String, term)
+    # Correctly handle TTYTerminal by using out_stream
+    out = term isa TTYTerminal ? term.out_stream : term
+
     # No thinking blocks - print normally
     if !occursin("<think>", response)
-        print(term, response)
-        println(term)
+        print(out, response)
+        println(out)
         return response
     end
     
@@ -81,9 +84,9 @@ function render_with_thinking_color(response::String, term)
         end
     end
     
-    print(term, String(take!(buffer)))
-    println(term)
-    flush(term)
+    print(out, String(take!(buffer)))
+    println(out)
+    flush(out)
     return response
 end
 
@@ -105,28 +108,32 @@ function stream_with_colors(model, tok, prompt; io::IO=stdout, stop_tokens::Set{
     presence_penalty = haskey(kwargs, :presence_penalty) ? Float32(kwargs[:presence_penalty]) : 0.0f0
     min_p = haskey(kwargs, :min_p) ? Float32(kwargs[:min_p]) : 0.0f0
     
+    # Correctly handle TTYTerminal by using out_stream
+    out = io isa TTYTerminal ? io.out_stream : io
+
     for token in generate_stream_cpu(model, prompt_tokens, (ids) -> decode(tok, ids); 
         max_tokens=max_tokens, stop_tokens=stop_tokens,
         temperature=temperature, top_p=top_p, top_k=top_k,
         repetition_penalty=repetition_penalty, presence_penalty=presence_penalty, min_p=min_p,
-        show_tps=false, io=stdout)
+        show_tps=false, io=out)
         token_buffer *= token
         token_count += 1
         
         # Print with appropriate color - color content in thinking blocks
         if is_thinking
-            printstyled(io, token, color=:light_black, italic=true)
+            printstyled(out, token, color=:light_black, italic=true)
         else
-            print(io, token)
+            print(out, token)
         end
-flush(io)
+        flush(out)
     end
     
     # Print TPS if enabled
     if show_tps && token_count > 0
         elapsed = time() - t0
         tps = elapsed > 0 ? token_count / elapsed : 0.0
-        printstyled(io, "\n[t/s] $(round(tps, digits=2)) tokens/s — $(token_count) tokens in $(round(elapsed, digits=3))s\n", color=:cyan)
+        printstyled(out, "\n[t/s] $(round(tps, digits=2)) tokens/s — $(token_count) tokens in $(round(elapsed, digits=3))s\n", color=:cyan)
+        flush(out)
     end
     
     return token_buffer
@@ -221,20 +228,23 @@ function forward_word(cursor::Int, buffer::Vector{Char})
 end
 
 function clear_line(term, prompt)
-    print(term, "\r" * " "^80 * "\r" * prompt)
+    print(term.out_stream, "\r\e[2K")
+    printstyled(term.out_stream, prompt, color=:cyan, bold=true)
 end
 
 function refresh_line(term, prompt, buffer, cursor)
-    print(term, "\r" * " "^80 * "\r" * prompt * String(buffer) * "\r")
-    print(term, "\r" * prompt)
+    print(term.out_stream, "\r\e[2K")
+    printstyled(term.out_stream, prompt, color=:cyan, bold=true)
+    print(term.out_stream, String(buffer) * "\r")
+    printstyled(term.out_stream, prompt, color=:cyan, bold=true)
     for i in 1:cursor-1
-        print(term, buffer[i])
+        print(term.out_stream, buffer[i])
     end
 end
 
 function read_line_chat(term, state)
-    print(term, "You> ")
-    flush(term)
+    printstyled(term.out_stream, "You> ", color=:cyan, bold=true)
+    flush(term.out_stream)
     
     buffer = Char[]
     cursor = 1
@@ -251,20 +261,15 @@ function read_line_chat(term, state)
             end
         end
         
-        # Skip escape sequences ( CSI, OSC, DCS, etc. )
-        if c == '\e'
-            # This is start of escape sequence - consume and discard
-            continue
-        end
         
         if c == '\x04'
             isempty(buffer) && return "EXIT_CHAT"
-            println(term)
+            println(term.out_stream)
             result = String(buffer)
             !isempty(result) && push!(state.history, result)
             return result
         elseif c == '\x03'
-            println(term)
+            println(term.out_stream)
             return ""
         elseif c == '\x10'  # Ctrl+P = previous history
             if !isempty(state.history)
@@ -311,10 +316,11 @@ function read_line_chat(term, state)
                 # This appears to be paste - include in buffer but don't render
                 paste_len = length(potential_paste)
                 truncate_msg = paste_len > 100 ? "[$paste_len chars truncated]" : "[$paste_len chars pasted]"
-                println(term)
-                printstyled(truncate_msg, color=:cyan)
-                print(term, "\r\nYou> ")
-                flush(term)
+                println(term.out_stream)
+                printstyled(term.out_stream, truncate_msg, color=:cyan)
+                print(term.out_stream, "\r\n")
+                printstyled(term.out_stream, "You> ", color=:cyan, bold=true)
+                flush(term.out_stream)
                 # Add to buffer but don't print each char
                 for pc in potential_paste
                     push!(buffer, pc)
@@ -324,7 +330,7 @@ function read_line_chat(term, state)
                 refresh_line(term, "You> ", buffer, cursor)
             else
                 # Normal enter - submit
-                println(term)
+                println(term.out_stream)
                 result = String(buffer)
                 !isempty(result) && push!(state.history, result)
                 return result
@@ -357,13 +363,36 @@ function read_line_chat(term, state)
                     refresh_line(term, "You> ", buffer, cursor)
                 elseif seq == 'C'
                     if cursor <= length(buffer)
-                        print(term, buffer[cursor])
+                        print(term.out_stream, buffer[cursor])
                         cursor += 1
                     end
                 elseif seq == 'D'
                     if cursor > 1
                         cursor -= 1
-                        print(term, "\b")
+                        print(term.out_stream, "\b")
+                    end
+                elseif seq == 'H' # Home
+                    cursor = 1
+                    refresh_line(term, "You> ", buffer, cursor)
+                elseif seq == 'F' # End
+                    cursor = length(buffer) + 1
+                    refresh_line(term, "You> ", buffer, cursor)
+                elseif seq == '1' || seq == '4' || seq == '3'
+                    # Handle extended sequences like \e[1~ (Home), \e[4~ (End), \e[3~ (Delete)
+                    next_seq = read(term, Char)
+                    if next_seq == '~'
+                        if seq == '1' # Home
+                            cursor = 1
+                            refresh_line(term, "You> ", buffer, cursor)
+                        elseif seq == '4' # End
+                            cursor = length(buffer) + 1
+                            refresh_line(term, "You> ", buffer, cursor)
+                        elseif seq == '3' # Delete
+                            if cursor <= length(buffer)
+                                deleteat!(buffer, cursor)
+                                refresh_line(term, "You> ", buffer, cursor)
+                            end
+                        end
                     end
                 end
             elseif next == '\x7f'
@@ -391,21 +420,23 @@ function read_line_chat(term, state)
             cursor = 1
             refresh_line(term, "You> ", buffer, cursor)
             continue
-        elseif c == '\x05'
-            for i in cursor:length(buffer)
-                print(term, buffer[i])
-            end
-            cursor = min(length(buffer) + 1, cursor)
+        elseif c == '\x05' # Ctrl+E: move to end
+            cursor = length(buffer) + 1
+            refresh_line(term, "You> ", buffer, cursor)
+            continue
+        elseif c == '\x0c' # Ctrl+L: clear screen
+            print(term.out_stream, "\e[H\e[2J")
+            refresh_line(term, "You> ", buffer, cursor)
             continue
         elseif c == '\x02'
             if cursor > 1
                 cursor -= 1
-                print(term, "\b")
+                print(term.out_stream, "\b")
             end
             continue
         elseif c == '\x06'
             if cursor <= length(buffer)
-                print(term, buffer[cursor])
+                print(term.out_stream, buffer[cursor])
                 cursor += 1
             end
             continue
@@ -431,7 +462,7 @@ function read_line_chat(term, state)
                 refresh_line(term, "You> ", buffer, cursor)
             else
                 push!(buffer, c)
-                print(term, c)
+                print(term.out_stream, c)
             end
             cursor += 1
         end
@@ -443,17 +474,17 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
  thinking_mode = enable_thinking
  
  banner = """
- ╔═══════════════════════════════════════════════════╗
- ║ Welcome to Inferno Chat! ║
- ╠═══════════════════════════════════════════════════╣
- ║ Type your message and press Enter to chat. ║
- ║ Commands: ║
- ║ /clear - Clear conversation history ║
- ║ /system - Change system prompt ║
- ║ /think - Toggle thinking mode ║
- ║ /quit - Exit chat ║
- ╚═══════════════════════════════════════════════════╝
- """
+╔═══════════════════════════════════════════════════╗
+║ Welcome to Inferno Chat! ║
+╠═══════════════════════════════════════════════════╣
+║ Type your message and press Enter to chat. ║
+║ Commands: ║
+║ /clear - Clear conversation history ║
+║ /system - Change system prompt ║
+║ /think - Toggle thinking mode ║
+║ /quit - Exit chat ║
+╚═══════════════════════════════════════════════════╝
+"""
  
  printstyled(banner, color=:cyan, bold=true)
  printstyled("Thinking: $(thinking_mode ? "ON" : "OFF")\n", color=:yellow)
@@ -496,13 +527,17 @@ function chat!(model, tok; system_prompt::String="You are a helpful assistant.",
 # Exit raw mode during generation - makes stdin line-buffered
   raw!(term, false)
   
+  # Print assistant prefix
+  printstyled(term.out_stream, "Assistant> ", color=:green, bold=true)
+  flush(term.out_stream)
+
   # Generate and stream with thinking colors
   im_end_id = get(tok.token_to_id, "<|im_end|>", 0)
   stop_tokens = Set(filter(!=(0), [tok.eos_id, im_end_id]))
 response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_tokens=div(model.config.max_position_embeddings, 2), io=term, thinking_enabled=thinking_mode, show_tps=true, kwargs...)
    
    # Print newline after response
-   println(term)
+   println(term.out_stream)
    
    # Re-enter raw mode for input
    raw!(term, true)
@@ -511,7 +546,7 @@ response = stream_with_colors(model, tok, prompt; stop_tokens=stop_tokens, max_t
  end
     catch e
         if e isa InterruptException
-            println(term)
+            println(term.out_stream)
             interrupt_flag[], false
         else
             rethrow(e)
