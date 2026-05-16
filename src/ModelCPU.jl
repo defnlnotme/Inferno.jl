@@ -196,34 +196,39 @@ function rmsnorm_rotary!(x::Matrix{Float32}, pos::Int, rope::RotaryEmbeddingCPU,
  sin_vals = view(rope.sin_cache, :, pos_idx)
  end
  
+ eps = norm.eps
+ rotary_dim = rope.rotary_dim
+
  for h in 1:num_heads
  # First: RMSNorm on this head
  sum_sq = 0.0f0
- for i in 1:head_dim
- @inbounds sum_sq += x[i, h] * x[i, h]
+ @turbo for i in 1:head_dim
+ sum_sq += x[i, h] * x[i, h]
  end
- rms = sqrt(sum_sq / head_dim + norm.eps)
+ rms = sqrt(sum_sq / head_dim + eps)
  inv_rms = 1.0f0 / rms
  
- # Apply RMSNorm and RoPE in one pass
- for i in 1:head_dim
- @inbounds x[i, h] = x[i, h] * inv_rms * weight[i]
- end
- 
- # Now apply RoPE to the first rotary_dim dimensions
- for i in 1:half
- @inbounds begin
+ # Fused RMSNorm and RoPE for rotary dimensions
+ @turbo for i in 1:half
  idx1 = i
  idx2 = i + half
  
- x1 = x[idx1, h]
- x2 = x[idx2, h]
+ # Apply RMSNorm
+ v1 = x[idx1, h] * inv_rms * weight[idx1]
+ v2 = x[idx2, h] * inv_rms * weight[idx2]
  
+ # Apply RoPE
  c = cos_vals[i]
  s = sin_vals[i]
  
- x[idx1, h] = x1 * c - x2 * s
- x[idx2, h] = x1 * s + x2 * c
+ x[idx1, h] = v1 * c - v2 * s
+ x[idx2, h] = v1 * s + v2 * c
+ end
+
+ # RMSNorm for remaining dimensions (if any)
+ if head_dim > rotary_dim
+ @turbo for i in (rotary_dim + 1):head_dim
+ x[i, h] = x[i, h] * inv_rms * weight[i]
  end
  end
  end
