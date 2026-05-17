@@ -763,12 +763,17 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
  query_states = attn.query_states_buf
  gate = attn.gate_buf
  
- for h in 1:attn.n_heads
- base = (h - 1) * (2 * attn.head_dim)
- for i in 1:attn.head_dim
- query_states[(h-1)*attn.head_dim+i] = attn.qkv_buf[base+i]
- gate[(h-1)*attn.head_dim+i] = attn.qkv_buf[base+attn.head_dim+i]
- end
+ # Hoist fields to local variables for @turbo compatibility
+ n_heads = attn.n_heads
+ head_dim = attn.head_dim
+ qkv_buf = attn.qkv_buf
+
+ @turbo for h in 1:n_heads
+    base = (h - 1) * (2 * head_dim)
+    for i in 1:head_dim
+        query_states[(h-1)*head_dim+i] = qkv_buf[base+i]
+        gate[(h-1)*head_dim+i] = qkv_buf[base+head_dim+i]
+    end
  end
 
  # Reshape to (head_dim, num_heads)
@@ -797,10 +802,10 @@ function (attn::FullAttentionCPU)(x::Vector{Float32}, pos::Int, rope::RotaryEmbe
  if attn.use_flash_attention
  # Flash Attention: memory-efficient tiled computation
  fa_out = view(attn.fa_output_buf, 1:attn.head_dim)
- fill!(fa_out, 0.0f0)
+ # fa_out is filled with zeros inside flash_attention_cpu!
  
  # Call the flash_attention_cpu! function from FlashAttention.jl
- flash_attention_cpu!(fa_out, q_h, cache.k, cache.v, kv_h, seq_len, attn.scale, attn.head_dim)
+ flash_attention_cpu!(fa_out, q_h, cache.k, cache.v, kv_h, seq_len, attn.scale, attn.head_dim, attn.scores_buf)
  
  # Copy result to output buffer
  @turbo for i in 1:attn.head_dim
