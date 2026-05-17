@@ -2,7 +2,7 @@
 # This is included inside ModelCPU module
 
 """
-    flash_attention_cpu!(output, Q, cache_k, cache_v, kv_h, seq_len, scale, head_dim)
+    flash_attention_cpu!(output, Q, cache_k, cache_v, kv_h, seq_len, scale, head_dim, scores)
 
 Memory-efficient attention that avoids materializing the full attention matrix.
 
@@ -10,8 +10,8 @@ Key optimizations:
 1. Tiled computation - process attention in blocks to fit in cache
 2. Online softmax - compute softmax incrementally without full materialization
 3. Recomputation of attention scores from KV cache instead of storing
-
-This is essentially Flash Attention-2/3 adapted for CPU.
+4. Zero-allocation - uses pre-allocated scores buffer
+5. Vectorized loops - uses @turbo for SIMD performance
 """
 function flash_attention_cpu!(
  output::AbstractVector{Float32},
@@ -21,7 +21,8 @@ function flash_attention_cpu!(
  kv_h::Int,
  seq_len::Int,
  scale::Float32,
- head_dim::Int
+ head_dim::Int,
+ scores::AbstractVector{Float32}
 )
     fill!(output, 0.0f0)
     
@@ -36,39 +37,48 @@ function flash_attention_cpu!(
         j_end = min(j + BLOCK_N - 1, seq_len)
         block_len = j_end - j + 1
         
-        scores = zeros(Float32, block_len)
-        
-        for n in 1:block_len
-            k_j = j + n - 1
+        # 1. Compute attention scores for the current block
+        # Use @turbo to vectorize dot products across the block
+        @turbo for n in 1:block_len
             s = 0.0f0
-            @simd for d in 1:head_dim
-                s += Q[d] * cache_k[d, kv_h, k_j]
+            for d in 1:head_dim
+                s += Q[d] * cache_k[d, kv_h, j + n - 1]
             end
             scores[n] = s * scale
         end
         
-        m_new = max(m, maximum(scores))
-        scale_factor = exp(m - m_new)
+        # 2. Find max in current block for online softmax
+        m_block = -Inf32
+        for n in 1:block_len
+            m_block = max(m_block, scores[n])
+        end
+
+        m_new = max(m, m_block)
         
+        # 3. Rescale existing accumulator if max value changed
         if m_new > m
-            output .*= scale_factor
+            scale_factor = exp(m - m_new)
+            @turbo for d in 1:head_dim
+                output[d] *= scale_factor
+            end
             l *= scale_factor
         end
         
+        # 4. Accumulate weighted values
         for n in 1:block_len
-            k_j = j + n - 1
             p = exp(scores[n] - m_new)
             l += p
-            @simd for d in 1:head_dim
-                output[d] += p * cache_v[d, kv_h, k_j]
+            @turbo for d in 1:head_dim
+                output[d] += p * cache_v[d, kv_h, j + n - 1]
             end
         end
         
         m = m_new
     end
     
+    # Final normalization
     inv_l = 1.0f0 / l
-    @simd for d in 1:head_dim
+    @turbo for d in 1:head_dim
         output[d] *= inv_l
     end
 end
