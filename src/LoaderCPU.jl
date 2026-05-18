@@ -379,6 +379,7 @@ function load_model_cpu(path::String; keep_quantized::Union{Bool,Nothing}=nothin
  embed_buf = Vector{Float32}(undef, config.hidden_size)
  final_norm_buf = Vector{Float32}(undef, config.hidden_size)
  lm_head_buf = Vector{Float32}(undef, config.vocab_size)
+ x_bf16_buf = Vector{UInt16}(undef, config.hidden_size)
  
  # Load tokenizer
  tok = Tokenizer.load_tokenizer(file.metadata)
@@ -387,7 +388,7 @@ function load_model_cpu(path::String; keep_quantized::Union{Bool,Nothing}=nothin
  # MTP is only available in safetensors format
  mtp_head = nothing
  
- return ModelCPU.QwenModelCPU(config, embed, lm_head, layers, final_norm, rope, embed_buf, final_norm_buf, lm_head_buf, mtp_head), tok
+ return ModelCPU.QwenModelCPU(config, embed, lm_head, layers, final_norm, rope, embed_buf, final_norm_buf, lm_head_buf, x_bf16_buf, mtp_head), tok
 end
 
 function get_config(file::GGUF.GGUFFile)
