@@ -56,13 +56,17 @@ Call C AVX2 BF16 matmul kernel. A_u16 is UInt16 view of BF16 weight matrix,
 x_bf16 is UInt16 BF16-converted activation vector, out is F32 result.
 """
 function bf16_gemv_c!(out::AbstractVector{Float32}, A_u16::AbstractArray{UInt16}, x_bf16::Vector{UInt16}; lda::Int=0)
- _load_libbf16() || error("BF16 C kernel not available")
- m, n = size(A_u16)
- actual_lda = lda > 0 ? lda : m
- ccall((:bf16_gemv_avx2, LIBBF16_PATH), Cvoid,
- (Ptr{UInt16}, Ptr{UInt16}, Ptr{Float32}, Cint, Cint, Cint),
- A_u16, x_bf16, out, m, n, actual_lda)
- return out
+    _load_libbf16() || error("BF16 C kernel not available")
+    m, n = size(A_u16)
+    actual_lda = lda > 0 ? lda : m
+    # Use pointer() to correctly handle SubArray views in ccall.
+    # GC.@preserve ensures that arrays are not collected during C kernel execution.
+    GC.@preserve out A_u16 x_bf16 begin
+        ccall((:bf16_gemv_avx2, LIBBF16_PATH), Cvoid,
+              (Ptr{UInt16}, Ptr{UInt16}, Ptr{Float32}, Cint, Cint, Cint),
+              pointer(A_u16), pointer(x_bf16), pointer(out), m, n, actual_lda)
+    end
+    return out
 end
 
 """
@@ -72,14 +76,18 @@ Compute out[k] = dot(A[:, col_start+k-1], x) for columns col_start..col_end.
 Uses batch C kernel bf16_gemv_cols_avx2 for minimal per-column overhead.
 """
 function bf16_gemv_c_cols!(out::AbstractVector{Float32}, A_u16::AbstractArray{UInt16}, 
- x_bf16::Vector{UInt16}, col_start::Int, col_end::Int, col_len::Int)
- _load_libbf16() || error("BF16 C kernel not available")
- n_cols = col_end - col_start + 1
- # C uses 0-based column index
- ccall((:bf16_gemv_cols_avx2, LIBBF16_PATH), Cvoid,
- (Ptr{UInt16}, Ptr{UInt16}, Ptr{Float32}, Cint, Cint, Cint),
- A_u16, x_bf16, out, col_start - 1, n_cols, col_len)
- return out
+                           x_bf16::Vector{UInt16}, col_start::Int, col_end::Int, col_len::Int)
+    _load_libbf16() || error("BF16 C kernel not available")
+    n_cols = col_end - col_start + 1
+    # C uses 0-based column index.
+    # Use pointer() to correctly handle SubArray views in ccall.
+    # GC.@preserve ensures that arrays are not collected during C kernel execution.
+    GC.@preserve out A_u16 x_bf16 begin
+        ccall((:bf16_gemv_cols_avx2, LIBBF16_PATH), Cvoid,
+              (Ptr{UInt16}, Ptr{UInt16}, Ptr{Float32}, Cint, Cint, Cint),
+              pointer(A_u16), pointer(x_bf16), pointer(out), col_start - 1, n_cols, col_len)
+    end
+    return out
 end
 
 """
